@@ -1,0 +1,69 @@
+<svg width="680" height="640" viewBox="0 0 680 640" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>Chatbot to Entra ID PIM architecture</title>
+<desc>Flowchart: user requests a resource in chat, the bot backend authenticates via Entra ID, checks active PIM role assignments via Microsoft Graph, a policy engine decides if the role permits the action, then either denies access or calls Azure ARM to create the resource on the user's behalf.</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#5F5E5A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+
+<style>
+  text { font-family: Arial, Helvetica, sans-serif; }
+  .th { font-size: 14px; font-weight: 700; }
+  .ts { font-size: 12px; font-weight: 400; }
+  .arr { stroke: #5F5E5A; stroke-width: 1.5; fill: none; }
+</style>
+
+<rect width="680" height="640" fill="#FFFFFF"/>
+
+<line x1="340" y1="94" x2="340" y2="134" class="arr" marker-end="url(#arrow)"/>
+<line x1="340" y1="188" x2="340" y2="228" class="arr" marker-end="url(#arrow)"/>
+<line x1="340" y1="282" x2="340" y2="322" class="arr" marker-end="url(#arrow)"/>
+<line x1="340" y1="376" x2="340" y2="416" class="arr" marker-end="url(#arrow)"/>
+<line x1="290" y1="470" x2="210" y2="530" class="arr" marker-end="url(#arrow)"/>
+<line x1="390" y1="470" x2="470" y2="530" class="arr" marker-end="url(#arrow)"/>
+<text x="235" y="500" class="ts" fill="#444441">no</text>
+<text x="425" y="500" class="ts" fill="#444441">yes</text>
+
+<g>
+<rect x="210" y="40" width="260" height="54" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="230" y="61" class="th" fill="#2C2C2A">User</text>
+<text x="230" y="79" class="ts" fill="#444441">Requests a resource in chat</text>
+</g>
+
+<g>
+<rect x="210" y="134" width="260" height="54" rx="4" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="230" y="155" class="th" fill="#2C2C2A">Chatbot backend</text>
+<text x="230" y="173" class="ts" fill="#444441">Receives request, starts auth flow</text>
+</g>
+
+<g>
+<rect x="210" y="228" width="260" height="54" rx="4" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="230" y="249" class="th" fill="#042C53">Entra ID (MSAL)</text>
+<text x="230" y="267" class="ts" fill="#0C447C">Authenticates user, issues token</text>
+</g>
+
+<g>
+<rect x="210" y="322" width="260" height="54" rx="4" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="230" y="343" class="th" fill="#042C53">Microsoft graph API</text>
+<text x="230" y="361" class="ts" fill="#0C447C">Reads active PIM role assignments</text>
+</g>
+
+<g>
+<rect x="210" y="416" width="260" height="54" rx="4" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="230" y="437" class="th" fill="#26215C">Policy engine</text>
+<text x="230" y="455" class="ts" fill="#3C3489">Role permits this action?</text>
+</g>
+
+<g>
+<rect x="100" y="530" width="220" height="54" rx="4" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/>
+<text x="120" y="551" class="th" fill="#501313">Access denied</text>
+<text x="120" y="569" class="ts" fill="#791F1F">Bot explains missing role</text>
+</g>
+
+<g>
+<rect x="360" y="530" width="220" height="54" rx="4" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+<text x="380" y="551" class="th" fill="#173404">Azure ARM API</text>
+<text x="380" y="569" class="ts" fill="#27500A">Creates resource (delegated)</text>
+</g>
+</svg>
