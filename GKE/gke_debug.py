@@ -422,10 +422,10 @@ def list_clusters(emit=None) -> dict:
     - otherwise: only the gkelogin menu (CLUSTERS dict, clusters.json, or the menu gkelogin.exe prints)."""
     out = emit or print
     if LOGIN_OPTS["method"] == "cli":
-        return list_clusters_cli(out, all_projects=bool(LOGIN_OPTS.get("all_clusters")))
+        return list_clusters_cli(out)
     menu = exe_menu_clusters()
     if LOGIN_OPTS.get("all_clusters"):
-        return list_clusters_cli(out, menu=menu, all_projects=True)
+        return list_clusters_cli(out, menu=menu)
     CLI_TARGETS.clear()
     return menu
 
@@ -434,7 +434,20 @@ def list_clusters(emit=None) -> dict:
 # Login method: the standard Google Cloud CLI (`gcloud`) instead of gkelogin.exe  (--login-method cli)
 # ---------------------------------------------------------------------------
 
-LOGIN_OPTS = {"method": "exe", "device_code": False, "gui": False, "all_clusters": False}   # method: "exe" (gkelogin.exe, default) or "cli" (gcloud); all_clusters: list every cluster gcloud can see
+SIGNIN_METHOD_LABELS = {"manual": "I run the command myself (recommended)", "captured": "Show URL here and paste the code (captured)",
+                        "console": "Open a console window for me"}      # the sign-in method selector (step 2) / --signin-method values
+SIGNIN_KEYS = {v: k for k, v in SIGNIN_METHOD_LABELS.items()}
+_SESSION = {}      # choices remembered while the program runs (the sign-in method)
+
+
+def default_signin_method():
+    """manual unless the environment says otherwise (GKE_DEBUG_SIGNIN_METHOD=captured|console|manual; used by automated tests)."""
+    v = (os.environ.get("GKE_DEBUG_SIGNIN_METHOD") or "").strip().lower()
+    return v if v in SIGNIN_METHOD_LABELS else "manual"
+
+
+LOGIN_OPTS = {"method": "exe", "device_code": True, "gui": False, "all_clusters": False, "account": None,
+              "signin": default_signin_method()}   # method: "exe" (gkelogin.exe, default) or "cli" (gcloud); all_clusters: list every cluster gcloud can see; signin: manual (default) | captured | console
 LOGIN_LABELS = {"exe": "Custom login (gkelogin)", "cli": "Cloud CLI (gcloud)"}   # the GUI combobox values
 CLI_TARGETS = {}    # cluster number (str) -> what the CLI listing found; fed into GCP_OPTS after the login
 
@@ -480,24 +493,701 @@ def list_selected_clusters(emit=print):
     return list_clusters(emit) if (LOGIN_OPTS["method"] == "cli" or LOGIN_OPTS.get("all_clusters")) else list_clusters()
 
 
+def gcloud_accounts():
+    """([{account, active}], error_or_None): every account gcloud holds credentials for (`gcloud auth list`, read-only)."""
+    data, err = gcloud(["auth", "list"], None, 30, project=False)
+    if err or not isinstance(data, list):
+        return [], (err or "unexpected output from gcloud auth list")
+    rows = [{"account": str(d.get("account")), "active": str(d.get("status") or "").upper() == "ACTIVE"}
+            for d in data if isinstance(d, dict) and d.get("account")]
+    return rows, None
+
+
 def _gcloud_active_account():
-    accts, err = gcloud(["auth", "list", "--filter=status:ACTIVE"], None, 30, project=False)
-    if not err and isinstance(accts, list) and accts and isinstance(accts[0], dict):
-        return accts[0].get("account") or "?", None
-    return None, err
+    """(account, error): the account this tool uses - the pinned one (LOGIN_OPTS['account'], when gcloud holds credentials for it),
+    otherwise gcloud's ACTIVE account."""
+    rows, err = gcloud_accounts()
+    if err:
+        return None, err
+    pin = LOGIN_OPTS.get("account")
+    if pin:
+        if any(r["account"] == pin for r in rows):
+            return pin, None
+        return None, f"gcloud has no credentials for {pin} - sign in with that account first"
+    for r in rows:
+        if r["active"]:
+            return r["account"], None
+    return None, "gcloud has no active account"
+
+
+# ---- credential state: which accounts are usable / expired (read-only: `gcloud auth print-access-token --account X`, the token is thrown away)
+EXPIRED_PATTERN = re.compile(r"reauthentication (?:required|failed)|invalid_grant|problem refreshing your current auth tokens|"
+                             r"do not currently have an active account|token has been expired or revoked|gcloud auth login to obtain new credentials|"
+                             r"credentials? (?:have |has |are |is )?(?:expired|revoked)|invalid authentication credentials|"
+                             r"unauthenticated|expected oauth 2 access token", re.I)
+_TOKEN_LIKE = re.compile(r"\b(?:ya29\.|1//)[A-Za-z0-9_\-.]{8,}|\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-.]{5,}")
+AUTH_STATE = {"expired": set(), "status": {}, "last": None}        # expired accounts, {account: (state, time)}, the account last seen in use
+EXPIRY_EVENTS = queue.Queue()                                        # (account, reason) - the window reads it and shows the banner
+CREDS_EXPIRED_TEXT = "credentials expired - sign in again"
+
+
+def mask_tokens(text):
+    """Hides anything shaped like an access / refresh / id token and the verification code in text that may be shown."""
+    return mask_secrets(_TOKEN_LIKE.sub("[token hidden]", str(text)))
+
+
+def is_expired_error(text):
+    return bool(EXPIRED_PATTERN.search(str(text or "")))
+
+
+def mark_expired(account, reason=""):
+    """Remember that `account` (None = the one in use) needs a new sign-in and tell the window."""
+    acct = account or LOGIN_OPTS.get("account") or AUTH_STATE.get("last")
+    if not acct:
+        return None
+    new = acct not in AUTH_STATE["expired"]
+    AUTH_STATE["expired"].add(acct)
+    AUTH_STATE["status"][acct] = ("expired", time.time())
+    if new:
+        EXPIRY_EVENTS.put((acct, mask_tokens(_first_line(reason, 160)) if reason else ""))
+    return acct
+
+
+def account_status(account, rows=None):
+    """Read-only status of one account: {"state": "active" | "expired" | "signed_out" | "unknown", "detail"}. `gcloud auth print-access-token
+    --account X` working means usable; the token is discarded at once (never stored, printed or logged)."""
+    if rows is not None and not any(r["account"] == account for r in rows):
+        return {"state": "signed_out", "detail": "Not signed in with gcloud"}
+    out, err = gcloud(["auth", "print-access-token", "--account", account], None, 60, project=False, fmt=None)
+    ok = not err and isinstance(out, str) and bool(out.strip())
+    out = None                                                         # the token is not kept
+    if ok:
+        AUTH_STATE["expired"].discard(account)
+        AUTH_STATE["status"][account] = ("active", time.time())
+        return {"state": "active", "detail": "Active"}
+    if err and is_expired_error(err):
+        mark_expired(account, err)
+        return {"state": "expired", "detail": "Credentials expired - sign in again"}
+    return {"state": "unknown", "detail": mask_tokens(_first_line(err or "no token returned", 120))}
+
+
+def check_accounts(accounts, rows=None, on_result=None, cap=4):
+    """Status of several accounts, at most `cap` gcloud calls at once. Returns {account: status}."""
+    from concurrent.futures import ThreadPoolExecutor
+    results = {}
+
+    def one(a):
+        try:
+            res = account_status(a, rows)
+        except Exception as exc:
+            res = {"state": "unknown", "detail": mask_tokens(str(exc))[:120]}
+        results[a] = res
+        if on_result:
+            on_result(a, res)
+    with ThreadPoolExecutor(max_workers=max(1, min(cap, 4))) as ex:
+        list(ex.map(one, list(accounts)))
+    return results
+
+
+STATUS_TEXT = {"active": "Active", "expired": "Credentials expired - sign in again", "signed_out": "Not signed in", "unknown": "Unknown"}
+
+
+def print_accounts(emit=print):
+    """--list-accounts: every account gcloud knows, which one is active, and whether its credentials still work."""
+    rows, err = gcloud_accounts()
+    if err:
+        emit("Could not read the account list: " + mask_tokens(_first_line(err, 160)))
+        return False
+    if not rows:
+        emit("gcloud has no signed-in account. Run this tool with --login-method cli to sign in (device code), or: gcloud auth login")
+        return True
+    res = check_accounts([r["account"] for r in rows], rows)
+    emit("Accounts known to gcloud (read-only check; '*' = active in gcloud, '>' = pinned with --account):")
+    for r in rows:
+        st = res.get(r["account"]) or {"state": "unknown", "detail": ""}
+        mark = ">" if LOGIN_OPTS.get("account") == r["account"] else ("*" if r["active"] else " ")
+        kind = " (service account)" if r["account"].endswith(".gserviceaccount.com") else ""
+        why = "" if st["state"] == "active" else (" - " + st["detail"] if st["detail"] and st["state"] == "unknown" else "")
+        emit(f"  {mark} {r['account']}{kind}   [{STATUS_TEXT[st['state']]}]{why}")
+        if st["state"] == "expired":
+            emit(f"      Credentials for {r['account']} expired. Sign in again: run with --login-method cli --account {r['account']} (or: gcloud auth login --no-launch-browser --account {r['account']}).")
+    return True
+
+
+def pin_account(account):
+    """Use `account` for everything this tool runs from now on (None = follow gcloud's active account). Nothing is written to gcloud's
+    configuration: the account is added as `--account <email>` to every gcloud call (and CLOUDSDK_CORE_ACCOUNT for kubectl's auth plugin)."""
+    LOGIN_OPTS["account"] = account or None
+    AUTH_STATE["last"] = account or AUTH_STATE.get("last")
+    with _TOKEN_LOCK:
+        _TOKEN["value"], _TOKEN["at"], _TOKEN["account"] = None, 0.0, None
 
 
 def login_status(account=None):
     """Read-only sign-in check for the window (`gcloud auth list`; nothing is changed, no sign-in is started).
-    Returns {"state": "ok" | "not_signed_in" | "no_cli", "who", "detail", "hint"}."""
+    Returns {"state": "ok" | "not_signed_in" | "no_cli", "who", "detail", "hint", "accounts", "active"}."""
     if not shutil.which("gcloud"):
         return {"state": "no_cli", "who": None, "detail": "The Google Cloud CLI (gcloud) is not installed (it was not found on PATH).",
-                "hint": "Install it from https://cloud.google.com/sdk/docs/install, then press 'Check status'."}
-    who, err = _gcloud_active_account()
+                "hint": "Install it from https://cloud.google.com/sdk/docs/install, then press 'Check status'.", "accounts": [], "active": None}
+    rows, err = gcloud_accounts()
+    active = next((r["account"] for r in rows if r["active"]), None)
+    pin = LOGIN_OPTS.get("account")
+    who = pin if pin and any(r["account"] == pin for r in rows) else (None if pin else active)
     if not who:
-        return {"state": "not_signed_in", "who": None, "detail": _first_line(err, 160) if err else "gcloud has no active account.",
-                "hint": "Press 'Sign in' (runs: gcloud auth login) and complete the sign-in in the console window / browser that opens."}
-    return {"state": "ok", "who": who, "detail": "", "hint": ""}
+        why = (f"gcloud has no credentials for {pin}." if pin and not err else _first_line(err, 160) if err else "gcloud has no active account.")
+        return {"state": "not_signed_in", "who": None, "detail": why, "accounts": rows, "active": active,
+                "hint": (("Run 'gcloud auth login --no-launch-browser' in your own terminal (the commands are shown in step 2), then press 'I have signed in - Verify'.")
+                         if (LOGIN_OPTS.get("signin") or "manual") == "manual" else
+                         "Press 'Sign in' (device code: you get a link and a code box right here) to sign in." if LOGIN_OPTS.get("device_code")
+                         else "Press 'Sign in' (runs: gcloud auth login) and complete the sign-in in the console window / browser that opens.")}
+    AUTH_STATE["last"] = who
+    return {"state": "ok", "who": who, "detail": "", "hint": "", "accounts": rows, "active": active}
+
+
+# ---- device-code sign-in: `gcloud auth login --no-launch-browser` with its output captured (no console window) -------------------------
+# gcloud has no true "device code": with --no-launch-browser it prints a sign-in link; after signing in (in any browser, on any machine) Google
+# shows a verification code that must be pasted back into gcloud's input. This session shows the link and takes the code in the window.
+NO_URL_SECONDS = 6.0               # no link in gcloud's output after this long: the window switches to the manual commands
+ROLLING_LINES = 400                # output lines kept
+SIGNIN_WAIT_SECONDS = 300          # how long the window waits for the code before it gives up (shown as a countdown)
+SIGNIN_URL_PATTERN = re.compile(r"https?://\S+")
+_URL_CHARS = re.compile(r"^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$")
+_CODE_LIKE = re.compile(r"\b4/[A-Za-z0-9_\-]{12,}")                 # what a Google verification code looks like (masked in any output)
+SIGNIN_STEPS = ("1. Open the link below (any browser, on any computer).",
+                "2. Sign in with the Google account you want and allow access.",
+                "3. Copy the verification code Google shows and paste it into the box below, then press 'Submit code'.")
+
+
+class UrlAssembler:
+    """Finds the sign-in URL in gcloud's output lines. The URL is long and may be wrapped over several lines: lines that follow the
+    first one and look like a URL continuation (no spaces, URL characters only) are joined; a blank / ordinary line ends it."""
+
+    def __init__(self):
+        self.parts = None
+        self.url = None
+
+    def feed(self, line):
+        """Returns the finished URL the moment it is complete, else None."""
+        text = ANSI_PATTERN.sub("", str(line)).strip()
+        if self.url:
+            return None
+        if self.parts is None:
+            m = SIGNIN_URL_PATTERN.search(text)
+            if m:
+                self.parts = [m.group(0)]
+            return None
+        if text and _URL_CHARS.match(text):
+            self.parts.append(text)
+            return None
+        return self._finish()
+
+    def idle(self):
+        """Called when gcloud went quiet: whatever was collected is the URL."""
+        return self._finish() if (self.parts and not self.url) else None
+
+    def _finish(self):
+        self.url = "".join(self.parts)
+        return self.url
+
+
+def mask_secrets(text, code=None):
+    """Hides the verification code (and anything shaped like one) in a line of output."""
+    out = str(text)
+    if code and len(code) >= 4:
+        out = out.replace(code, "[code hidden]")
+    return _CODE_LIKE.sub("[code hidden]", out)
+
+
+class SignInSession:
+    """One `gcloud auth login --no-launch-browser [--account HINT]` run with captured, streamed output and a piped stdin.
+    on_event(kind, data): "started", "line" (a masked output line), "url", "nourl" (raw lines), "tick" (seconds left), "finished" (dict)."""
+
+    def __init__(self, account_hint=None, on_event=None, wait_seconds=None):
+        self.hint = (account_hint or "").strip() or None
+        self.on_event = on_event or (lambda kind, data=None: None)
+        self.wait = wait_seconds or SIGNIN_WAIT_SECONDS
+        self.proc = None
+        self.url = None
+        self.lines = []
+        self.code_sent = False
+        self._code = None
+        self.cancelled = False
+        self.expired = False
+        self.result = None
+        self.done = threading.Event()
+        self._q = queue.Queue()
+        self._t0 = None
+        self._lock = threading.Lock()
+        self._nourl_said = False
+
+    def command(self):
+        exe = shutil.which("gcloud") or "gcloud"
+        return [exe, "auth", "login", "--no-launch-browser"] + (["--account", self.hint] if self.hint else [])
+
+    def command_text(self):
+        return " ".join(["gcloud"] + self.command()[1:])
+
+    def start(self):
+        """Starts gcloud. Returns None, or a plain-language error (nothing was started)."""
+        if not shutil.which("gcloud"):
+            return "The Google Cloud CLI (gcloud) was not found on PATH - install it from https://cloud.google.com/sdk/docs/install"
+        cmd = self.command()
+        why = gcloud_violation(cmd[1:], local_ok=True)
+        if why:
+            return guard_block("login", cmd[1:], why)
+        env = dict(os.environ, CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK="1", PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        env.pop("CLOUDSDK_CORE_DISABLE_PROMPTS", None)      # this login is interactive (the code is typed in): prompts must stay enabled
+        kwargs = {"creationflags": 0x08000000} if os.name == "nt" else {}          # CREATE_NO_WINDOW: the output is shown in this window instead
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                         encoding="utf-8", errors="replace", bufsize=1, env=env, **kwargs)
+        except Exception as exc:
+            return f"could not start gcloud: {exc}"
+        self._t0 = time.time()
+        self.on_event("started", self.command_text())
+        threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._work, daemon=True).start()
+        return None
+
+    def _read(self):
+        """Reads the output in raw chunks (os.read) as it arrives - NOT line by line: gcloud's prompt ('Enter verification code: ') has no newline, and a
+        link without a trailing newline must still be seen. stderr is merged into the same pipe. (Test doubles without a file descriptor are read by line.)"""
+        out = self.proc.stdout
+        try:
+            fd = out.fileno()
+            if not isinstance(fd, int):
+                raise TypeError
+        except Exception:
+            fd = None
+        try:
+            if fd is not None:
+                import codecs
+                dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                while True:
+                    data = os.read(fd, 4096)
+                    if not data:
+                        break
+                    text = dec.decode(data)
+                    if text:
+                        self._q.put(text)
+            else:
+                for line in iter(out.readline, ""):
+                    self._q.put(line)
+        except Exception:
+            pass
+        self._q.put(None)
+
+    def _line(self, raw, asm):
+        """One complete output line: keep it (masked), look for the link, report it."""
+        raw = ANSI_PATTERN.sub("", raw).rstrip("\r\n")
+        shown = mask_secrets(raw, self._code)
+        if shown.strip():
+            self.lines.append(shown)
+            del self.lines[:-ROLLING_LINES]
+        in_url = asm.parts is not None and not asm.url
+        url = asm.feed(raw)
+        if url:
+            self._got_url(url)
+        elif asm.parts is not None and not asm.url:
+            in_url = True
+        if shown.strip() and not (in_url and not url):
+            self.on_event("line", shown)
+
+    def _work(self):
+        asm = UrlAssembler()
+        last_tick = None
+        last_item = time.time()
+        partial = ""
+        eof = False
+        while not eof:
+            try:
+                item = self._q.get(timeout=0.25)
+            except queue.Empty:
+                item = False
+            now = time.time()
+            left = max(0, int(self.wait - (now - self._t0) + 0.999))
+            if left != last_tick:
+                last_tick = left
+                self.on_event("tick", left)
+            if item is None:
+                eof = True
+            elif item is not False:
+                last_item = now
+                self.on_event("raw", mask_secrets(ANSI_PATTERN.sub("", item), self._code))      # exactly what gcloud printed (masked), for the raw-output box
+                parts = re.split(r"\r\n|\n|\r", partial + item)
+                partial = parts.pop()
+                for raw in parts:
+                    self._line(raw, asm)
+            elif now - last_item > 0.6:                      # gcloud went quiet (it waits for the code): the unfinished line and the link so far are complete
+                if partial.strip():
+                    self._line(partial, asm)
+                    partial = ""
+                url = asm.idle() if now - last_item > 1.0 else None
+                if url:
+                    self._got_url(url)
+            if not eof and now - self._t0 > NO_URL_SECONDS and not self.url and not self.code_sent and not self._nourl_said:
+                self._nourl_said = True
+                self.on_event("nourl", list(self.lines) + ([mask_secrets(partial, self._code)] if partial.strip() else []))
+            if not eof and now - self._t0 > self.wait and not self.cancelled and not self.expired:
+                self.expired = True
+                self.terminate()
+        if partial.strip():
+            self._line(partial, asm)
+        url = asm.idle()
+        if url:
+            self._got_url(url)
+        try:
+            rc = self.proc.wait(timeout=10)
+        except Exception:
+            self.terminate()
+            rc = self.proc.poll()
+        if not self.url:
+            self.on_event("nourl", list(self.lines))
+        self.result = {"rc": rc, "ok": rc == 0 and not self.cancelled and not self.expired, "cancelled": self.cancelled, "expired": self.expired,
+                       "code_sent": self.code_sent, "error": self._explain(rc), "last_lines": [l for l in self.lines if l.strip()][-8:],
+                       "command": self.command_text(), "causes": [] if (rc == 0 or self.cancelled) else likely_signin_causes(self.lines, rc)}
+        self.done.set()
+        self.on_event("finished", self.result)
+
+    def _got_url(self, url):
+        if not self.url:
+            self.url = url
+            self.on_event("url", url)
+
+    def _explain(self, rc):
+        if self.cancelled:
+            return "Sign-in cancelled."
+        if self.expired:
+            return "The sign-in timed out before a code was entered. Press 'Sign in' to get a new link."
+        if rc == 0:
+            return ""
+        cand = [l for l in self.lines if l.strip() and "http" not in l]
+        last = next((l for l in reversed(cand) if "error" in l.lower()), cand[-1] if cand else "")
+        if self.code_sent:
+            return ("gcloud did not accept the verification code (it may be wrong, incomplete or expired). Press 'Sign in' for a new link "
+                    "and paste the new code." + (f" (gcloud said: {_first_line(last, 140)})" if last else ""))
+        return "gcloud stopped before a code was entered" + (f": {_first_line(last, 140)}" if last else ".") + " Press 'Sign in' to try again."
+
+    def submit(self, code):
+        """Writes the verification code + newline to gcloud's input. The code is never logged or kept in any output."""
+        code = (code or "").strip()
+        if not code:
+            return False
+        if not self.proc or self.done.is_set() or self.proc.poll() is not None:
+            return False
+        try:
+            with self._lock:
+                self._code = code
+                self.proc.stdin.write(code + "\n")
+                self.proc.stdin.flush()
+            self.code_sent = True
+        except Exception:
+            return False
+        return True
+
+    def terminate(self):
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=3)
+                except Exception:
+                    self.proc.kill()
+        except Exception:
+            pass
+
+    def cancel(self):
+        self.cancelled = True
+        self.terminate()
+
+
+def signin_box_lines(url):
+    """The sign-in instructions as a framed box (command-line mode / live log). The verification code is never part of it."""
+    width = 78
+    body = ["SIGN IN TO GOOGLE CLOUD (device code / no-browser sign-in)", ""] + list(SIGNIN_STEPS) + ["", "Sign-in link:"]
+    body += [url[i:i + width - 4] for i in range(0, len(url), width - 4)] if url else ["(not found yet)"]
+    return ["+" + "-" * (width - 2) + "+"] + ["| " + l.ljust(width - 4) + " |" for l in body] + ["+" + "-" * (width - 2) + "+"]
+
+
+def cli_device_login(emit, account_hint=None, ask_code=None, wait_seconds=None):
+    """Console sign-in with `gcloud auth login --no-launch-browser`: prints the framed instructions + link, asks for the verification code
+    (hidden input) and passes it to gcloud. Returns (ok, error_text)."""
+    got = {"url": None, "raw": None}
+    ready = threading.Event()
+
+    def on_event(kind, data=None):
+        if kind == "url":
+            got["url"] = data
+            ready.set()
+        elif kind == "nourl":
+            got["raw"] = data
+            ready.set()
+        elif kind == "finished":
+            ready.set()
+    sess = SignInSession(account_hint, on_event, wait_seconds)
+    err = sess.start()
+    if err:
+        return False, err
+    emit("Running: " + " ".join(["gcloud"] + sess.command()[1:]))
+    ready.wait(timeout=60)
+    if got["url"]:
+        for l in signin_box_lines(got["url"]):
+            emit(l)
+        if not sess.done.is_set():
+            def default_ask():
+                import getpass
+                return getpass.getpass("Paste the verification code here (input is hidden) and press Enter: ")
+            try:
+                code = (ask_code or default_ask)()
+            except (EOFError, KeyboardInterrupt):
+                sess.cancel()
+                code = ""
+            if code and not sess.submit(code):
+                emit("The sign-in already ended - the code was not sent.")
+    else:
+        emit("Could not find the sign-in link in gcloud's output. Raw output:")
+        for l in (got.get("raw") or sess.lines)[-20:]:
+            emit("  " + l)
+    sess.done.wait(timeout=120)
+    if not sess.done.is_set():
+        sess.cancel()
+        sess.done.wait(timeout=10)
+    res = sess.result or {"ok": False, "error": "sign-in did not finish"}
+    return bool(res["ok"]), res.get("error") or ""
+
+
+# ---------------------------------------------------------------------------
+# Signing in.  Three methods (step 2 of the window, --signin-method on the command line):
+#   manual   (DEFAULT)  the tool SHOWS the exact commands (gcloud auth login --no-launch-browser, ...); the user runs one in their own Command Prompt /
+#                       PowerShell, then presses 'I have signed in - Verify' (the tool only runs the read-only `gcloud auth list`, the token check and the
+#                       project list). The window also checks every few seconds and notices the sign-in by itself. 'Open a terminal for me' starts a
+#                       visible PowerShell window with the chosen `gcloud auth login` form - a LOCAL-ONLY, user-initiated exception limited to exactly
+#                       `gcloud auth login [--no-launch-browser] [--account X]`.
+#   captured            `gcloud auth login --no-launch-browser` runs with its output captured; the link is shown in the window and the code is pasted back.
+#                       When no link appears (~6 s) or it fails, the window switches to the manual commands.
+#   console             the same command in its own visible console window; the tool waits and then re-checks the sign-in.
+# The tool never installs anything: the install hints for gcloud and its components (gke-gcloud-auth-plugin) are TEXT only.
+# ---------------------------------------------------------------------------
+
+MANUAL_POLL_SECONDS = 5         # manual mode: how often the window checks whether the sign-in happened
+MANUAL_POLL_CAP = 900           # ... and for how long (seconds) before it stops waiting
+MANUAL_INSTRUCTIONS = "Sign in from your own Command Prompt or PowerShell. If the Google Cloud CLI is not installed yet, install it first, then run this command:"
+MANUAL_STEPS = ("Then: gcloud prints a URL - open it in a browser, sign in with your Google account and allow access, copy the verification code Google shows, "
+                "paste it back into the terminal and press Enter. Return to this window and press 'I have signed in - Verify'.")
+GCLOUD_INSTALL_URL = "https://cloud.google.com/sdk/docs/install"
+GCLOUD_INSTALL_WINGET = "winget install -e --id Google.CloudSDK"
+GCLOUD_MISSING_TEXT = "Google Cloud CLI (gcloud) not found on this computer - install it first"
+GCLOUD_INSTALL_HINT = (f"Install it from {GCLOUD_INSTALL_URL}  -  on Windows you can run:  {GCLOUD_INSTALL_WINGET}  "
+                       "(then open a NEW terminal window). This tool never installs anything.")
+PLUGIN_INSTALL_CMD = "gcloud components install gke-gcloud-auth-plugin"
+NO_URL_REASON = "No URL received from gcloud yet. Run one of these commands in your own terminal, then press Verify."
+FAILED_REASON = "The automatic sign-in did not complete. Run one of these commands in your own terminal, then press Verify."
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+$")
+_TERMINAL_FORMS = ("device", "device-account", "browser")
+
+
+def manual_commands(account=None, plugin_missing=None):
+    """The numbered commands of the manual sign-in. Each: {n, key, cmd, note[, text_only]}. `account` = the account hint (adds the 1b variant). They are
+    shown as TEXT; the tool itself never runs them (only 'Open a terminal for me' starts the `gcloud auth login` forms, on the user's request).
+    The helpers marked text_only (application-default sign-in, the kubectl plugin) are never run by this tool, not even from the terminal button."""
+    account = account if (account and EMAIL_RE.match(account)) else None
+    items = [{"n": "1", "key": "device", "cmd": "gcloud auth login --no-launch-browser",
+              "note": "Recommended: prints a URL - open it, sign in, copy the verification code and paste it back into the terminal."}]
+    if account:
+        items.append({"n": "1b", "key": "device-account", "cmd": f"gcloud auth login --no-launch-browser --account {account}",
+                      "note": "Same, for the account in the 'hint' box."})
+    items += [{"n": "2", "key": "browser", "cmd": "gcloud auth login", "note": "Normal flow: opens your browser by itself."},
+              {"n": "3a", "key": "list", "cmd": "gcloud auth list", "note": "Shows the accounts gcloud holds credentials for (the active one is marked)."},
+              {"n": "3b", "key": "projects", "cmd": "gcloud projects list", "note": "Verify: lists the projects this account can see."},
+              {"n": "4a", "key": "adc", "cmd": "gcloud auth application-default login", "text_only": True,
+               "note": "Only if another tool asks for application-default credentials (this tool does not need it)."}]
+    if plugin_missing is None:
+        plugin_missing = not shutil.which("gke-gcloud-auth-plugin")
+    if plugin_missing:
+        items.append({"n": "4b", "key": "plugin", "cmd": PLUGIN_INSTALL_CMD, "text_only": True,
+                      "note": "kubectl needs this plugin to sign in to GKE and it was not found. Shown as text only - run it yourself if you want it."})
+    return items
+
+
+_GCLOUD_VERSION = {}       # exe path -> first line of `gcloud --version` (only successful reads are remembered)
+
+
+def gcloud_cli_line():
+    """('Google Cloud CLI installed ...' text, found): PATH lookup only (no process); the version is read separately by gcloud_version()."""
+    exe = shutil.which("gcloud")
+    if not exe:
+        return GCLOUD_MISSING_TEXT, False
+    ver = _GCLOUD_VERSION.get(exe)
+    return (f"Google Cloud CLI installed: {ver}" if ver else f"Google Cloud CLI installed ({exe})"), True
+
+
+def gcloud_version(timeout=60):
+    """First line of `gcloud --version` (e.g. 'Google Cloud SDK 480.0.0'), or None. The only information command the tool runs besides the read verbs."""
+    exe = shutil.which("gcloud")
+    if not exe:
+        return None
+    if exe in _GCLOUD_VERSION:
+        return _GCLOUD_VERSION[exe]
+    guard_allow()
+    try:
+        proc = subprocess.run([exe, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                              stdin=subprocess.DEVNULL, env=_gcloud_env())
+    except Exception:
+        return None
+    first = next((" ".join(l.split()) for l in str(getattr(proc, "stdout", "") or "").splitlines() if l.strip()), "")
+    if getattr(proc, "returncode", 1) != 0 or not first:
+        return None
+    _GCLOUD_VERSION[exe] = first[:120]
+    return _GCLOUD_VERSION[exe]
+
+
+def manual_signin_block(account=None, reason=None, gcloud_missing=None, plugin_missing=None):
+    """The numbered command block as text lines (command line; same content as the window's manual panel, incl. the install hint when gcloud is missing)."""
+    if gcloud_missing is None:
+        gcloud_missing = not shutil.which("gcloud")
+    rows = []
+    if reason:
+        rows += [reason, ""]
+    rows += [MANUAL_INSTRUCTIONS, ""]
+    if gcloud_missing:
+        rows += [GCLOUD_MISSING_TEXT, "  Install it from " + GCLOUD_INSTALL_URL, "  On Windows you can run:  " + GCLOUD_INSTALL_WINGET,
+                 "  (then open a NEW terminal window; this tool never installs anything)", ""]
+    for item in manual_commands(account, plugin_missing):
+        rows += [f"  {item['n']}. {item['cmd']}", f"        {item['note']}"]
+    rows += ["", MANUAL_STEPS.replace("press 'I have signed in - Verify'.", "press Enter here.")]
+    width = max(len(r) for r in rows) + 2
+    return ["+" + "-" * width + "+"] + ["| " + r.ljust(width - 1) + "|" for r in rows] + ["+" + "-" * width + "+"]
+
+
+def likely_signin_causes(lines, rc=None):
+    """Plain-language likely causes of a sign-in process that ended without success (from its output)."""
+    low = " ".join(str(l) for l in (lines or [])).lower()
+    causes = []
+    if re.search(r"not recognized|no such file|cannot find|not found", low):
+        causes.append("gcloud (or Python for gcloud) was not found - install the Google Cloud CLI and open a NEW terminal.")
+    if re.search(r"ssl|certificate|proxy|connection|network|timed out|unreachable|name resolution|getaddrinfo", low):
+        causes.append("a network, proxy or certificate problem - check the VPN / proxy settings, then try again.")
+    if re.search(r"invalid_grant|invalid verification code|bad request|did not accept", low):
+        causes.append("the verification code was wrong, incomplete or expired - start again and paste the new code.")
+    if re.search(r"reauthentication|policy|organization|blocked|access_denied|admin", low):
+        causes.append("your organization may require re-authentication or blocks this sign-in - ask your administrator, or use the browser flow (gcloud auth login).")
+    if re.search(r"prompt|non-interactive|eof|stdin|tty", low):
+        causes.append("gcloud could not ask for the code (no interactive input) - run the command in your own terminal instead.")
+    if not causes:
+        causes.append("the sign-in was closed or interrupted before it finished - run it again, or run the command in your own terminal.")
+    return causes
+
+
+def verify_signin(account=None):
+    """The 'Verify' check (read-only: `gcloud auth list`, the token usability check, `gcloud projects list`). Returns login_status()'s dict; on success it
+    also has "n_projects". A failed one has "state": "not_signed_in" and the reason in "detail" ("expired": True when the credentials are expired)."""
+    st = login_status(account)
+    if st["state"] != "ok":
+        return st
+    tok = account_status(st["who"])
+    st = dict(st, tok=tok)
+    if tok["state"] == "expired":
+        return dict(st, state="not_signed_in", expired=True, detail=tok.get("detail") or "credentials expired - Reauthentication required",
+                    hint="Run one of the commands shown in step 2 again.")
+    if tok["state"] == "unknown":
+        return dict(st, state="not_signed_in", detail=tok.get("detail") or "the credentials could not be used", hint="Run one of the commands shown in step 2 again.")
+    rows, err = load_accounts()
+    st["n_projects"] = len(rows)
+    st["projects_error"] = err
+    return st
+
+
+def verify_signin_follow(account=None):
+    """verify_signin(), and when the pinned / chosen account does not work but gcloud now has ANOTHER active account (the user signed in with a different
+    one), follow it: that account is pinned (nothing is written to gcloud) and verified instead."""
+    res = verify_signin(account)
+    if res.get("state") == "ok":
+        return res
+    pin = LOGIN_OPTS.get("account")
+    rows, _err = gcloud_accounts()
+    act = next((r["account"] for r in rows if r["active"]), None)
+    if pin and act and act != pin:
+        pin_account(act)
+        alt = verify_signin(account)
+        if alt.get("state") == "ok":
+            return alt
+        pin_account(pin)
+    return res
+
+
+def signin_failure_help(res, account=None):
+    """The exact error and which command to try next, after a failed verification. `res` = the dict of verify_signin() (or just the error text)."""
+    res = res if isinstance(res, dict) else {"detail": str(res or "")}
+    detail = str(res.get("detail") or "unknown error")
+    cmds = {i["key"]: i["cmd"] for i in manual_commands(account, True)}
+    low = detail.lower()
+    if res.get("state") == "no_cli":
+        nxt = f"{GCLOUD_MISSING_TEXT}. Install it from {GCLOUD_INSTALL_URL} (Windows: {GCLOUD_INSTALL_WINGET}), open a NEW terminal window and run: {cmds['device']}"
+    elif res.get("expired") or is_expired_error(detail):
+        nxt = f"Reauthentication required - the sign-in expired or was not completed. Run: {cmds['device']}"
+    elif "no credentials for" in low:
+        nxt = f"gcloud has no credentials for this account yet. Run: {cmds.get('device-account') or cmds['device']}"
+    else:
+        nxt = f"You are not signed in yet. Run: {cmds['device']}   (or: {cmds['browser']})"
+    return f"Verification failed: {_first_line(mask_tokens(detail), 200)}\nNext: {nxt}   Then press 'I have signed in - Verify' again."
+
+
+def terminal_signin_plan(form, account=None):
+    """(Popen args, displayed command, None) or (None, None, reason): the PowerShell window of 'Open a terminal for me'. User-initiated LOCAL-ONLY
+    exception: only `gcloud auth login [--no-launch-browser] [--account X]`, checked by the same strict guard as every other sign-in command."""
+    if form not in _TERMINAL_FORMS:
+        return None, None, f"'{form}' is not one of the sign-in commands"
+    if form == "device-account" and not (account and EMAIL_RE.match(account)):
+        return None, None, "Type your Google account (an email address) in the 'hint' box first."
+    flags = {"device": ["--no-launch-browser"], "device-account": ["--no-launch-browser", "--account", account or ""], "browser": []}[form]
+    if not shutil.which("gcloud"):
+        return None, None, GCLOUD_MISSING_TEXT + ". " + GCLOUD_INSTALL_HINT
+    why = gcloud_violation(["auth", "login", *flags], local_ok=True)
+    if why:
+        return None, None, guard_block("login", ["auth", "login", *flags], why)
+    line = " ".join(["gcloud", "auth", "login", *flags])
+    shell = shutil.which("powershell") or shutil.which("pwsh") or "powershell"
+    return [shell, "-NoExit", "-Command", line], line, None
+
+
+def open_terminal_signin(form, account=None, popen=None):
+    """Start a visible PowerShell window that runs the chosen `gcloud auth login` form and stays open (CREATE_NEW_CONSOLE). The tool does not wait for it.
+    Returns (ok, command text or reason)."""
+    args, line, why = terminal_signin_plan(form, account)
+    if why:
+        return False, why
+    if os.name != "nt":
+        return False, "Opening a terminal is only done on Windows - copy the command and run it in your own terminal."
+    env = dict(os.environ)
+    env.pop("CLOUDSDK_CORE_DISABLE_PROMPTS", None)           # an interactive sign-in: prompts must stay enabled
+    try:
+        (popen or subprocess.Popen)(args, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10), env=env)
+    except Exception as exc:
+        return False, f"could not open a terminal: {exc}"
+    return True, line
+
+
+def manual_signin_cli(emit=print, reason=None, input_fn=None, status_fn=None):
+    """Command line, manual method: print the numbered command block, wait for Enter, verify (read-only), repeat on failure.
+    Returns True when signed in; False on Ctrl+C / no input (stdin is not interactive)."""
+    account = LOGIN_OPTS.get("account")
+    for line in manual_signin_block(account, reason):
+        emit(line)
+    ask = input_fn or input
+    while True:
+        try:
+            ask("Press Enter after you have signed in, or Ctrl+C to stop: ")
+        except (KeyboardInterrupt, EOFError):
+            emit("")
+            emit("Stopped waiting - no sign-in was verified. Run one of the commands above in your terminal, then run this tool again.")
+            return False
+        st = (status_fn or verify_signin)()
+        if st.get("state") == "ok":
+            n = st.get("n_projects")
+            emit(f"Signed in as {st.get('who') or '?'}" + (f" - {n} project{'s' if n != 1 else ''}" if n is not None else ""))
+            return True
+        for line in signin_failure_help(st, account).splitlines():
+            emit(line)
 
 
 def cli_sign_in(emit, account=None):
@@ -506,26 +1196,65 @@ def cli_sign_in(emit, account=None):
 
 
 def cli_ensure_gcloud(emit):
-    """True when gcloud is installed and has an ACTIVE account (`gcloud auth list --filter=status:ACTIVE`). If not,
-    runs `gcloud auth login` interactively (--no-launch-browser with --device-code) and checks again."""
+    """True when gcloud is installed and has an ACTIVE (or the pinned) account (`gcloud auth list`). If not, signs in: with the device code /
+    no-browser flow (default; the console shows the link and asks for the code) or `gcloud auth login` in a console / browser window."""
     exe = shutil.which("gcloud")
+    method = LOGIN_OPTS.get("signin") or "manual"
     if not exe:
-        emit("Google Cloud CLI (gcloud) was not found on PATH - install it (https://cloud.google.com/sdk/docs/install), then run: gcloud auth login")
-        return False
+        if method == "manual" and not LOGIN_OPTS["gui"]:
+            if not manual_signin_cli(emit, "Google Cloud CLI (gcloud) was not found on PATH."):
+                return False
+            exe = shutil.which("gcloud")
+            if not exe:
+                emit("gcloud is still not found on PATH. Open a NEW terminal window (the PATH of this one does not know the new install) and run this tool again.")
+                return False
+        else:
+            emit("Google Cloud CLI (gcloud) was not found on PATH - install it (" + GCLOUD_INSTALL_URL + "; Windows: " + GCLOUD_INSTALL_WINGET
+                 + "), open a NEW terminal window, then run: gcloud auth login --no-launch-browser")
+            return False
 
     def active():
         return _gcloud_active_account()[0]
     who = active()
+    hint = LOGIN_OPTS.get("account")
     if who:
-        emit(f"gcloud is signed in as {who}")
-        return True
-    emit("gcloud has no active account.")
-    cmd = [exe, "auth", "login"] + (["--no-launch-browser"] if LOGIN_OPTS["device_code"] else [])
-    rc = _run_interactive(cmd, emit)
-    if rc != 0:
-        emit("gcloud auth login failed or was cancelled" + (f" (exit code {rc})" if rc else "") + ".")
+        known = AUTH_STATE["status"].get(who)
+        st = ("active", 0) if (known and known[0] == "active" and time.time() - known[1] < 600) else None
+        state_now = st[0] if st else account_status(who)["state"]
+        if state_now != "expired":
+            emit(f"gcloud is signed in as {who}")
+            return True
+        emit(f"Credentials for {who} expired (the sign-in session ended). Signing in again ...")
+        hint = who
+    else:
+        emit("gcloud has no active account" + (f" for {hint}" if hint else "") + ".")
+    if LOGIN_OPTS["gui"] and (method == "manual" or (method == "captured" and LOGIN_OPTS["device_code"])):
+        emit("Sign in with the 'Sign in' button in step 2 (the commands are shown there; for the captured method it shows the link and the code box), "
+             "then run again.")
         return False
+    if method == "manual":
+        reason = f"Credentials for {who} expired (the sign-in session ended)." if who else ("gcloud has no active account" + (f" for {hint}" if hint else "") + ".")
+        if not manual_signin_cli(emit, reason):
+            return False
+    elif method == "captured" and LOGIN_OPTS["device_code"]:
+        ok, why = cli_device_login(emit, hint)
+        if not ok:
+            emit("gcloud auth login failed or was cancelled" + (f": {why}" if why else "") + ".")
+            emit("You can sign in yourself instead: run `gcloud auth login --no-launch-browser` in your own terminal, then run this tool again.")
+            return False
+    else:                                                  # console: gcloud in its own console window
+        flags = ["--no-launch-browser"] if (LOGIN_OPTS["device_code"] and method == "console") else []
+        rc = _run_interactive([exe, "auth", "login"] + flags + (["--account", hint] if hint else []), emit)
+        if rc != 0:
+            emit("gcloud auth login failed or was cancelled" + (f" (exit code {rc})" if rc else "") + ".")
+            return False
     who = active()
+    if who and account_status(who)["state"] == "expired":
+        emit(f"Credentials for {who} are still expired after the sign-in.")
+        return False
+    if not who and not hint:
+        rows, _err = gcloud_accounts()
+        who = next((r["account"] for r in rows if r["active"]), None)
     if not who:
         emit("Still no active gcloud account after gcloud auth login.")
         return False
@@ -540,6 +1269,31 @@ def load_accounts():
              "info": " ".join(x for x in ((i.get("state") or ""), ("[default]" if i.get("default") else "")) if x),
              "usable": i.get("state") in (None, "ACTIVE")} for pid, i in projects.items()]
     return sorted(rows, key=lambda a: (a["name"].lower(), a["id"])), err
+
+
+CONFIRM_OVER = 20            # collecting clusters from more projects than this asks for a confirmation first
+CONFIRM_HOOK = {"fn": None}  # tests replace it: fn(count) -> bool
+
+
+def confirm_many(n):
+    """One-line confirmation before a large cluster search (window only)."""
+    if CONFIRM_HOOK["fn"]:
+        return bool(CONFIRM_HOOK["fn"](n))
+    from tkinter import messagebox
+    return messagebox.askyesno("Collect clusters", f"This will search {n} projects and can take several minutes. Continue?")
+
+
+def parse_project_scope(value):
+    """--project value -> (scope, single_project): 'all' -> ("all", None); 'a,b,c' -> (["a","b","c"], None); 'a' -> (None, "a"); None -> (None, None)."""
+    v = (value or "").strip()
+    if not v:
+        return None, None
+    if v.lower() == "all":
+        return "all", None
+    parts = [x.strip() for x in v.split(",") if x.strip()]
+    if len(parts) > 1:
+        return list(dict.fromkeys(parts)), None
+    return None, parts[0] if parts else None
 
 
 LIST_WORKERS = 8             # parallel `gcloud container clusters list` calls
@@ -730,19 +1484,26 @@ def list_clusters_cli(emit=print, accounts=None, progress=None, cancel=None, on_
                 emit("The Google Cloud CLI (gcloud) is not available / not signed in - showing only the clusters from the gkelogin menu.")
                 return dict(menu)
             return {}
-        if GCP_OPTS.get("project") and not all_projects:
-            projects = [GCP_OPTS["project"]]
-        else:
+        scope = GCP_OPTS.get("scope")
+        if scope == "all" or all_projects:
             projects = [pid for pid, i in list_gcp_projects().items() if i.get("state") in (None, "ACTIVE")]
-            if not projects and gcp_default_project():
-                projects = [gcp_default_project()]
-            if not projects:
-                emit("No GCP project found - pass --project ID (or: gcloud config set project ID).")
-                return dict(menu) if menu else {}
-            if len(projects) > 20:
-                emit(f"Searching {len(projects)} projects for GKE clusters (use --project to choose one) ...")
+            emit("Cluster search scope: ALL projects gcloud can see (--project all)" + (f" - {len(projects)} projects, this can take several minutes." if projects else "."))
+        elif isinstance(scope, list):
+            projects = list(scope)
+            emit(f"Cluster search scope: {len(projects)} project(s) from --project: " + ", ".join(projects[:10]) + (" ..." if len(projects) > 10 else ""))
+        elif GCP_OPTS.get("project"):
+            projects = [GCP_OPTS["project"]]
+            emit(f"Cluster search scope: project {projects[0]} (--project)")
+        else:
+            dp = gcp_default_project()
+            projects = [dp] if dp else []
+            if dp:
+                emit(f"Cluster search scope: only the currently configured project {dp} (gcloud config). Use --project a,b,c or --project all to search more.")
+        if not projects:
+            emit("No project to search: pass --project ID, --project a,b,c or --project all (or: gcloud config set project ID).")
+            return dict(menu) if menu else {}
         accounts = [{"id": pid, "name": pid} for pid in projects]
-        inventory = all_projects or GCP_OPTS.get("project") is None
+        inventory = len(projects) >= INVENTORY_MIN_PROJECTS
     found, failed = scan_clusters(accounts, emit, progress, cancel, on_batch, inventory)
     rows = merge_menu(found, menu) if menu is not None else found
     if not rows:
@@ -780,7 +1541,7 @@ def cli_login(number, label, emit):
 # anything inside the cluster. Every kubectl / gcloud command is checked against an ALLOW-LIST before a process is started; anything else is
 # refused ("blocked: read-only mode - '<verb>' is not allowed"), no process is spawned, the attempt is recorded and shown in the report.
 # LOCAL-ONLY exceptions (they write only on THIS machine, never to the cluster or the cloud): the user's own interactive sign-in
-# (`gcloud auth login`), `gcloud container clusters get-credentials` (writes the local kubeconfig), `kubectl config use-context` (local kubeconfig)
+# (exactly `gcloud auth login [--no-launch-browser] [--account X]`), `gcloud container clusters get-credentials` (writes the local kubeconfig), `kubectl config use-context` (local kubeconfig)
 # and the custom gkelogin.exe the user chose. Install hints are printed text only; nothing is ever installed or downloaded.
 # ---------------------------------------------------------------------------
 
@@ -804,6 +1565,8 @@ READ_ONLY_CLOUD_COMMANDS = (
     ("compute", "packet-mirrorings", "list"), ("network-management", "connectivity-tests", "list"), ("logging", "read"),
 )
 LOCAL_ONLY_CLOUD_COMMANDS = (("auth", "login"), ("container", "clusters", "get-credentials"))     # local machine only (sign-in, local kubeconfig)
+AUTH_LOGIN_FLAGS = ("--no-launch-browser",)             # the only flags `gcloud auth login` may carry, besides `--account X` (never --no-browser, --cred-file, --brief ...)
+# `--account X` is a global flag: it only says WHICH signed-in account a read command uses. The tool adds it to every gcloud call; nothing is written.
 READ_ONLY_API_URLS = (("GET", "https://monitoring.googleapis.com/v3/projects/", "/timeSeries"),         # Cloud Monitoring timeSeries.list
                       ("POST", "https://logging.googleapis.com/v2/entries:list", ""))                    # Cloud Logging entries.list (a read, sent as POST)
 
@@ -874,16 +1637,30 @@ def kubectl_violation(args, local_ok=True):
 def gcloud_violation(args, local_ok=False):
     """None when the gcloud arguments (without the executable) are on the READ_ONLY_CLOUD_COMMANDS allow-list."""
     path = []
-    for x in (args or []):
-        if str(x).startswith("-"):
-            break
-        path.append(str(x))
+    rest = []
+    a = [str(x) for x in (args or [])]
+    i = 0
+    while i < len(a):                          # the global flag --account X (or --account=X) is allowed anywhere; it is taken out first
+        if a[i] == "--account":
+            i += 2
+            continue
+        if a[i].startswith("--account="):
+            i += 1
+            continue
+        if a[i].startswith("-") or rest:
+            rest.append(a[i])
+        else:
+            path.append(a[i])
+        i += 1
     for entry in READ_ONLY_CLOUD_COMMANDS:
         if tuple(path[:len(entry)]) == entry:
             return None
     if local_ok:
         for entry in LOCAL_ONLY_CLOUD_COMMANDS:
             if tuple(path[:len(entry)]) == entry:
+                if entry == ("auth", "login"):        # exactly: auth login [--no-launch-browser] [--account X] - nothing else
+                    if len(path) != 2 or any(x not in AUTH_LOGIN_FLAGS for x in rest):
+                        return "'auth login' is only allowed as: gcloud auth login [--no-launch-browser] [--account EMAIL]"
                 return None
     return f"'{' '.join(path[:3]) or ' '.join(str(x) for x in (args or [])[:2])}' is not allowed"
 
@@ -897,7 +1674,10 @@ def api_violation(method, url):
 
 def _gcloud_env():
     """Environment of every non-interactive gcloud call: nothing may prompt, auto-update or install a component."""
-    return dict(os.environ, CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK="1", CLOUDSDK_CORE_DISABLE_PROMPTS="1")
+    env = dict(os.environ, CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK="1", CLOUDSDK_CORE_DISABLE_PROMPTS="1")
+    if LOGIN_OPTS.get("account"):
+        env["CLOUDSDK_CORE_ACCOUNT"] = LOGIN_OPTS["account"]       # the same pin for what gcloud runs internally (nothing is written to its config)
+    return env
 
 
 def guard_summary_lines(delta):
@@ -926,8 +1706,9 @@ def kubectl(args, timeout=KUBECTL_TIMEOUT):
     if KUBE_CONTEXT and not (args and args[0] == "config" and len(args) > 1 and args[1] in ("get-contexts", "use-context", "current-context")):
         args = ["--context", KUBE_CONTEXT, *args]
     try:
+        extra = {"env": dict(os.environ, CLOUDSDK_CORE_ACCOUNT=LOGIN_OPTS["account"])} if LOGIN_OPTS.get("account") else {}   # the gke auth plugin runs gcloud with this
         proc = subprocess.run([exe, *args], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=timeout)
+                              encoding="utf-8", errors="replace", timeout=timeout, **extra)
     except subprocess.TimeoutExpired:
         return False, f"timed out after {timeout}s"
     except Exception as exc:
@@ -1862,7 +2643,7 @@ MAX_CP_LOG_LINES = 30        # control-plane error lines shown
 LOW_SUBNET_IPS = 50          # warn when a cluster subnet has fewer free IPs than this
 LOGGING_COMPONENTS = ["SYSTEM_COMPONENTS", "WORKLOADS", "APISERVER", "SCHEDULER", "CONTROLLER_MANAGER"]
 DEFAULT_SA = re.compile(r"^\d+-compute@developer\.gserviceaccount\.com$")
-_TOKEN = {"value": None, "at": 0.0}
+_TOKEN = {"value": None, "at": 0.0, "account": None}
 _TOKEN_LOCK = threading.Lock()
 _API_ALLOWED = ("https://monitoring.googleapis.com/v3/", "https://logging.googleapis.com/v2/entries:list")
 
@@ -1877,6 +2658,9 @@ def gcloud(args, target=None, timeout=90, project=True, fmt="json"):
         return None, "Google Cloud CLI (gcloud) was not found on PATH"
     guard_allow()
     cmd = [exe, *args, "--quiet"]
+    pin = LOGIN_OPTS.get("account")
+    if pin and "--account" not in args and tuple(str(x) for x in args[:2]) != ("auth", "list") and tuple(str(x) for x in args[:3]) != ("config", "get-value", "account"):
+        cmd += ["--account", pin]                          # the chosen account is pinned on every call (`auth list` lists all accounts, so it is the one exception)
     if fmt:
         cmd.append(f"--format={fmt}")
     proj = (target or {}).get("project")
@@ -1889,7 +2673,12 @@ def gcloud(args, target=None, timeout=90, project=True, fmt="json"):
     except Exception as exc:
         return None, str(exc)
     if proc.returncode != 0:
-        return None, (proc.stderr or proc.stdout).strip() or f"gcloud exited with {proc.returncode}"
+        text = (proc.stderr or proc.stdout).strip() or f"gcloud exited with {proc.returncode}"
+        if is_expired_error(text):
+            who = cmd[cmd.index("--account") + 1] if "--account" in cmd else None
+            mark_expired(who, text)
+            return None, mask_tokens(CREDS_EXPIRED_TEXT + " (" + _first_line(text, 120) + ")")
+        return None, text
     try:
         return (json.loads(proc.stdout) if proc.stdout.strip() else {}), None
     except json.JSONDecodeError:
@@ -1901,16 +2690,16 @@ def _first_line(err, n=170):
 
 
 def gcp_token():
-    """An access token from `gcloud auth print-access-token` (kept in memory ~30 min, never printed or saved)."""
-    if _TOKEN["value"] and time.time() - _TOKEN["at"] < 1800:
+    """An access token from `gcloud auth print-access-token [--account X]` (kept in memory ~30 min, never printed or saved)."""
+    if _TOKEN["value"] and time.time() - _TOKEN["at"] < 1800 and _TOKEN.get("account") == LOGIN_OPTS.get("account"):
         return _TOKEN["value"], None
     with _TOKEN_LOCK:                      # several parallel Monitoring / Logging calls must not each ask gcloud for a token
-        if _TOKEN["value"] and time.time() - _TOKEN["at"] < 1800:
+        if _TOKEN["value"] and time.time() - _TOKEN["at"] < 1800 and _TOKEN.get("account") == LOGIN_OPTS.get("account"):
             return _TOKEN["value"], None
         out, err = gcloud(["auth", "print-access-token"], None, 60, project=False, fmt=None)
         if err or not isinstance(out, str) or not out.strip():
             return None, err or "no access token (run: gcloud auth login)"
-        _TOKEN["value"], _TOKEN["at"] = out.strip(), time.time()
+        _TOKEN["value"], _TOKEN["at"], _TOKEN["account"] = out.strip(), time.time(), LOGIN_OPTS.get("account")
         return _TOKEN["value"], None
 
 
@@ -1935,6 +2724,11 @@ def gcp_api(method, url, body=None, timeout=90):
             msg = (json.loads(exc.read().decode("utf-8", "replace")).get("error") or {}).get("message")
         except Exception:
             msg = None
+        if exc.code == 401:
+            with _TOKEN_LOCK:
+                _TOKEN["value"] = None
+            mark_expired(None, f"HTTP 401 {msg or ''}")
+            return None, CREDS_EXPIRED_TEXT + f" (HTTP 401: {msg or exc.reason})"
         return None, f"HTTP {exc.code}: {msg or exc.reason}"
     except Exception as exc:
         return None, str(exc)
@@ -7985,6 +8779,7 @@ def run_clusters(selected, minutes, emit, skip_login=False, context=None, progre
     if n > 1 and context:
         emit("NOTE: --context applies to a single cluster and is ignored when several are selected.")
     entries = []
+    expired_run = None
     for i, (number, label) in enumerate(selected, start=1):
         entry = {"number": number, "label": label, "status": "not run", "html": None, "txt": None,
                  "counts": Counter(), "findings": [], "titles": {}, "secs": None, "error": None, "plan": None}
@@ -8002,6 +8797,11 @@ def run_clusters(selected, minutes, emit, skip_login=False, context=None, progre
         finding_cb = on_finding
         if on_finding and n > 1:
             finding_cb = lambda sev, text, _l=label: on_finding(sev, f"[{_l}] {text}")
+        if expired_run and LOGIN_OPTS["method"] == "cli":          # the account's sign-in ended: do not ask for it again for every cluster
+            entry.update(status="credentials expired", error=f"Credentials for {expired_run} expired - sign in again.", secs=0)
+            emit(f"Cluster {label}: skipped - credentials for {expired_run} expired. Sign in again and run it again.")
+            notify(i, n, label, entry["status"], entry)
+            continue
         try:
             result = login_and_debug(number, label, minutes, emit, skip_login, context if n == 1 else None,
                                      progress, cancel, options, finding_cb)
@@ -8009,8 +8809,15 @@ def run_clusters(selected, minutes, emit, skip_login=False, context=None, progre
                          html=str(result), txt=getattr(result, "txt", None), counts=getattr(result, "counts", Counter()),
                          findings=getattr(result, "findings", []), titles=getattr(result, "section_titles", {}), plan=getattr(result, "plan", None))
         except Exception as exc:
-            entry.update(status="failed", error=str(exc))
-            emit(f"ERROR on cluster {label}: {exc}")
+            acct_now = LOGIN_OPTS.get("account") or AUTH_STATE.get("last")
+            if is_expired_error(str(exc)) or (acct_now and acct_now in AUTH_STATE["expired"] and "not logged in" in str(exc)):
+                expired_run = acct_now or "the account"
+                mark_expired(acct_now, str(exc))
+                entry.update(status="credentials expired", error=f"Credentials for {expired_run} expired - sign in again.")
+                emit(f"ERROR on cluster {label}: credentials for {expired_run} expired - sign in again.")
+            else:
+                entry.update(status="failed", error=mask_tokens(exc))
+                emit(f"ERROR on cluster {label}: {mask_tokens(exc)}")
         entry["secs"] = time.time() - t0
         notify(i, n, label, entry["status"], entry)
 
@@ -8111,16 +8918,18 @@ def run_gui(default_minutes, skip_login=False, context=None):
     import webbrowser
     from tkinter import ttk, scrolledtext
 
+    if _SESSION.get("signin") in SIGNIN_METHOD_LABELS:
+        LOGIN_OPTS["signin"] = _SESSION["signin"]            # the sign-in method chosen earlier in this session
     root = tk.Tk()
     root.title(PRODUCT_TITLE)
-    root.geometry("1180x760")          # comfortable at 1100 x 700 and above; everything resizes with the window
+    root.geometry("1180x840")          # comfortable at 1100 x 700 and above; everything resizes with the window
     root.minsize(980, 620)
     msgs = queue.Queue()
     state = {"busy": False, "cancel": None, "html": None, "t0": None, "finished": 0, "total": 1,
              "counts": Counter(), "clusters": {}, "reports": {}, "n": 1,
              "auth": {"state": "unchecked"}, "checking": False, "signing": False, "auth_for": None, "recheck": None,
              "accounts": [], "acct_by_id": {}, "acct_chosen": set(), "acct_loading": False, "accounts_loaded": False,
-             "acct_locked": False, "cl_locked": False, "pre": False,
+             "acct_locked": False, "cl_locked": False, "pre": False, "acct_status": {}, "acct_rows": [], "acct_map": {}, "acct_gen": 0,
              "crows": [], "by_key": {}, "cchosen": set(), "listing": False, "list_cancel": None, "listed": set(),
              "list_done": 0, "list_total": 0, "rebuild": False, "said": [], "menu": {}, "src_user": False, "src_fallback": False}
     ICON = {"pending": "o", "running": ">>", "done": "OK", "failed": "FAILED", "skipped": "-"}
@@ -8236,8 +9045,44 @@ def run_gui(default_minutes, skip_login=False, context=None):
         return f"{n} {noun}" + ("" if n == 1 else "s")
 
     # ---- guide: steps 1 - 4 (login method, sign in, choose project, choose clusters) with a message line
-    guide = ttk.Frame(tab1, style="Page.TFrame", padding=(6, 4, 6, 0))
-    guide.pack(fill="both", expand=True)
+    # the page scrolls when the window is too small for steps 1-4 plus the sign-in details (small screens)
+    guide_canvas = tk.Canvas(tab1, highlightthickness=0, bg=PAGE)
+    guide_scroll = ttk.Scrollbar(tab1, orient="vertical", command=guide_canvas.yview)
+    guide_canvas.configure(yscrollcommand=guide_scroll.set)
+    guide_scroll.pack(side="right", fill="y")
+    guide_canvas.pack(side="left", fill="both", expand=True)
+    guide = ttk.Frame(guide_canvas, style="Page.TFrame", padding=(6, 4, 6, 0))
+    guide_win = guide_canvas.create_window(0, 0, window=guide, anchor="nw")
+
+    def fit_guide(_event=None):
+        w, h = max(1, guide_canvas.winfo_width()), max(1, guide_canvas.winfo_height())
+        need = guide.winfo_reqheight()
+        guide_canvas.itemconfigure(guide_win, width=w, height=max(h, need))
+        guide_canvas.configure(scrollregion=(0, 0, w, max(h, need)))
+        if need <= h:
+            guide_scroll.pack_forget()
+        elif not guide_scroll.winfo_ismapped():
+            guide_scroll.pack(side="right", fill="y", before=guide_canvas)
+    guide_canvas.bind("<Configure>", fit_guide)
+    guide.bind("<Configure>", fit_guide)
+
+    def guide_wheel(event):
+        under = root.winfo_containing(event.x_root, event.y_root)
+        if under is None or under.winfo_class() in ("Treeview", "Text", "Listbox", "TCombobox", "Entry", "TEntry") or not str(under).startswith(str(tab1)):
+            return
+        if guide_scroll.winfo_ismapped():
+            guide_canvas.yview_scroll(int(-event.delta / 120), "units")
+    root.bind_all("<MouseWheel>", guide_wheel, add="+")
+
+    def scroll_to(widget):
+        """Bring a widget of the guide into view (the sign-in details when the link appears)."""
+        try:
+            root.update_idletasks()
+            need = max(1, guide.winfo_reqheight())
+            if guide_scroll.winfo_ismapped():
+                guide_canvas.yview_moveto(max(0.0, min(1.0, (widget.winfo_y() - 8) / need)))
+        except Exception:
+            pass
     row12 = ttk.Frame(guide, style="Page.TFrame")
     row12.pack(fill="x")
     s1_o, s1 = card(row12, f"{S_ICO['login']}  Step 1 - Login method", BRAND_COLORS[0])
@@ -8249,11 +9094,11 @@ def run_gui(default_minutes, skip_login=False, context=None):
     ttk.Label(s1, textvariable=method_info, wraplength=330, justify="left", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
     ttk.Label(s1, text="Read-only guarantee: this tool only reads. It installs, creates, changes and deletes nothing on the cluster or in the cloud.",
               style="Muted.TLabel", wraplength=330, justify="left", foreground=BRAND_ACCENT).pack(anchor="w", pady=(4, 0))
-    src_var = tk.StringVar(value="all" if shutil.which("gcloud") else "menu")     # which clusters the list (step 4) shows (custom login only)
+    src_var = tk.StringVar(value="menu")     # which clusters the list (step 4) shows (custom login only): the gkelogin menu (instant) or gcloud, on demand
     ttk.Label(s1, text="Cluster list:").pack(anchor="w", pady=(6, 0))
-    src_all_rb = ttk.Radiobutton(s1, text="All clusters I can access (via gcloud)", value="all", variable=src_var)
+    src_all_rb = ttk.Radiobutton(s1, text="Collect clusters with gcloud from selected projects (on demand)", value="all", variable=src_var)
     src_all_rb.pack(anchor="w")
-    src_menu_rb = ttk.Radiobutton(s1, text="Only the clusters from gkelogin menu", value="menu", variable=src_var)
+    src_menu_rb = ttk.Radiobutton(s1, text="Clusters from the gkelogin menu (instant)", value="menu", variable=src_var)
     src_menu_rb.pack(anchor="w")
     s2_o, s2 = card(row12, f"{S_ICO['cloud']}  Step 2 - Sign in", BRAND_COLORS[1])
     s2_o.pack(side="left", fill="both", expand=True, padx=(8, 0))
@@ -8266,11 +9111,106 @@ def run_gui(default_minutes, skip_login=False, context=None):
     signin_btn.pack(side="left", padx=(8, 4))
     check_btn = ttk.Button(s2a, text="Check status")
     check_btn.pack(side="left")
+    s2m = ttk.Frame(s2)
+    s2m.pack(fill="x", pady=(2, 0))
+    ttk.Label(s2m, text="Sign-in method:").pack(side="left")
+    signin_var = tk.StringVar(value=SIGNIN_METHOD_LABELS[LOGIN_OPTS.get("signin") or "manual"])
+    signin_combo = ttk.Combobox(s2m, width=44, state="readonly", textvariable=signin_var, values=[SIGNIN_METHOD_LABELS[k] for k in ("manual", "captured", "console")])
+    signin_combo.pack(side="left", padx=6)
     device_var = tk.BooleanVar(value=LOGIN_OPTS["device_code"])
-    device_chk = ttk.Checkbutton(s2a, text="no-browser login (gcloud auth login --no-launch-browser)", variable=device_var)
-    device_chk.pack(side="left", padx=(12, 0))
+    s2d = ttk.Frame(s2)
+    s2d.pack(fill="x", pady=(2, 0))
+    device_chk = ttk.Checkbutton(s2d, text="Use device code / no-browser sign-in (default)", variable=device_var)
+    device_chk.pack(side="left")
+    autowrap(ttk.Label(s2d, style="Muted.TLabel", justify="left", wraplength=300,
+                       text="No browser opens here: you get a link, open it on any device, sign in, and paste the code Google shows."), 8).pack(side="left", fill="x", expand=True, padx=(8, 0))
+    s2b = ttk.Frame(s2)
+    s2b.pack(fill="x", pady=(2, 0))
+    ttk.Label(s2b, text="Account:").pack(side="left")
+    acct_combo = ttk.Combobox(s2b, width=38, state="normal", values=[])      # type to filter the list (type-ahead) when there are many accounts
+    acct_combo.pack(side="left", padx=4)
+    use_acct_btn = ttk.Button(s2b, text="Use this account")
+    use_acct_btn.pack(side="left")
+    acct_chip = tk.Label(s2b, text="", fg="white", bg=COLORS["dim"], padx=8, pady=1, font=("Segoe UI", 9, "bold"))
+    acct_chip.pack(side="left", padx=6)
+    s2c = ttk.Frame(s2)
+    s2c.pack(fill="x", pady=(2, 0))
+    diff_btn = ttk.Button(s2c, text="Sign in with a different account")
+    diff_btn.pack(side="left")
+    ttk.Label(s2c, text=" hint:").pack(side="left")
+    hint_var = tk.StringVar(value="")
+    hint_entry = ttk.Entry(s2c, textvariable=hint_var, width=18)
+    hint_entry.pack(side="left", padx=2)
+    check_all_btn = ttk.Button(s2c, text="Check all accounts / Re-check")
+    check_all_btn.pack(side="left", padx=(6, 0))
+    sd_toggle_btn = ttk.Button(s2c, text="Hide sign-in details")
+    st_wrap = ttk.Frame(s2)
+    st_wrap.pack(fill="x", pady=(4, 0))
+    acct_st_tree = ttk.Treeview(st_wrap, columns=("status",), show="tree headings", selectmode="browse", height=2)
+    acct_st_tree.heading("#0", text="Account (all accounts gcloud knows)")
+    acct_st_tree.heading("status", text="Status")
+    acct_st_tree.column("#0", width=270)
+    acct_st_tree.column("status", width=210)
+    acct_st_sc = ttk.Scrollbar(st_wrap, orient="vertical", command=acct_st_tree.yview)
+    acct_st_tree.configure(yscrollcommand=acct_st_sc.set)
+    acct_st_sc.pack(side="right", fill="y")
+    acct_st_tree.pack(side="left", fill="x", expand=True)
+    for _tag, _col in (("active", "#067647"), ("expired", "#c00000"), ("signed_out", "#777777"), ("unknown", "#777777"), ("checking", "#1f4e79")):
+        acct_st_tree.tag_configure(_tag, foreground=_col)
     auth_msg = tk.StringVar(value="")
     autowrap(ttk.Label(s2, textvariable=auth_msg, wraplength=520, justify="left")).pack(fill="x", pady=(4, 0))
+    # ---- sign-in details panel (device code): the instructions, the full link, the code box; shown while / after a sign-in attempt.
+    # It is a full-width row between the steps 1-2 and the steps 3-4 (packed there by sd_show), so the link and the code box are never cut off.
+    sd = ttk.LabelFrame(guide, text="Sign-in details (device code)", padding=6)
+    sd_right = ttk.Frame(sd)
+    sd_right.pack(side="right", fill="y", padx=(12, 0))
+    sd_left = ttk.Frame(sd)
+    sd_left.pack(side="left", fill="both", expand=True)
+    sd_steps = ttk.Label(sd_left, text=chr(10).join(SIGNIN_STEPS), justify="left", wraplength=640)
+    autowrap(sd_steps, 8).pack(anchor="w", fill="x")
+    sd_url_wrap = ttk.Frame(sd_left)
+    sd_url_wrap.pack(fill="x", pady=(4, 0))
+    sd_url = tk.Text(sd_url_wrap, height=3, wrap="char", font=("Consolas", 9), fg="#1a0dab", relief="solid", borderwidth=1, cursor="arrow", width=40)
+    sd_url_sc = ttk.Scrollbar(sd_url_wrap, orient="vertical", command=sd_url.yview)
+    sd_url.configure(yscrollcommand=sd_url_sc.set, state="disabled")
+    sd_url_sc.pack(side="right", fill="y")
+    sd_url.pack(side="left", fill="x", expand=True)
+    sd_url.tag_configure("link", foreground="#1a0dab", underline=True)
+    sd_btns = ttk.Frame(sd_left)
+    sd_btns.pack(fill="x", pady=(4, 0))
+    sd_open_btn = ttk.Button(sd_btns, text="Open in browser")
+    sd_open_btn.pack(side="left")
+    sd_copy_btn = ttk.Button(sd_btns, text="Copy URL")
+    sd_copy_btn.pack(side="left", padx=4)
+    ttk.Label(sd_right, text="Paste the verification code here:").pack(anchor="w")
+    sd_code_row = ttk.Frame(sd_right)
+    sd_code_row.pack(fill="x", pady=(2, 0))
+    code_var = tk.StringVar(value="")
+    sd_code = ttk.Entry(sd_code_row, textvariable=code_var, width=24, show="•")
+    sd_code.pack(side="left")
+    sd_submit_btn = ttk.Button(sd_code_row, text="Submit code")
+    sd_submit_btn.pack(side="left", padx=(4, 0))
+    sd_status_row = ttk.Frame(sd_right)
+    sd_status_row.pack(fill="x", pady=(8, 0))
+    sd_chip = tk.Label(sd_status_row, text="Idle", fg="white", bg=COLORS["dim"], padx=8, pady=1, font=("Segoe UI", 9, "bold"))
+    sd_chip.pack(side="left")
+    sd_cancel_btn = ttk.Button(sd_status_row, text="Cancel sign-in")
+    sd_cancel_btn.pack(side="right")
+    sd_count = tk.StringVar(value="")
+    ttk.Label(sd_right, textvariable=sd_count, width=44).pack(anchor="w", pady=(4, 0))
+    sd_result = tk.StringVar(value="")
+    sd_result_lbl = ttk.Label(sd_right, textvariable=sd_result, justify="left", wraplength=360)
+    sd_result_lbl.pack(anchor="w", fill="x", pady=(2, 0))
+    sd_raw_hdr = ttk.Frame(sd_left)
+    sd_raw_hdr.pack(fill="x", pady=(6, 0))
+    ttk.Label(sd_raw_hdr, text="Raw output from gcloud", font=("Segoe UI", 9, "bold")).pack(side="left")
+    sd_raw_toggle = ttk.Button(sd_raw_hdr, text="Hide raw output")
+    sd_raw_toggle.pack(side="left", padx=6)
+    sd_cmd_var = tk.StringVar(value="")
+    sd_cmd_lbl = ttk.Label(sd_left, textvariable=sd_cmd_var, font=("Consolas", 9))
+    sd_cmd_lbl.pack(anchor="w")
+    sd_raw = tk.Text(sd_left, height=5, wrap="char", font=("Consolas", 8), relief="solid", borderwidth=1, state="disabled")
+    sd_raw.pack(fill="x", pady=(2, 0))
     LOGIN_OPTS["gui"] = True        # no console of our own: interactive logins get a window
 
     guide_msg = tk.Label(guide, text="", anchor="w", justify="left", font=("Segoe UI", 10, "bold"), padx=8, pady=4,
@@ -8305,7 +9245,9 @@ def run_gui(default_minutes, skip_login=False, context=None):
     box3.pack(fill="x")
     acct_count = tk.StringVar(value="")
     ttk.Label(s3, textvariable=acct_count).pack(anchor="w")
-    scope_var = tk.StringVar(value="all")
+    acct_sel_var = tk.StringVar(value="0 of 0 selected")
+    ttk.Label(s3, textvariable=acct_sel_var, font=("Segoe UI", 9, "bold"), foreground=BRAND_ACCENT).pack(anchor="w")
+    scope_var = tk.StringVar(value="sel" if LOGIN_OPTS["method"] == "cli" else "all")
     scope_row = ttk.Frame(s3)
     scope_row.pack(fill="x")
     scope_all_rb = ttk.Radiobutton(scope_row, text="", value="all", variable=scope_var)
@@ -8369,6 +9311,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
     clear_btn.pack(side="left", padx=4)
     refresh_btn = ttk.Button(c_btns, text="Reload clusters")
     refresh_btn.pack(side="left")
+    refresh_sel_btn = ttk.Button(c_btns, text="Refresh selected")
     manual_var = tk.StringVar(value="")
     ttk.Label(c_btns, text="  or type numbers:").pack(side="left")
     manual_entry = ttk.Entry(c_btns, textvariable=manual_var, width=16)
@@ -8636,6 +9579,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
             acct_tree.insert("", "end", iid=a["id"], text=a["name"], values=(a["code"], a["info"]), tags=(("odd",) if len(acct_tree.get_children()) % 2 else ()))
         acct_tree.selection_set([a["id"] for a in shown if a["id"] in state["acct_chosen"]])
         acct_count.set(f"Showing {len(shown)} of {len(state['accounts'])}")
+        acct_sel_var.set(f"{len(state['acct_chosen'])} of {len(state['accounts'])} selected")
 
     def on_acct_select(_event=None):
         if state["acct_locked"]:
@@ -8661,12 +9605,15 @@ def run_gui(default_minutes, skip_login=False, context=None):
 
     def acct_clear():
         state["acct_chosen"] = set()
-        scope_var.set("all")
+        scope_var.set("sel" if is_cli() else "all")
         rebuild_account_list()
         on_scope_change()
 
     def on_scope_change():
+        _SESSION["projects"] = sorted(state["acct_chosen"])            # remembered for the session
         update_scope_labels()
+        acct_sel_var.set(f"{len(state['acct_chosen'])} of {len(state['accounts'])} selected")
+
         sync_login_opts()
         rebuild_cluster_list()
         cluster_hint()
@@ -8700,6 +9647,8 @@ def run_gui(default_minutes, skip_login=False, context=None):
         for r in shown:
             cluster_tree.insert("", "end", iid=r["key"], text=(f"{r['number']} - {r['name']}" if r.get("number") else r["name"]),
                                 values=(r.get("where") or "", r.get("account_name") or ""), tags=(("odd",) if len(cluster_tree.get_children()) % 2 else ()))
+        if not rows and on_demand() and not state["listing"]:
+            cluster_tree.insert("", "end", iid="__hint__", text=COLLECT_HINT, tags=("hint",))
         cluster_tree.selection_set([r["key"] for r in shown if r["key"] in state["cchosen"]])
         cl_count.set(f"Showing {len(shown)} of {len(rows)}")
         update_selected_label()
@@ -8751,18 +9700,40 @@ def run_gui(default_minutes, skip_login=False, context=None):
         index_rows()
         rebuild_cluster_list()
 
+    COLLECT_HINT = "Select one or more projects above, then press 'Collect clusters from the selected projects'."
+
+    def on_demand():
+        """True when the cluster list is filled by the 'Collect clusters' button (Cloud CLI login, or the custom login's gcloud source)."""
+        return is_cli() or src_var.get() == "all"
+
+    def selected_projects():
+        """The projects a collection covers: the ones selected in step 3 ('All projects' only when the user chose that option explicitly)."""
+        if is_cli():
+            return effective_accounts()
+        return [a for a in state["accounts"] if a["id"] in state["acct_chosen"]]
+
+    def update_collect_button():
+        if on_demand():
+            refresh_btn.configure(text="Collect clusters from selected projects", style="Accent.TButton")
+            if not refresh_sel_btn.winfo_ismapped():
+                refresh_sel_btn.pack(side="left", padx=(4, 0), after=refresh_btn)
+        else:
+            refresh_btn.configure(text="Reload clusters", style="TButton")
+            refresh_sel_btn.pack_forget()
+
     def cluster_hint():
         """The line under the cluster list: where the list stands."""
         if state["cl_locked"]:
             cl_status.set("Sign in first (step 2).")
         elif state["listing"]:
-            cl_status.set(f"Listing clusters: {state['list_done']}/{state['list_total']} projects ... ({count_of(len(state['crows']), 'cluster')} so far)")
-        elif is_cli() and not state["listed"] and not state["crows"]:
-            cl_status.set("Press 'Reload clusters' to list the clusters of the projects chosen in step 3.")
-        elif is_cli():
-            todo = [a for a in effective_accounts() if a["id"] not in state["listed"]]
+            secs = int(time.time() - state.get("list_t0", time.time()))
+            cl_status.set(f"Listing clusters: {state['list_done']}/{state['list_total']} projects ... ({count_of(len(state['crows']), 'cluster')} so far)   elapsed {secs // 60}:{secs % 60:02d}")
+        elif on_demand() and not state["listed"] and not state["crows"]:
+            cl_status.set(COLLECT_HINT)
+        elif on_demand():
+            todo = [a for a in selected_projects() if a["id"] not in state["listed"]]
             if todo:
-                cl_status.set(f"{len(todo)} of the chosen projects are not listed yet - press 'Reload clusters'.")
+                cl_status.set(f"{len(todo)} of the selected projects are not collected yet - press 'Collect clusters from selected projects'.")
 
     # ---- sign-in state: badge, message, what is unlocked
     def refresh_banner(*_):
@@ -8770,7 +9741,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
             mins = max(1, int(minutes_var.get()))
         except ValueError:
             mins = default_minutes
-        who = ("not signed in" if state["auth"]["state"] != "ok" else (state["auth"].get("who") or "signed in")) if is_cli() else "custom login (gkelogin)"
+        who = (("credentials expired" if state["auth"]["state"] == "expired" else "not signed in") if state["auth"]["state"] != "ok" else (state["auth"].get("who") or "signed in")) if is_cli() else "custom login (gkelogin)"
         projects = count_of(len(state["accounts"]), "project") if state["accounts_loaded"] else "projects not loaded yet"
         banner_sub.set(f"Last {mins} min   \u2022   {CLOUD_NAME} account: {who}   \u2022   {projects}   \u2022   read-only")
 
@@ -8787,6 +9758,9 @@ def run_gui(default_minutes, skip_login=False, context=None):
         set_state(signin_btn, cli and idle)
         set_state(check_btn, cli and idle)
         set_state(device_chk, cli and not working)
+        signin_combo.configure(state="readonly" if (cli and not working and not busy and not listing) else "disabled")
+        for w in (acct_combo, use_acct_btn, diff_btn, hint_entry, check_all_btn):
+            set_state(w, cli and idle)
         for rb in (src_all_rb, src_menu_rb):
             set_state(rb, not cli and not busy and not listing)
         state["acct_locked"] = cli and NEED_SIGNIN and not auth_ok
@@ -8798,6 +9772,8 @@ def run_gui(default_minutes, skip_login=False, context=None):
         set_state(acct_all_btn, not state["acct_locked"])
         set_state(acct_reload_btn, not state["acct_locked"] and not busy and not state["acct_loading"])
         set_state(refresh_btn, not state["cl_locked"] and not busy and not listing)
+        set_state(refresh_sel_btn, not state["cl_locked"] and not busy and not listing)
+        update_collect_button()
         set_state(select_all_btn, not state["cl_locked"])
         set_state(clear_btn, not state["cl_locked"])
         acct_tree.configure(selectmode="none" if state["acct_locked"] else "extended")
@@ -8826,50 +9802,102 @@ def run_gui(default_minutes, skip_login=False, context=None):
         update_scope_labels()
         if not is_cli():
             state["auth"] = {"state": "unchecked"}
+            man_hide()
             set_badge("Handled by gkelogin", "dim")
+            if not state["acct_chosen"]:
+                scope_var.set("all")
             auth_msg.set("Uses gkelogin.exe - it signs in when you press Run. The sign-in buttons are only used with the Cloud CLI method.")
             say("Custom login: choose the project if you want to force one (otherwise it is picked after login), select the clusters in step 4 and press "
                 "'Login & Debug'.", "info")
         else:
             set_badge("Not checked", "dim")
             auth_msg.set("")
+            if not state["acct_chosen"]:
+                scope_var.set("sel")
 
     def apply_auth(res, source):
+        if source == "manual_auto":           # the window's own check while it waits for a manual sign-in: only a success matters
+            man["probing"] = False
+            if (res["state"] != "ok" or not man["active"] or not is_cli() or state["busy"] or state["checking"] or state["signing"] or state["listing"]):
+                return
+            if state["auth"]["state"] == "ok" and state["auth"].get("who") == res.get("who"):
+                man_signed_in(res)
+                return
+            source = "manual_signed"
         state["checking"] = state["signing"] = False
         if not is_cli():                      # the method was switched while this was running
+            update_controls()
+            return
+        manual_src = source in ("manual_verify", "manual_signed")
+        if manual_src and res["state"] == "ok":
+            source = "check" if (state["auth"]["state"] == "ok" and state["auth"].get("who") == res.get("who")) else "signin_new"
+        elif source == "manual_verify":
+            fix = signin_failure_help(res, man_account())
+            if res.get("accounts") is not None:
+                fill_account_combo(res)
+            if res.get("expired") and res.get("who"):
+                show_expired(res["who"], "verify")                 # the red banner + the commands under it
+            else:
+                state["auth"] = res
+                set_badge("gcloud not installed" if res.get("state") == "no_cli" else "Not signed in", "err")
+                auth_msg.set(fix.splitlines()[0])
+                say("Not signed in yet: " + fix.splitlines()[0].replace("Verification failed: ", ""), "err")
+            man_open(force=True, quiet=True)
+            man_failed(fix)
             update_controls()
             return
         was_ok = state["auth"]["state"] == "ok"
         state["auth"] = res
         st = res["state"]
+        if res.get("accounts") is not None:
+            fill_account_combo(res)
+        if source in ("signin_new", "switch") and st == "ok":
+            reset_lists()
+            if source == "signin_new":
+                state["signin_note"] = res.get("who")
+                sd_result.set(f"Signed in as {res.get('who')} - reading the projects ...")
+                sd_result_lbl.configure(foreground=COLORS["ok"])
+        if st == "ok" and source in ("check", "already", "signin_new", "signin_ok", "switch"):
+            signin_btn.configure(style="TButton")
+            AUTH_STATE["expired"].discard(res.get("who"))
+            check_accounts_async(res.get("who"))
+        if st == "ok" and man["shown"]:
+            man_signed_in(res)
         if st == "ok":
             who = res.get("who") or "?"
             set_badge(f"Signed in as {who}", "ok")
             auth_msg.set("You are signed in. Next: step 3 and step 4.")
-            lead = {"signin_ok": "Login OK - ", "already": "Already signed in - "}.get(source, "")
+            lead = {"signin_ok": "Login OK - ", "signin_new": "Login OK - ", "already": "Already signed in - ", "switch": "Now using this account - "}.get(source, "")
             say(f"{lead}signed in as {who}. Next: choose the project in step 3 (or keep 'All projects') and the clusters in step 4.", "ok")
         elif st == "no_cli":
             set_badge("gcloud not installed", "err")
             auth_msg.set(res.get("detail") or "")
             say(f"{res.get('detail')} {res.get('hint')}", "err")
+            if LOGIN_OPTS["signin"] == "manual":
+                man_open(quiet=True, force=True)
         else:
             set_badge("Not signed in", "err")
             auth_msg.set(f"Reason: {res.get('detail') or 'unknown'}\nNext: {res.get('hint')}")
+            if LOGIN_OPTS["signin"] == "manual" and source != "signin_fail":
+                man_open(quiet=True)
             if source == "signin_fail":
                 say("Sign-in failed or was cancelled (" + (res.get("detail") or "no details") + "). Press 'Sign in' to try again, or run 'gcloud auth login' in a "
                     "terminal and then press 'Check status'.", "err")
+                if sd.winfo_ismapped() and not sd_result.get():
+                    sd_result.set(res.get("detail") or "The sign-in failed.")
+                    sd_result_lbl.configure(foreground=COLORS["err"])
             else:
                 say("Not signed in. " + (res.get("hint") or ""), "err")
         if st == "ok" and state["accounts_loaded"] and not state["accounts"]:
             say(acct_status.get(), "warn")
         update_controls()
-        if st == "ok" and (not was_ok or source in ("signin_ok", "already")):
+        if st == "ok" and (not was_ok or source in ("signin_ok", "signin_new", "switch", "already")):
             if not state["accounts_loaded"] or not state["accounts"]:
                 load_accounts_async()
             else:
                 maybe_auto_list()
 
-    def check_status(_event=None):
+    def check_status(_event=None, source="check"):
         if not is_cli() or state["checking"] or state["signing"] or state["busy"] or state["listing"]:
             return
         sync_login_opts()
@@ -8882,27 +9910,48 @@ def run_gui(default_minutes, skip_login=False, context=None):
 
         def work():
             try:
-                res = login_status(acct)
+                res = verify_signin_follow(acct) if source == "manual_verify" else login_status(acct)
             except Exception as exc:
                 res = {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": "Press 'Sign in'."}
-            msgs.put(("auth", res, "check"))
+            msgs.put(("auth", res, source))
         threading.Thread(target=work, daemon=True).start()
 
-    def sign_in(_event=None):
+    def sign_in(_event=None, force=False, hint=None, method=None):
         if not is_cli() or state["checking"] or state["signing"] or state["busy"] or state["listing"]:
             return
+        if state["auth"]["state"] == "expired":            # renew the expired account: a fresh sign-in for exactly that account
+            force = True
+            hint = hint or state["auth"].get("who")
         sync_login_opts()
+        explicit = method is not None
+        method = method or LOGIN_OPTS.get("signin") or "manual"
+        if method == "manual":                              # the default: show the commands, the user runs them (the window verifies read-only)
+            man_open(force=force, account=hint)
+            return
         acct = signin_account()
         state.update(signing=True, auth_for=acct)
         set_badge("Signing in...", "info")
         auth_msg.set("Running the sign-in ...")
+        captured = method == "captured" and (LOGIN_OPTS["device_code"] or explicit)
+        if captured:
+            panel_reset()
         update_controls()
 
         def work():
             try:
                 pre = login_status(acct)
-                if pre["state"] != "not_signed_in":
+                if pre["state"] != "not_signed_in" and not force:
                     msgs.put(("auth", pre, "already" if pre["state"] == "ok" else "check"))
+                    return
+                if captured:
+                    msgs.put(("signin_begin", hint, force))
+                    return
+                if method == "console" or force:
+                    flags = ["--no-launch-browser"] if (method == "console" and LOGIN_OPTS["device_code"]) else []
+                    msgs.put(("say", "A console window opened - complete the sign-in there (open the link, paste the code). This window continues when you are done.", "info"))
+                    cmd = [shutil.which("gcloud") or "gcloud", "auth", "login"] + flags + (["--account", hint] if hint else [])
+                    rc = _run_interactive(cmd, lambda l: msgs.put(("line", l)))
+                    finish_signin_thread(rc == 0, "" if rc == 0 else "The sign-in failed or was cancelled.", True)
                     return
                 msgs.put(("say", "Login window opened - complete the sign-in in the console window / browser that just opened (a code may be shown "
                                  "in the console). This window continues when you are done.", "info"))
@@ -8911,6 +9960,654 @@ def run_gui(default_minutes, skip_login=False, context=None):
             except Exception as exc:
                 msgs.put(("auth", {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": "Press 'Sign in' to try again."}, "signin_fail"))
         threading.Thread(target=work, daemon=True).start()
+
+    # ---- manual sign-in (the DEFAULT method): the exact commands, each with a Copy button; the window waits and notices the sign-in by itself
+    man_panel = ttk.LabelFrame(guide, text="Sign in - run a command yourself", padding=8)
+    man = state["man"] = {"shown": False, "active": False, "t0": None, "after": None, "probing": False, "account": None, "fallback": False, "auto": False,
+                          "different": False}
+    man_form = tk.StringVar(value="device")
+    man_instr_var = tk.StringVar(value=MANUAL_INSTRUCTIONS)
+    ttk.Label(man_panel, textvariable=man_instr_var, wraplength=900, justify="left", font=("Segoe UI", 10, "bold")).pack(fill="x")
+    man_cli_var = tk.StringVar(value="")
+    man_cli_lbl = tk.Label(man_panel, textvariable=man_cli_var, anchor="w", justify="left", font=("Segoe UI", 10, "bold"), fg=COLORS["ok"], bg=CARD)
+    man_cli_lbl.pack(fill="x", pady=(4, 0))
+    man_inst = tk.Label(man_panel, text="Install the Google Cloud CLI first: " + GCLOUD_INSTALL_HINT, anchor="w", justify="left", wraplength=900,
+                        fg=COLORS["err"], bg=CARD, font=("Segoe UI", 9))
+    man_msg_var = tk.StringVar(value="")
+    man_msg_lbl = tk.Label(man_panel, textvariable=man_msg_var, anchor="w", justify="left", wraplength=900, font=("Segoe UI", 10, "bold"), fg=COLORS["warn"], bg=CARD)
+    man_msg_lbl.pack(fill="x", pady=(2, 0))
+    man_fb = ttk.Frame(man_panel)              # shown after an automatic switch from the captured sign-in
+    man_retry_btn = ttk.Button(man_fb, text="Retry")
+    man_retry_btn.pack(side="left")
+    man_console_btn = ttk.Button(man_fb, text="Run in a console window instead")
+    man_console_btn.pack(side="left", padx=(6, 0))
+    man_copycmd_btn = ttk.Button(man_fb, text="Copy command")
+    man_copycmd_btn.pack(side="left", padx=(6, 0))
+    man_cmd_vars, man_copy_btns, man_entries, man_rows = {}, {}, {}, {}
+    for _it in manual_commands("someone@example.com", True):
+        _row = ttk.Frame(man_panel)
+        man_rows[_it["key"]] = _row
+        if _it["key"] not in ("device-account", "plugin"):      # the 1b variant (account hint) and the plugin helper are shown only when relevant
+            _row.pack(fill="x", pady=(4, 0))
+        _top = ttk.Frame(_row)
+        _top.pack(fill="x")
+        if _it["key"] in _TERMINAL_FORMS:
+            ttk.Radiobutton(_top, text=f"{_it['n']}.", variable=man_form, value=_it["key"], width=4).pack(side="left")
+        else:
+            ttk.Label(_top, text=f"{_it['n']}.", width=5).pack(side="left", padx=(18, 0))
+        _note = ttk.Label(_top, text=_it["note"], style="Desc.TLabel", wraplength=860, justify="left")
+        _note.pack(side="left", fill="x", expand=True)
+        _line = ttk.Frame(_row)
+        _line.pack(fill="x", padx=(40, 0))
+        man_cmd_vars[_it["key"]] = tk.StringVar(value=_it["cmd"])
+        man_entries[_it["key"]] = ttk.Entry(_line, textvariable=man_cmd_vars[_it["key"]], state="readonly",
+                                            font=("Consolas", 12, "bold") if _it["key"] == "device" else ("Consolas", 10))
+        man_entries[_it["key"]].pack(side="left", fill="x", expand=True)
+        man_copy_btns[_it["key"]] = ttk.Button(_line, text="Copy", style="Accent.TButton" if _it["key"] == "device" else "TButton")
+        man_copy_btns[_it["key"]].pack(side="left", padx=(6, 0))
+    man_steps_lbl = ttk.Label(man_panel, text=MANUAL_STEPS, wraplength=900, justify="left", font=("Segoe UI", 10))
+    man_steps_lbl.pack(fill="x", pady=(8, 0))
+    ttk.Label(man_panel, text="The round button in front of 1 - 2 chooses which command 'Open a terminal for me' runs. The other commands are only shown here as text. "
+                              "This tool never installs anything and never runs these commands itself.", style="Desc.TLabel", wraplength=900, justify="left").pack(fill="x", pady=(4, 0))
+    man_act = ttk.Frame(man_panel)
+    man_act.pack(fill="x", pady=(6, 0))
+    man_chip = tk.Label(man_act, text="Waiting for you", fg="white", bg=COLORS["dim"], padx=10, pady=2, font=("Segoe UI", 9, "bold"))
+    man_chip.pack(side="left")
+    man_status_var = tk.StringVar(value="")
+    ttk.Label(man_act, textvariable=man_status_var, font=("Segoe UI", 10)).pack(side="left", padx=8)
+    man_stop_btn = ttk.Button(man_act, text="Stop waiting", state="disabled")
+    man_stop_btn.pack(side="right")
+    man_verify_btn = ttk.Button(man_act, text="I have signed in - Verify", style="Accent.TButton")
+    man_verify_btn.pack(side="right", padx=(0, 6))
+    man_term_btn = ttk.Button(man_act, text="Open a terminal for me")
+    man_term_btn.pack(side="right", padx=(0, 6))
+    man_result_var = tk.StringVar(value="")
+    man_result_lbl = tk.Label(man_panel, textvariable=man_result_var, anchor="w", justify="left", wraplength=900, font=("Segoe UI", 10, "bold"), fg=COLORS["info"], bg=CARD)
+    man_result_lbl.pack(fill="x", pady=(4, 0))
+
+    def man_account():
+        """The account the account-specific command (1b) and 'Open a terminal for me' use: the 'hint' box, else the expired account the banner is about."""
+        a = hint_var.get().strip()
+        return a if EMAIL_RE.match(a) else (man.get("account") if man.get("account") and EMAIL_RE.match(man["account"]) else None)
+
+    def man_refresh():
+        """Show / hide the account variant (1b) and the plugin helper (4b) and fill their text."""
+        items = {i["key"]: i for i in manual_commands(man_account(), None)}
+        for key in ("device-account", "plugin"):
+            row = man_rows[key]
+            if key in items:
+                man_cmd_vars[key].set(items[key]["cmd"])
+                if not row.winfo_ismapped():
+                    anchor = man_rows["device"] if key == "device-account" else man_rows["adc"]
+                    row.pack(fill="x", pady=(4, 0), after=anchor)
+            else:
+                row.pack_forget()
+                if man_form.get() == key:
+                    man_form.set("device")
+
+    def man_cli_check():
+        """The 'Google Cloud CLI installed?' line: PATH lookup now, `gcloud --version` (first line) in the background; install hint as TEXT when gcloud is missing."""
+        text, found = gcloud_cli_line()
+        man_cli_var.set(text)
+        man_cli_lbl.configure(fg=COLORS["ok"] if found else COLORS["err"])
+        if found:
+            man_inst.pack_forget()
+
+            def work():
+                try:
+                    ver = gcloud_version()
+                except Exception:
+                    ver = None
+                msgs.put(("man", "cliinfo", ver))
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            man_inst.pack(fill="x", pady=(2, 0), after=man_cli_lbl)
+
+    def man_cliinfo(ver):
+        if ver and shutil.which("gcloud"):
+            man_cli_var.set(f"Google Cloud CLI installed: {ver}")
+
+    def man_show():
+        if not man["shown"]:
+            man["shown"] = True
+            man_panel.pack(fill="x", pady=(6, 0), after=guide_msg)
+            root.after(60, lambda: scroll_to(man_panel))
+
+    def man_chip_set(text, kind):
+        man_chip.configure(text=text, bg=COLORS.get(kind, COLORS["dim"]))
+
+    def man_fallback(on):
+        man["fallback"] = bool(on)
+        if on:
+            man_fb.pack(fill="x", pady=(4, 0), after=man_msg_lbl)
+        else:
+            man_fb.pack_forget()
+
+    def man_open(reason=None, force=False, account=None, quiet=False, fallback=False, auto=False):
+        """Show the manual sign-in panel and start waiting (checks every MANUAL_POLL_SECONDS whether the sign-in happened). Idempotent while waiting."""
+        if not is_cli():
+            return
+        if state["auth"]["state"] == "ok" and not force and not reason and not man["active"]:
+            say(f"Already signed in as {state['auth'].get('who') or '?'}. Use 'Sign in with a different account' to sign in with another account.", "ok")
+            return
+        if account:
+            man["account"] = account
+        man_show()
+        man_refresh()
+        man_cli_check()
+        man["auto"] = man["auto"] or auto
+        if fallback:
+            man_fallback(True)
+        if man["active"]:
+            if reason:
+                man_msg_var.set(reason)
+            return
+        man_msg_var.set(reason or "")
+        man_form.set("device" if device_var.get() else "browser")
+        man_result_var.set("")
+        man_result_lbl.configure(fg=COLORS["info"])
+        if man.get("after"):
+            try:
+                root.after_cancel(man["after"])
+            except Exception:
+                pass
+        man.update(active=True, t0=time.time(), probing=False)
+        man_stop_btn.state(["!disabled"])
+        man_chip_set("Waiting for you", "info")
+        man_status_var.set("Waiting for you to sign in...")
+        man["after"] = root.after(int(MANUAL_POLL_SECONDS * 1000), man_tick)
+        if not quiet:
+            say("Run the first command of step 2 in your own terminal (open the URL it prints, sign in, paste the code back), then press 'I have signed in - Verify'. "
+                "This window also notices the sign-in by itself.", "info")
+
+    def man_tick():
+        man["after"] = None
+        if not man["active"]:
+            return
+        if time.time() - man["t0"] > MANUAL_POLL_CAP:
+            man_stop(f"Stopped waiting after {MANUAL_POLL_CAP // 60} minutes. Press 'I have signed in - Verify' when you have signed in.")
+            return
+        if not man["probing"] and not (state["busy"] or state["checking"] or state["signing"] or state["listing"]):
+            man["probing"] = True
+
+            def work():
+                try:
+                    res = verify_signin_follow(None)
+                except Exception as exc:
+                    res = {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": ""}
+                msgs.put(("auth", res, "manual_auto"))
+            threading.Thread(target=work, daemon=True).start()
+        man["after"] = root.after(int(MANUAL_POLL_SECONDS * 1000), man_tick)
+
+    def man_stop(message=None):
+        man["active"] = False
+        if man.get("after"):
+            try:
+                root.after_cancel(man["after"])
+            except Exception:
+                pass
+            man["after"] = None
+        man_stop_btn.state(["disabled"])
+        if message != "":
+            man_chip_set("Stopped", "dim")
+            man_status_var.set(message or "Stopped waiting. Press 'I have signed in - Verify' when you have signed in.")
+
+    def man_hide():
+        man_stop("")
+        man_fallback(False)
+        man["auto"] = False
+        if man["shown"]:
+            man["shown"] = False
+            man_panel.pack_forget()
+
+    def man_verify():
+        if state["checking"] or state["signing"] or state["busy"] or state["listing"]:
+            man_result_var.set("Please wait for the current action to finish, then press Verify again.")
+            return
+        man_result_var.set("Verifying (read-only): gcloud auth list, the token check and gcloud projects list ...")
+        man_result_lbl.configure(fg=COLORS["info"])
+        man_chip_set("Verifying", "info")
+        check_status(source="manual_verify")
+
+    def man_signed_in(res):
+        man_stop("")
+        man_fallback(False)
+        n_ = res.get("n_projects")
+        man_chip_set("Signed in", "ok")
+        man_status_var.set("Signed in.")
+        man_msg_var.set("")
+        man_result_var.set(f"Signed in as {res.get('who') or '?'}" + (f" - {count_of(n_, 'project')}" if n_ is not None else ""))
+        man_result_lbl.configure(fg=COLORS["ok"])
+
+    def man_failed(text):
+        man_chip_set("Waiting for you" if man["active"] else "Not signed in", "info" if man["active"] else "err")
+        man_result_var.set(text)
+        man_result_lbl.configure(fg=COLORS["err"])
+
+    def man_copy(key):
+        cmd = man_cmd_vars[key].get()
+        root.clipboard_clear()
+        root.clipboard_append(cmd)
+        status.set("Copied: " + cmd)
+
+    def man_terminal():
+        """'Open a terminal for me': a visible PowerShell window with the chosen gcloud auth login form (user-initiated, local-only; nothing else is ever started this way)."""
+        form = man_form.get()
+        ok, info = open_terminal_signin(form if form in _TERMINAL_FORMS else "device", man_account())
+        if ok:
+            if not man["active"]:
+                man_open(force=True, quiet=True)
+            man_result_var.set(f"A PowerShell window opened and runs: {info}   Complete the sign-in there, then press 'I have signed in - Verify'.")
+            man_result_lbl.configure(fg=COLORS["info"])
+        else:
+            man_result_var.set("Could not open a terminal: " + info)
+            man_result_lbl.configure(fg=COLORS["err"])
+
+    def after_signing(fn, tries=30):
+        """Run fn() once the current sign-in process has been cancelled and the window is idle again."""
+        if state["signing"] and tries > 0:
+            root.after(200, lambda: after_signing(fn, tries - 1))
+        else:
+            fn()
+
+    def man_retry():
+        sess = state.get("session")
+        if sess and not sess.done.is_set():
+            sess.cancel()
+        man_fallback(False)
+        after_signing(lambda: sign_in(force=True, hint=man_account(), method="captured"))
+
+    def man_console():
+        sess = state.get("session")
+        if sess and not sess.done.is_set():
+            sess.cancel()
+        man_fallback(False)
+        after_signing(lambda: sign_in(force=True, hint=man_account(), method="console"))
+
+    def man_copy_command():
+        cmd = man_cmd_vars["device-account" if man_account() and man_form.get() == "device-account" else "device"].get()
+        root.clipboard_clear()
+        root.clipboard_append(cmd)
+        status.set("Copied: " + cmd)
+
+    def on_signin_method(_event=None):
+        LOGIN_OPTS["signin"] = _SESSION["signin"] = SIGNIN_KEYS.get(signin_var.get(), "manual")
+        if LOGIN_OPTS["signin"] == "manual":
+            say("Sign-in method: you run the command yourself. The commands are shown in step 2.", "info")
+            if is_cli() and state["auth"]["state"] != "ok":
+                man_open()
+        else:
+            man_hide()
+            say(f"Sign-in method: {SIGNIN_METHOD_LABELS[LOGIN_OPTS['signin']]}. Press 'Sign in' to start it.", "info")
+        update_controls()
+
+    for _k, _b in man_copy_btns.items():
+        _b.configure(command=lambda k=_k: man_copy(k))
+    man_verify_btn.configure(command=man_verify)
+    man_term_btn.configure(command=man_terminal)
+    man_stop_btn.configure(command=man_stop)
+    man_retry_btn.configure(command=man_retry)
+    man_console_btn.configure(command=man_console)
+    man_copycmd_btn.configure(command=man_copy_command)
+    signin_combo.bind("<<ComboboxSelected>>", on_signin_method)
+
+    # ---- device-code sign-in panel + account switching
+    def sd_chip_set(text, kind):
+        sd_chip.configure(text=text, bg=COLORS.get(kind, COLORS["dim"]))
+
+    def sd_set_url(text):
+        sd_url.configure(state="normal")
+        sd_url.delete("1.0", "end")
+        if text:
+            sd_url.insert("1.0", text, "link")
+        sd_url.configure(state="disabled")          # read-only, still selectable / copyable
+
+    def sd_show():
+        if not sd.winfo_ismapped():
+            sd.pack(fill="x", pady=(6, 0), before=row34)
+            root.after(50, lambda: scroll_to(sd))
+        sd_toggle_btn.configure(text="Hide sign-in details")
+        if not sd_toggle_btn.winfo_ismapped():
+            sd_toggle_btn.pack(side="left", padx=(6, 0))
+
+    def sd_toggle():
+        if sd.winfo_ismapped():
+            sd.pack_forget()
+            sd_toggle_btn.configure(text="Show sign-in details")
+        else:
+            sd_show()
+
+    def sd_raw_set(text):
+        sd_raw.configure(state="normal")
+        sd_raw.delete("1.0", "end")
+        if text:
+            sd_raw.insert("1.0", text)
+        sd_raw.configure(state="disabled")
+
+    def sd_raw_add(text):
+        sd_raw.configure(state="normal")
+        sd_raw.insert("end", text)
+        sd_raw.see("end")
+        sd_raw.configure(state="disabled")
+
+    def sd_raw_toggle_cmd():
+        if sd_raw.winfo_ismapped():
+            sd_raw.pack_forget()
+            sd_raw_toggle.configure(text="Show raw output")
+        else:
+            sd_raw.pack(fill="x", pady=(2, 0))
+            sd_raw_toggle.configure(text="Hide raw output")
+
+    def panel_reset():
+        """A new attempt: clear the previous link, code and result."""
+        state["session"] = None
+        state["signin_url"] = None
+        state["signin_note"] = None
+        sd_show()
+        sd_steps.configure(text="\n".join(SIGNIN_STEPS))
+        sd_set_url("")
+        code_var.set("")
+        sd_count.set("")
+        sd_result.set("")
+        sd_result_lbl.configure(foreground="")
+        sd_raw_set("")
+        sd_cmd_var.set("")
+        sd_chip_set("Starting...", "info")
+        for w in (sd_open_btn, sd_copy_btn, sd_submit_btn, sd_code, sd_cancel_btn):
+            set_state(w, False)
+
+    def open_signin_url(_event=None):
+        if state.get("signin_url"):
+            webbrowser.open(state["signin_url"])
+
+    def copy_signin_url():
+        if state.get("signin_url"):
+            root.clipboard_clear()
+            root.clipboard_append(state["signin_url"])
+            sd_count.set("Link copied.")
+
+    sd_url.tag_bind("link", "<Double-Button-1>", open_signin_url)
+
+    def begin_device_signin(hint, force):
+        """(main thread) start gcloud auth login --no-launch-browser with captured output."""
+        def on_event(kind, data=None):
+            msgs.put(("signin", kind, data))
+        sess = SignInSession(hint, on_event)
+        err = sess.start()
+        if err:
+            sd_chip_set("Failed", "err")
+            sd_result.set(err)
+            sd_result_lbl.configure(foreground=COLORS["err"])
+            finish_signin_thread(False, err, force)
+            return
+        state["session"] = sess
+        state["signin_force"] = force
+        set_state(sd_cancel_btn, True)
+        sd_chip_set("Starting...", "info")
+        sd_cmd_var.set("Command: " + sess.command_text())
+        write("Running: " + sess.command_text())
+        say("Sign-in started - the link and the code box appear in step 2 (Sign-in details).", "info")
+
+    def on_signin_event(kind, data):
+        sess = state.get("session")
+        if kind == "url":
+            state["signin_url"] = data
+            sd_set_url(data)
+            for w in (sd_open_btn, sd_copy_btn, sd_submit_btn, sd_code):
+                set_state(w, True)
+            sd_chip_set("Waiting for you", "warn")
+            if man["fallback"] or man["auto"]:         # the link arrived after all (late): back to the captured view
+                man_hide()
+                sd_result.set("")
+            for l in SIGNIN_STEPS:
+                write(l)
+            write("Sign-in link: " + data)
+            scroll_to(sd)
+            say("Open the link in step 2 (Sign-in details), sign in, then paste the verification code and press 'Submit code'.", "info")
+        elif kind == "line":
+            write(data)
+        elif kind == "raw":
+            sd_raw_add(data)
+        elif kind == "tick":
+            if sess and not sess.done.is_set():
+                if sess.code_sent:
+                    sd_count.set("checking the code ...")
+                elif state.get("signin_url"):
+                    sd_count.set("waiting for you to sign in... %02d:%02d" % (data // 60, data % 60))
+                else:
+                    sd_count.set("waiting for gcloud to print the link ... %02d:%02d" % (data // 60, data % 60))
+        elif kind == "nourl":
+            if not state.get("signin_url"):
+                sd_chip_set("No URL received", "err")
+                sd_result.set("No URL received from gcloud yet. The raw output is shown below - if it contains a link that starts with https://, open it. "
+                              "Otherwise use the commands in the panel below (run one in your own terminal).")
+                sd_result_lbl.configure(foreground=COLORS["err"])
+                if not sd_raw.get("1.0", "end").strip():
+                    sd_raw_set("(gcloud printed nothing)")
+                man_open(reason=NO_URL_REASON, force=True, quiet=True, fallback=True, auto=True)
+                man_status_var.set("No URL received from gcloud yet")
+        elif kind == "finished":
+            ok = bool(data.get("ok"))
+            sd_count.set("")
+            for w in (sd_submit_btn, sd_code, sd_cancel_btn):
+                set_state(w, False)
+            code_var.set("")
+            if ok:
+                sd_chip_set("Signed in", "ok")
+            else:
+                sd_chip_set("Cancelled" if data.get("cancelled") else ("Timed out" if data.get("expired") else "Failed"), "warn" if data.get("cancelled") else "err")
+                msg_ = data.get("error") or "The sign-in did not finish."
+                if not data.get("cancelled") and not data.get("expired"):
+                    tail_ = [l for l in (data.get("last_lines") or []) if l.strip()][-4:]
+                    msg_ += f"  Exit code {data.get('rc')}." + (" Last output: " + " | ".join(l.strip()[:160] for l in tail_) + "." if tail_ else "")
+                    msg_ += " Likely causes: " + " ".join(data.get("causes") or [])
+                sd_result.set(msg_)
+                sd_result_lbl.configure(foreground=COLORS["err"])
+                if not data.get("cancelled") and not state.get("signin_url") and not man["fallback"]:
+                    man_open(reason=FAILED_REASON, force=True, quiet=True, fallback=True, auto=True)
+            finish_signin_thread(ok, data.get("error") or "", state.get("signin_force", False))
+
+    def submit_code(_event=None):
+        sess = state.get("session")
+        code = code_var.get().strip()
+        code_var.set("")
+        if not sess or not code:
+            return
+        if sess.submit(code):
+            sd_chip_set("Checking the code", "info")
+            sd_count.set("checking the code ...")
+            set_state(sd_submit_btn, False)
+            set_state(sd_code, False)
+        else:
+            sd_result.set("The sign-in has already ended - the code was not sent. Press 'Sign in' to start again.")
+
+    def cancel_signin():
+        sess = state.get("session")
+        if sess:
+            sess.cancel()
+            sd_chip_set("Cancelling...", "warn")
+
+    def finish_signin_thread(ok, err, force):
+        """After the sign-in process ended: re-read the accounts (and pin the newly signed-in one), then tell the window."""
+        def work():
+            try:
+                if ok:
+                    rows, _e = gcloud_accounts()
+                    new = next((r["account"] for r in rows if r["active"]), None)
+                    if new:
+                        pin_account(new)
+                res = login_status(None)
+            except Exception as exc:
+                res = {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": "Press 'Sign in' to try again.", "accounts": [], "active": None}
+            if ok and res["state"] == "ok":
+                msgs.put(("auth", res, "signin_new"))
+            elif res["state"] == "ok":
+                msgs.put(("auth", res, "check"))
+            else:
+                res = dict(res, detail=err or res.get("detail"))
+                msgs.put(("auth", res, "signin_fail"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def reset_lists():
+        """The account changed: the project and cluster lists belong to the old one - clear them (they are read again)."""
+        state.update(accounts=[], acct_by_id={}, acct_chosen=set(), accounts_loaded=False, crows=[], by_key={}, cchosen=set(), listed=set(), clusters={})
+        CLI_TARGETS.clear()
+        scope_var.set("sel" if is_cli() else "all")
+        _SESSION.pop("projects", None)
+        manual_var.set("")
+        update_scope_labels()
+        rebuild_account_list()
+        rebuild_cluster_list()
+
+    CHIP = {"active": ("Active", "ok"), "expired": ("Credentials expired - sign in again", "err"), "signed_out": ("Not signed in", "dim"),
+            "unknown": ("Unknown", "dim"), "checking": ("Checking ...", "info")}
+
+    def acct_status_of(email):
+        return state["acct_status"].get(email) or {"state": "checking", "detail": ""}
+
+    def acct_label(r, pin):
+        st = acct_status_of(r["account"])
+        return (r["account"] + ("  (service account)" if r["account"].endswith(".gserviceaccount.com") else "") + ("  (active)" if r["active"] else "")
+                + ("  - used by this tool" if pin == r["account"] else "") + "  [" + CHIP[st["state"]][0].split(" - ")[0] + "]")
+
+    def render_accounts():
+        """The account dropdown (every account gcloud knows, status in the text), the coloured status list and the chip of the chosen one."""
+        rows = state.get("acct_rows") or []
+        pin = LOGIN_OPTS.get("account")
+        who = state["auth"].get("who")
+        state["acct_map"] = {acct_label(r, pin): r["account"] for r in rows}
+        state["acct_all"] = list(state["acct_map"])
+        flt = state.get("acct_typed", "").strip().lower()
+        shown = [l for l in state["acct_all"] if not flt or flt in l.lower()]
+        acct_combo.configure(values=shown or state["acct_all"])
+        if not flt:
+            acct_combo.set(next((l for l, a in state["acct_map"].items() if a == who), state["acct_all"][0] if state["acct_all"] else ""))
+        acct_st_tree.delete(*acct_st_tree.get_children())
+        for r in rows:
+            st = acct_status_of(r["account"])
+            text = CHIP[st["state"]][0] + (f" ({st['detail']})" if st["state"] == "unknown" and st.get("detail") else "")
+            acct_st_tree.insert("", "end", iid=r["account"], text=r["account"] + ("   (active)" if r["active"] else "") + ("   > in use" if who == r["account"] else ""),
+                                values=(text,), tags=(st["state"],))
+        cur = who or (state["acct_map"].get(acct_combo.get()))
+        if cur:
+            st = acct_status_of(cur)
+            acct_chip.configure(text=CHIP[st["state"]][0].split(" - ")[0].replace("Credentials expired", "Expired"), bg=COLORS.get(CHIP[st["state"]][1], COLORS["dim"]))
+        else:
+            acct_chip.configure(text="", bg=COLORS["dim"])
+
+    def on_acct_typed(_event=None):
+        text = acct_combo.get()
+        if text in state.get("acct_map", {}):
+            return
+        state["acct_typed"] = text
+        render_accounts()
+
+    def fill_account_combo(res):
+        state["acct_rows"] = res.get("accounts") or []
+        state["acct_typed"] = ""
+        state["acct_status"] = {k: v for k, v in state["acct_status"].items() if any(r["account"] == k for r in state["acct_rows"])}
+        for r in state["acct_rows"]:
+            if r["account"] in AUTH_STATE["expired"]:
+                state["acct_status"][r["account"]] = {"state": "expired", "detail": ""}
+        render_accounts()
+
+    def check_accounts_async(first=None):
+        """Status of every listed account in the background (at most 4 gcloud calls at once; the chosen account first)."""
+        rows = list(state.get("acct_rows") or [])
+        if not rows:
+            return
+        emails = [r["account"] for r in rows]
+        if first in emails:
+            emails.remove(first)
+            emails.insert(0, first)
+        state["acct_gen"] = gen = state.get("acct_gen", 0) + 1
+        for e in emails:
+            state["acct_status"][e] = {"state": "checking", "detail": ""}
+        render_accounts()
+
+        def work():
+            check_accounts(emails, rows, on_result=lambda a, r: msgs.put(("acctst", gen, a, r)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_acct_status(gen, email, res):
+        if gen != state.get("acct_gen"):
+            return
+        state["acct_status"][email] = res
+        render_accounts()
+        if res["state"] == "expired" and email == state["auth"].get("who"):
+            show_expired(email)
+        elif res["state"] == "active" and email == state["auth"].get("who") and state["auth"]["state"] == "expired":
+            state["auth"] = dict(state["auth"], state="ok")
+            apply_auth(state["auth"], "check")
+
+    def show_expired(email, reason=""):
+        """The account in use has no valid credentials any more: red banner, 'Sign in' highlighted, steps 3 / 4 locked until it is renewed."""
+        if state["auth"]["state"] == "expired" and state["auth"].get("who") == email:
+            return
+        state["acct_status"][email] = {"state": "expired", "detail": ""}
+        state["auth"] = dict(state["auth"], state="expired", who=email, detail=f"Credentials for {email} expired.",
+                             hint="Press Sign in to renew.", accounts=state.get("acct_rows") or [])
+        set_badge("Credentials expired", "err")
+        auth_msg.set(f"Credentials for {email} expired. Press Sign in to renew." + (f"  ({reason})" if reason else ""))
+        say(f"Credentials for {email} expired. Press Sign in to renew.", "err")
+        try:
+            signin_btn.configure(style="Run.TButton")
+        except Exception:
+            pass
+        man_open(reason=f"Credentials for {email} expired. Run one of these commands in your own terminal (or press Sign in), then press Verify.",
+                 force=True, quiet=True, account=email)
+        render_accounts()
+        update_controls()
+
+    def on_expiry_event(email, reason):
+        if email in {r["account"] for r in (state.get("acct_rows") or [])}:
+            state["acct_status"][email] = {"state": "expired", "detail": ""}
+        who = state["auth"].get("who") or LOGIN_OPTS.get("account")
+        if email == who or (not state["auth"].get("who") and state["auth"]["state"] == "ok"):
+            show_expired(email, reason)
+        else:
+            render_accounts()
+
+    def check_all():
+        if not is_cli() or state["checking"] or state["signing"]:
+            return
+        if not state.get("acct_rows"):
+            check_status(source="check")
+            return
+        check_accounts_async(state["auth"].get("who"))
+
+    def on_acct_selected(_event=None):
+        use_account()
+
+    def use_account(_event=None):
+        email = (state.get("acct_map") or {}).get(acct_combo.get())
+        if not email or not is_cli() or state["busy"] or state["listing"] or state["checking"] or state["signing"]:
+            return
+        pin_account(email)                    # nothing is written to gcloud: --account EMAIL is added to every call
+        state["auth"] = dict(state["auth"], state="unchecked", who=None)
+        signin_btn.configure(style="TButton")
+        reset_lists()
+        say(f"Using {email}: every gcloud call now carries --account {email}. Re-reading the projects and clusters ...", "info")
+        check_status(source="switch")
+
+    def different_account(_event=None):
+        sign_in(force=True, hint=hint_var.get().strip() or None)
+
+    sd_toggle_btn.configure(command=sd_toggle)
+    sd_raw_toggle.configure(command=sd_raw_toggle_cmd)
+    sd_open_btn.configure(command=open_signin_url)
+    sd_copy_btn.configure(command=copy_signin_url)
+    sd_submit_btn.configure(command=submit_code)
+    sd_code.bind("<Return>", submit_code)
+    sd_cancel_btn.configure(command=cancel_signin)
+    use_acct_btn.configure(command=use_account)
+    check_all_btn.configure(command=check_all)
+    acct_combo.bind("<<ComboboxSelected>>", on_acct_selected)
+    acct_combo.bind("<KeyRelease>", on_acct_typed)
+    diff_btn.configure(command=different_account)
+    for _w in (sd_open_btn, sd_copy_btn, sd_submit_btn, sd_code, sd_cancel_btn):
+        set_state(_w, False)
+
 
     # ---- step 3 loading (projects are read once and cached for the session; 'Reload projects' refreshes)
     def load_accounts_async(force=False):
@@ -8941,13 +10638,19 @@ def run_gui(default_minutes, skip_login=False, context=None):
             if ACCOUNT0 in state["acct_by_id"]:
                 state["acct_chosen"] = {ACCOUNT0}
                 scope_var.set("sel")
-        if scope_var.get() == "sel" and not state["acct_chosen"]:
-            scope_var.set("all")
+        if not state["acct_chosen"] and _SESSION.get("projects"):         # the projects selected earlier in this session
+            state["acct_chosen"] = set(_SESSION["projects"]) & set(state["acct_by_id"])
+            if state["acct_chosen"]:
+                scope_var.set("sel")
         update_scope_labels()
         update_controls()
         rebuild_account_list()
         rebuild_cluster_list()
         state["acct_err"] = err
+        if state.get("signin_note"):
+            who_, state["signin_note"] = state["signin_note"], None
+            sd_result.set(f"Signed in as {who_} - {count_of(len(accts), 'project')}" + ("" if accts else " (none visible to this account)") + ".")
+            sd_result_lbl.configure(foreground=COLORS["ok"] if accts else COLORS["warn"])
         if not accts:
             acct_status.set("No projects found. Your Google account can see no project (or the list could not be read). Fix: press 'Sign in' and use another account, ask for the Viewer role on a project, or run 'gcloud config set project ID'; then press 'Reload projects'." + (f" (details: {err})" if err else ""))
             if state["auth"]["state"] in ("ok", "unchecked") or not is_cli():
@@ -8956,16 +10659,15 @@ def run_gui(default_minutes, skip_login=False, context=None):
         usable = len([a for a in accts if a.get("usable", True)])
         acct_status.set(f"{count_of(len(accts), 'project')} loaded" + (f" ({usable} usable)" if usable != len(accts) else "") + ".")
         if is_cli() and state["auth"]["state"] == "ok":
-            say(f"{count_of(len(accts), 'project')} loaded. Step 3: keep 'All projects ({usable})' or select some in the list; step 4 lists the clusters.", "ok")
-            maybe_auto_list()
+            say(f"{count_of(len(accts), 'project')} loaded. Step 3: select one or more projects (Ctrl/Shift-click, or 'Select all (shown)'), "
+                "then press 'Collect clusters from selected projects' in step 4. Nothing is searched until you press it.", "ok")
 
     # ---- step 4 loading (clusters are listed per project in parallel; the list grows while it runs)
     def maybe_auto_list():
-        if (is_cli() and state["auth"]["state"] == "ok" and state["accounts_loaded"] and not state["listing"] and not state["busy"]
-                and not state["listed"] and effective_accounts()):
-            load_clusters()
+        """Clusters are collected only when the user presses the button (searching every project is slow): nothing happens here."""
+        return
 
-    def load_clusters(_event=None):
+    def load_clusters(_event=None, refresh=False):
         if state["busy"]:
             status.set("Wait for the current run to finish (or press Stop) before reloading the cluster list.")
             return
@@ -8973,14 +10675,12 @@ def run_gui(default_minutes, skip_login=False, context=None):
             return
         sync_login_opts()
         if not is_cli():
-            if not state["src_user"] and shutil.which("gcloud"):
-                src_var.set("all")                       # default: every cluster the signed-in user can access
             if src_var.get() == "all" and not shutil.which("gcloud"):
                 src_var.set("menu")
                 say("The Google Cloud CLI (gcloud) is not installed, so only the clusters from the gkelogin menu can be listed. "
-                    "Install gcloud and press 'Reload clusters' to see every cluster you can access.", "warn")
+                    "Install gcloud and choose 'Collect clusters with gcloud' to see more.", "warn")
             if src_var.get() == "all":
-                load_exe_all()
+                collect(refresh)
                 return
             CLI_TARGETS.clear()
             state["listing"] = True
@@ -8991,65 +10691,61 @@ def run_gui(default_minutes, skip_login=False, context=None):
         if state["auth"]["state"] != "ok":
             say("Sign in first (step 2): press 'Sign in', or 'Check status' if you already signed in.", "warn")
             return
-        accts = effective_accounts()
+        collect(refresh)
+
+    def refresh_selected(_event=None):
+        load_clusters(refresh=True)
+
+    def list_tick():
+        if state["listing"]:
+            cluster_hint()
+            root.after(1000, list_tick)
+
+    def collect(refresh=False):
+        """'Collect clusters from selected projects': ONLY the selected projects are searched (parallel `gcloud container clusters list --project P`);
+        projects already collected are skipped unless refresh=True ('Refresh selected')."""
+        accts = selected_projects()
         if not accts:
-            say("Choose at least one project in step 3 (or click 'All projects') and press 'Reload clusters'.", "warn")
+            say(COLLECT_HINT, "warn")
+            cl_status.set(COLLECT_HINT)
             return
-        ids = {a["id"] for a in accts}
+        todo = [a for a in accts if refresh or a["id"] not in state["listed"]]
+        if not todo and not is_cli():
+            pass                       # custom login: nothing new to search, but the gkelogin menu is read again and merged (no cluster call)
+        elif not todo:
+            say(f"The selected project(s) are already collected ({count_of(len(state['crows']), 'cluster')} in the list). Press 'Refresh selected' to read them again.", "info")
+            cluster_hint()
+            return
+        if len(todo) > CONFIRM_OVER and not confirm_many(len(todo)):
+            say("Cluster collection cancelled - select fewer projects, or confirm to continue.", "info")
+            return
+        ids = {a["id"] for a in todo}
         state["crows"] = [r for r in state["crows"] if r.get("account") not in ids]       # these are listed again
         state["listed"] -= ids
         index_rows()
         cancel = threading.Event()
-        state.update(listing=True, list_cancel=cancel, list_done=0, list_total=len(accts))
-        list_bar.configure(maximum=max(1, len(accts)), value=0)
-        simple = [{"id": a["id"], "name": a["name"]} for a in accts]
-        extra = {}
-        extra["inventory"] = scope_var.get() == "all"
-        say(f"Listing clusters in {count_of(len(accts), 'project')} ... the list below fills in as results arrive (Stop cancels).", "info")
+        state.update(listing=True, list_cancel=cancel, list_done=0, list_total=len(todo), list_t0=time.time())
+        list_bar.configure(maximum=max(1, len(todo)), value=0)
+        simple = [{"id": a["id"], "name": a["name"]} for a in todo]
+        say(f"Collecting clusters from {count_of(len(todo), 'selected project')} ... the list below fills in as results arrive (Stop cancels).", "info")
         update_controls()
+        root.after(1000, list_tick)
 
         def work():
             try:
-                found, failed = scan_clusters(simple, lambda l: msgs.put(("line", l)), lambda d, t: msgs.put(("lprog", d, t)), cancel,
-                                              lambda batch: msgs.put(("cbatch", list(batch))), **extra)
+                menu = None
+                if not is_cli():
+                    menu = list_clusters()
+                    msgs.put(("menu", dict(menu)))
+                    res = login_status()
+                    if res["state"] != "ok":
+                        msgs.put(("srcfallback", res.get("detail") or "gcloud is not signed in", dict(menu)))
+                        return
+                found, failed = (scan_clusters(simple, lambda l: msgs.put(("line", l)), lambda d, t: msgs.put(("lprog", d, t)), cancel,
+                                               lambda batch: msgs.put(("cbatch", list(batch))), inventory=True) if simple else ([], 0))
                 msgs.put(("cdone", found, failed, cancel.is_set(), [a["id"] for a in simple]))
             except Exception as exc:
                 msgs.put(("cerr", str(exc), [a["id"] for a in simple]))
-        threading.Thread(target=work, daemon=True).start()
-
-    def load_exe_all():
-        """Custom login + 'All clusters I can access': read the gkelogin menu, check the gcloud sign-in (read-only), list every cluster of
-        every project gcloud can see (parallel / Cloud Asset Inventory), then map the menu entries onto them (merge_menu)."""
-        cancel = threading.Event()
-        state.update(listing=True, list_cancel=cancel, list_done=0, list_total=0, listed=set(), crows=[], by_key={}, cchosen=set(), src_fallback=False)
-        index_rows()
-        list_bar.configure(maximum=1, value=0)
-        cl_status.set("Reading the gkelogin menu and the gcloud sign-in ...")
-        say("Listing every cluster you can access (all projects, via gcloud) ... Stop cancels.", "info")
-        update_controls()
-
-        def work():
-            try:
-                menu = list_clusters()
-                msgs.put(("menu", dict(menu)))
-                res = login_status()
-                if res["state"] != "ok":
-                    msgs.put(("srcfallback", res.get("detail") or "gcloud is not signed in", dict(menu)))
-                    return
-                accts, err = load_accounts()
-                usable = [a for a in accts if a.get("usable", True)]
-                if not usable and gcp_default_project():
-                    usable = [{"id": gcp_default_project(), "name": gcp_default_project()}]
-                if not usable:
-                    msgs.put(("srcfallback", "gcloud can see no project" + (f" ({_first_line(err, 100)})" if err else ""), dict(menu)))
-                    return
-                simple = [{"id": a["id"], "name": a.get("name") or a["id"]} for a in usable]
-                msgs.put(("lstart", len(simple)))
-                found, failed = scan_clusters(simple, lambda l: msgs.put(("line", l)), lambda d, t: msgs.put(("lprog", d, t)), cancel,
-                                              lambda batch: msgs.put(("cbatch", list(batch))), inventory=True)
-                msgs.put(("cdone", found, failed, cancel.is_set(), [a["id"] for a in simple]))
-            except Exception as exc:
-                msgs.put(("cerr", str(exc), []))
         threading.Thread(target=work, daemon=True).start()
 
     def show_menu_clusters(menu, note=None):
@@ -9077,8 +10773,11 @@ def run_gui(default_minutes, skip_login=False, context=None):
         state["src_user"] = True
         state.update(crows=[], by_key={}, cchosen=set(), clusters={}, listed=set(), menu={}, src_fallback=False)
         manual_var.set("")
+        update_collect_button()
         rebuild_cluster_list()
-        load_clusters()
+        cluster_hint()
+        if src_var.get() == "menu":
+            load_clusters()              # the gkelogin menu: instant, no cloud call
 
     def on_clusters_done(found, failed, cancelled, ids):
         state["listing"] = False
@@ -9161,6 +10860,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
         """Read the login method and the chosen project (and region) into the options a run (or a cluster listing) uses."""
         LOGIN_OPTS["method"] = "cli" if method_combo.get() == LOGIN_LABELS["cli"] else "exe"
         LOGIN_OPTS["device_code"] = device_var.get()
+        LOGIN_OPTS["signin"] = SIGNIN_KEYS.get(signin_var.get(), LOGIN_OPTS.get("signin") or "manual")
         LOGIN_OPTS["all_clusters"] = False        # the window has its own 'Cluster list' choice (list_clusters() then means the gkelogin menu)
         picked = state["acct_chosen"] if scope_var.get() == "sel" else set()
         if state["pre"] or not ACCOUNT0:      # keep the command-line value until the list has been read
@@ -9275,9 +10975,18 @@ def run_gui(default_minutes, skip_login=False, context=None):
         update_controls()
         status.set(ok_text)
 
-    RUN_TAG = {"running": "running", "ok": "ok", "failed": "failed", "stopped (partial)": "partial"}
+    RUN_TAG = {"running": "running", "ok": "ok", "failed": "failed", "credentials expired": "failed", "stopped (partial)": "partial"}
 
     def poll():
+        try:
+            while True:
+                try:
+                    exp_acct, exp_reason = EXPIRY_EVENTS.get_nowait()
+                except queue.Empty:
+                    break
+                on_expiry_event(exp_acct, exp_reason)
+        except Exception:
+            pass
         try:
             while True:
                 msg = msgs.get_nowait()
@@ -9288,6 +10997,14 @@ def run_gui(default_minutes, skip_login=False, context=None):
                     say(msg[1], msg[2])
                 elif kind == "auth":
                     apply_auth(msg[1], msg[2])
+                elif kind == "acctst":
+                    on_acct_status(msg[1], msg[2], msg[3])
+                elif kind == "man":
+                    man_cliinfo(msg[2])
+                elif kind == "signin_begin":
+                    begin_device_signin(msg[1], msg[2])
+                elif kind == "signin":
+                    on_signin_event(msg[1], msg[2])
                 elif kind == "accounts":
                     on_accounts(msg[1], msg[2])
                 elif kind == "lprog":
@@ -9364,7 +11081,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
                     progress_bar.configure(value=state["total"])
                     if state["html"]:
                         open_btn.state(["!disabled"])
-                    bad = [r["label"] for r in results["items"] if r["status"] == "failed"]
+                    bad = [r["label"] for r in results["items"] if r["status"] in ("failed", "credentials expired")]
                     finish(f"Done: {len(ok)} of {len(results['items'])} cluster(s) reported"
                            + (f" ({len(bad)} failed: {', '.join(bad)})" if bad else "")
                            + ". Click 'Open HTML report'." if state["html"] else "Finished, but no report could be written - see the log.")
@@ -9385,6 +11102,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
     run_btn.configure(command=start)
     stop_btn.configure(command=stop)
     refresh_btn.configure(command=load_clusters)
+    refresh_sel_btn.configure(command=refresh_selected)
     open_btn.configure(command=open_report)
     folder_btn.configure(command=open_folder)
     select_all_btn.configure(command=select_all)
@@ -9452,12 +11170,25 @@ def run_gui(default_minutes, skip_login=False, context=None):
                 run_tree=run_tree, sel_text=sel_text, chosen_clusters=chosen_clusters,
                 method_combo=method_combo, device_var=device_var, on_method_change=on_method_change,
                 acct_tree=acct_tree, acct_filter=acct_filter, acct_count=acct_count, cl_count=cl_count, scope_var=scope_var,
-                acct_all_btn=acct_all_btn, acct_clear_btn=acct_clear_btn, acct_reload_btn=acct_reload_btn, refresh_btn=refresh_btn,
+                acct_all_btn=acct_all_btn, acct_clear_btn=acct_clear_btn, acct_reload_btn=acct_reload_btn, refresh_btn=refresh_btn, refresh_sel_btn=refresh_sel_btn,
+                on_scope_change=on_scope_change, acct_sel_var=acct_sel_var, selected_projects=selected_projects, collect=collect, rebuild_cluster_list=rebuild_cluster_list,
                 signin_btn=signin_btn, check_btn=check_btn, auth_badge=auth_badge, auth_msg=auth_msg, guide_msg=guide_msg,
                 acct_status=acct_status, cl_status=cl_status, method_info=method_info, search_icon=SEARCH_ICON,
                 s3=s3, s4=s4, list_bar=list_bar, acct_search=acct_search, cl_search=cl_search, scope_all_rb=scope_all_rb,
                 scope_sel_rb=scope_sel_rb, check_status=check_status, src_var=src_var, src_all_rb=src_all_rb, src_menu_rb=src_menu_rb,
-                on_source_change=on_source_change, sign_in=sign_in, load_clusters=load_clusters)
+                on_source_change=on_source_change, sign_in=sign_in, load_clusters=load_clusters,
+                acct_combo=acct_combo, use_acct_btn=use_acct_btn, diff_btn=diff_btn, hint_var=hint_var, sd=sd, sd_url=sd_url, sd_chip=sd_chip,
+                sd_count=sd_count, sd_result=sd_result, sd_code=sd_code, code_var=code_var, sd_submit_btn=sd_submit_btn, sd_cancel_btn=sd_cancel_btn,
+                sd_open_btn=sd_open_btn, sd_copy_btn=sd_copy_btn, sd_raw=sd_raw, use_account=use_account, different_account=different_account,
+                acct_chip=acct_chip, acct_st_tree=acct_st_tree, check_all_btn=check_all_btn, check_all=check_all, show_expired=show_expired,
+                render_accounts=render_accounts, on_acct_typed=on_acct_typed, sd_steps=sd_steps,
+                signin_var=signin_var, signin_combo=signin_combo, on_signin_method=on_signin_method, man=man, man_panel=man_panel, man_open=man_open,
+                man_hide=man_hide, man_verify_btn=man_verify_btn, man_term_btn=man_term_btn, man_stop_btn=man_stop_btn, man_chip=man_chip,
+                man_status_var=man_status_var, man_result_var=man_result_var, man_msg_var=man_msg_var, man_cli_var=man_cli_var, man_cli_lbl=man_cli_lbl,
+                man_inst=man_inst, man_form=man_form, man_cmd_vars=man_cmd_vars, man_copy_btns=man_copy_btns, man_rows=man_rows, man_fb=man_fb,
+                man_retry_btn=man_retry_btn, man_console_btn=man_console_btn, man_copycmd_btn=man_copycmd_btn, man_instr_var=man_instr_var,
+                man_steps_lbl=man_steps_lbl, sd_raw_toggle=sd_raw_toggle, sd_cmd_var=sd_cmd_var, sd_toggle=sd_toggle, man_tick=man_tick,
+                man_refresh=man_refresh, man_cli_check=man_cli_check)
     if is_cli():
         check_status()
     else:
@@ -9509,12 +11240,21 @@ def main():
     parser.add_argument("--no-gui", action="store_true", help="never open the GUI")
     parser.add_argument("--login-method", choices=["exe", "cli"], default="exe",
                         help="how to log in: exe = the custom gkelogin.exe (default); cli = the standard Google Cloud CLI (gcloud) - then --list / --cluster use the cluster list read from gcloud")
-    parser.add_argument("--device-code", action="store_true",
-                        help="with --login-method cli: sign in without a browser pop-up (gcloud auth login --no-launch-browser)")
-    parser.add_argument("--no-launch-browser", dest="device_code", action="store_true", help="same as --device-code")
+    parser.add_argument("--device-code", "--no-launch-browser", dest="device_code", action="store_true", default=True,
+                        help="DEFAULT. With --login-method cli: sign in without a browser pop-up (gcloud auth login --no-launch-browser): "
+                             "you get a link, sign in on any device, and paste the verification code back")
+    parser.add_argument("--no-device-code", dest="device_code", action="store_false",
+                        help="use the normal browser sign-in (gcloud auth login) instead of the device code flow")
+    parser.add_argument("--signin-method", choices=["manual", "captured", "console"], default=None,
+                        help="how to sign in with --login-method cli: manual (default) = the commands are printed, you run one in your own terminal and press Enter "
+                             "(this tool then verifies read-only); captured = gcloud auth login --no-launch-browser runs here, you get the link and paste the code; "
+                             "console = gcloud auth login in its own console window")
+    parser.add_argument("--list-accounts", action="store_true", help="list the accounts gcloud knows (active one marked) with their status (Active / credentials expired) and exit; read-only")
+    parser.add_argument("--account", default=None, help="use this signed-in Google account for every gcloud call (--account EMAIL); nothing is written to gcloud's configuration")
     parser.add_argument("--gke-cluster", help="GKE cluster name for the GCP checks (default: found from the kubectl context / API endpoint)")
     parser.add_argument("--location", help="zone or region of the GKE cluster (use with --gke-cluster)")
-    parser.add_argument("--project", help="GCP project id to use. Default: chosen automatically after login")
+    parser.add_argument("--project", help="GCP project id to use; with --list / --all-clusters / --cluster NAME also a comma list (a,b,c) or 'all' = the projects whose "
+                                          "clusters are collected (nothing else is searched). Default: the currently configured gcloud project")
     parser.add_argument("--context", help="kubectl context to use (default: matched from the selected cluster)")
     parser.add_argument("--list-projects", action="store_true", help="list the GCP projects `gcloud` can see and exit")
     parser.add_argument("--open", action="store_true", help="open the HTML report in your browser when done")
@@ -9567,14 +11307,20 @@ def main():
         SUPPORT_LABEL = args.support_label
     if args.traffic_sample is not None:
         TRAFFIC_SAMPLE_SECONDS = max(0, args.traffic_sample)
-    GCP_OPTS.update(cluster=args.gke_cluster, location=args.location, project=args.project, enabled=not args.no_gcp)
+    _scope, _single = parse_project_scope(args.project)
+    GCP_OPTS.update(cluster=args.gke_cluster, location=args.location, project=_single, enabled=not args.no_gcp, scope=_scope)
     if args.gkelogin:
         GKELOGIN_EXE = args.gkelogin
     try:
         sys.stdout.reconfigure(errors="replace")
     except Exception:
         pass
-    LOGIN_OPTS.update(method=args.login_method, device_code=args.device_code, all_clusters=args.all_clusters)
+    signin = args.signin_method or ("console" if not args.device_code else default_signin_method())
+    LOGIN_OPTS.update(method=args.login_method, device_code=args.device_code, all_clusters=args.all_clusters, account=args.account or None, signin=signin)
+
+    if args.list_accounts:
+        print_accounts()
+        return
 
     if args.list_projects:
         found = list_gcp_projects()
@@ -9625,7 +11371,7 @@ def main():
             import pathlib
             import webbrowser
             webbrowser.open(pathlib.Path(target).as_uri())
-        if any(r["status"] == "failed" for r in results["items"]):
+        if any(r["status"] in ("failed", "credentials expired") for r in results["items"]):
             sys.exit(1)
         return
 
