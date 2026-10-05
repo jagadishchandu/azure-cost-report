@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
 """
-EKS Debugger - log in to an EKS cluster with ekslogin.exe, then collect the
-basic debugging picture of what happened (and what is happening) in the last
-N minutes.
+EKS Debugger - uses the AWS credentials that already exist in ~/.aws (no sign-in in this tool), connects to the clusters you choose and collects the
+basic debugging picture of what happened (and what is happening) in the last N minutes.
 
-    python eks_debug.py                       # GUI: pick a cluster from the dropdown
+    python eks_debug.py                       # GUI: choose AWS profile(s), regions, clusters
     python eks_debug.py --minutes 60          # GUI, default window 60 minutes
-    python eks_debug.py --cluster 3           # no GUI: log in to cluster #3 and collect
-    python eks_debug.py --cluster 3 --minutes 15
-    python eks_debug.py --cluster 1,3,5       # SEVERAL clusters, one after another (also: 2-4, or all)
-    python eks_debug.py --list                # show the clusters ekslogin offers
-    python eks_debug.py --all-clusters --list # EVERY cluster you can access (all ~/.aws profiles x all regions, read with aws)
-    python eks_debug.py --all-clusters --cluster 5   # run one of them: ekslogin if its menu has it, else aws eks update-kubeconfig
-    python eks_debug.py --cluster 3 --skip-login   # already logged in: don't run ekslogin
-    python eks_debug.py --cluster 3 --context my-ctx   # force a specific kubectl context
-    python eks_debug.py --cluster 3 --profile my-aws-profile   # force a profile from ~/.aws
-    python eks_debug.py --list-profiles       # show the profiles found in ~/.aws
+    python eks_debug.py --list-accounts       # the profiles of ~/.aws with their credentials status (Active / Expiring soon / Expired / Not configured / Unknown)
+    python eks_debug.py --list --profile dev,prod --region us-east-1,eu-west-1   # collect the clusters of THESE profiles x regions (nothing is scanned unless you name the scope)
+    python eks_debug.py --profile dev --region us-east-1 --cluster 1             # debug cluster #1 of that list (no GUI)
+    python eks_debug.py --profile dev,prod --region all --cluster 1,3,5          # SEVERAL clusters, one after another (also: 2-4, all, a cluster name)
+    python eks_debug.py --connect ekslogin --list        # the clusters the ekslogin.exe menu offers; --cluster 3 then runs ekslogin for entry 3 first
+    python eks_debug.py --cluster 3 --skip-login         # already connected: don't run ekslogin / write the kubeconfig entry; use the current kubectl context
+    python eks_debug.py --cluster 3 --context my-ctx     # force a specific kubectl context
+    python eks_debug.py --list-profiles                  # show the profiles found in ~/.aws
 
-After login the script also reads your ~/.aws profiles (ekslogin may have just created/refreshed
-them), picks the one for the selected cluster (kubeconfig's own profile, name match, account match),
-verifies it with `aws sts get-caller-identity`, and uses it for all AWS-side checks.
+Credentials: this tool NEVER signs in. It uses what the aws CLI itself would use: ~/.aws/config and ~/.aws/credentials (honouring AWS_CONFIG_FILE /
+AWS_SHARED_CREDENTIALS_FILE, AWS_PROFILE and the AWS_ACCESS_KEY_ID ... variables). Whatever your company's own process puts there (SSO cache, credentials
+file, credential_process, assumed roles) just works. A profile whose credentials are expired or missing is reported with a "renew them outside this tool"
+message (the window shows it in red, the command line exits with 1). The only login the tool can start is YOUR OWN ekslogin.exe, when you choose
+'Log in with ekslogin first' (--connect ekslogin); ~/.aws is re-read afterwards, because ekslogin may refresh or create profiles.
 
-After login the script switches kubectl to the selected cluster's context (`kubectl config
-use-context`) and pins every call to it with --context, so a different 'current' context can
-never send the checks to the wrong cluster.
+By default the tool writes the kubeconfig entry of each selected cluster with `aws eks update-kubeconfig --name N --region R --profile P --alias A` (local
+kubeconfig only), switches kubectl to it (`kubectl config use-context`) and pins every call to that context with --context, so a different 'current'
+context can never send the checks to the wrong cluster.
 
 Several clusters
     In the window select as many clusters as you like (Ctrl/Shift-click, 'Select all', filter box, or
-    type numbers like 1,3,5). They run ONE AFTER ANOTHER - each with its own login, kubectl context,
+    type numbers like 1,3,5). They run ONE AFTER ANOTHER - each with its own kubeconfig entry, kubectl context,
     AWS profile and its own .html/.txt report - and a summary page links them all. A cluster that fails
-    is recorded and the next one still runs. Stop skips the clusters not yet started.
+    is recorded and the next one still runs (credentials that expire in the middle: that cluster is marked 'credentials expired'). Stop skips the clusters not yet started.
 
 Time window
     LOOKBACK_MINUTES (below) is the global default. Override it with --minutes,
@@ -78,21 +77,7 @@ appearing as they are found, a Stop button (a partial report is still saved), an
 to switch AWS details / pod logs on or off.
 Logs can contain sensitive data - treat the report file accordingly.
 
-Login methods (--login-method)
-    exe (default)  the custom ekslogin.exe wrapper, as before.
-    cli            the standard AWS CLI (`aws`): signs in if needed (device code by default; --no-device-code = browser flow), lists the
-                   clusters, and writes the kubeconfig entry for each selected cluster. Everything after the login
-                   (context, cloud details, report) is the same. See the README, section "Login methods".
-    e.g.  python eks_debug.py --login-method cli --profile dev --region us-east-1 --cluster 1
-
-All clusters (--all-clusters, or the window's "Cluster list: All clusters I can access (via aws)")
-    Works with both login methods: after sign-in every cluster the signed-in user can access is listed - all profiles in
-    ~/.aws x all regions (`all` = aws ec2 describe-regions, with a built-in fallback), in parallel, de-duplicated,
-    failures logged and skipped, with a summary such as "Found 57 clusters in 12 accounts, 3 accounts failed: ...".
-    With the custom login a cluster that is in the ekslogin menu is logged in with ekslogin, any other with
-    `aws eks update-kubeconfig`. Without the flag the custom login only offers the ekslogin menu, as before.
-
-Requirements: Python 3.9+ (tkinter ships with it), kubectl on PATH, ekslogin.exe.
+Requirements: Python 3.9+ (tkinter ships with it), kubectl and the AWS CLI (aws) on PATH, working credentials in ~/.aws (ekslogin.exe only if you use it).
 """
 
 import argparse
@@ -137,7 +122,7 @@ UTIL_CRIT = 90               # ... and red
 KUBECTL_TIMEOUT = 90         # seconds per kubectl call
 LOGIN_TIMEOUT = 120          # seconds for ekslogin.exe
 REPORT_DIR = "reports"
-PARALLEL_WORKERS = 8         # collection tasks that run at the same time after the login (--workers N; 1 = one after another, exactly as before)
+PARALLEL_WORKERS = 8         # collection tasks that run at the same time after the kubeconfig step (--workers N; 1 = one after another, exactly as before)
 KUBECTL_CONCURRENCY = 6      # at most this many kubectl calls at the same moment (keeps the API server calm)
 AWS_CONCURRENCY = 4          # at most this many `aws` calls at the same moment (AWS throttles read APIs)
 AWS_RETRIES = 4              # tries for an aws call that was answered with a throttling error (waits 0.5 s, 1 s, 2 s ... between the tries)
@@ -516,7 +501,7 @@ NOTABLE_NORMAL_REASONS = {
 
 
 # ---------------------------------------------------------------------------
-# Login (as provided)
+# ekslogin.exe (the user's own login program - only used when 'Log in with ekslogin first' / --connect ekslogin is chosen)
 # ---------------------------------------------------------------------------
 
 def ekslogin(cluster_number):
@@ -538,8 +523,8 @@ def ekslogin(cluster_number):
 
 
 def list_clusters(emit=None) -> dict:
-    """{'1': 'cluster-name', ...} for the dropdown: with the Cloud CLI method - or with the custom login and the source 'All clusters I can access' -
-    every cluster `aws` can see (see list_clusters_cli); otherwise the ekslogin menu (exe_menu_clusters)."""
+    """{'1': 'cluster-name', ...} for the list: by default - or with ekslogin and the source 'Collect clusters ...' - every cluster `aws` can see
+    (see list_clusters_cli); otherwise the ekslogin menu (exe_menu_clusters)."""
     if _lists_via_cli():
         return list_clusters_cli(emit or print)
     return exe_menu_clusters(refresh=True)
@@ -584,633 +569,43 @@ def _read_exe_menu():
 
 
 # ---------------------------------------------------------------------------
-# Login method: the standard AWS CLI (`aws`) instead of ekslogin.exe  (--login-method cli)
+# How to connect to a cluster: your existing AWS credentials from ~/.aws (default - this tool NEVER signs in) or ekslogin.exe first
 # ---------------------------------------------------------------------------
 
-SIGNIN_METHOD_LABELS = {"manual": "I run the command myself (recommended)", "captured": "Show URL and code here (captured)", "console": "Open a console window for me"}
-
-
-def default_signin_method():
-    """manual unless the environment says otherwise (EKS_DEBUG_SIGNIN_METHOD=captured|console|manual; used by automated tests)."""
-    v = (os.environ.get("EKS_DEBUG_SIGNIN_METHOD") or "").strip().lower()
-    return v if v in SIGNIN_METHOD_LABELS else "manual"
-
-
-LOGIN_OPTS = {"method": "exe", "device_code": True, "gui": False, "signin": default_signin_method(),   # signin: manual | captured | console (see 'Signing in' below)   # method: "exe" (ekslogin.exe, default) or "cli" (aws)
-              "source": None,         # where the cluster LIST comes from: "all" = every cluster aws can see, "menu" = only the ekslogin menu (None = menu)
-              "all_clusters": False}  # --all-clusters: list every accessible cluster (all profiles in ~/.aws x all regions)
+LOGIN_OPTS = {"method": "cli",        # "cli" = use the credentials that already exist in ~/.aws (default) | "exe" = log in with ekslogin.exe first, then re-read ~/.aws
+              "source": None,         # where the cluster LIST comes from: "all" = every cluster aws can see (selected profiles x regions), "menu" = the ekslogin menu (None = menu with ekslogin)
+              "all_clusters": False}  # --all-clusters: list every accessible cluster
 SOURCE_LABELS = {"all": "Collect clusters with the aws CLI from selected profiles (on demand)", "menu": "Clusters from the ekslogin menu (instant)"}
 LARGE_SCOPE = 20            # profile x region pairs: above this the window asks before it starts to collect clusters
+LOGIN_LABELS = {"cli": "Use my existing AWS credentials from ~/.aws (no sign-in)", "exe": "Log in with ekslogin first"}   # the GUI combobox values
+CLI_TARGETS = {}            # cluster number (str) -> what the CLI listing found; fed into AWS_OPTS before a run
 
 
 def _lists_via_cli():
-    """True when the cluster list is read with the aws CLI: the Cloud CLI login method, or the custom login with the source 'all'."""
+    """True when the cluster list is read with the aws CLI: the default (existing credentials) method, or ekslogin with the source 'all'."""
     return LOGIN_OPTS["method"] == "cli" or LOGIN_OPTS.get("source") == "all"
-LOGIN_LABELS = {"exe": "Custom login (ekslogin)", "cli": "Cloud CLI (aws)"}   # the GUI combobox values
-CLI_TARGETS = {}    # cluster number (str) -> what the CLI listing found; fed into AWS_OPTS after the login
 
 
-def _run_interactive(cmd, emit):
-    """Run an interactive login command (browser / device-code flow). Its output is NOT captured: from the
-    command line it uses this console; from the GUI (no console) it gets its own console window on Windows.
-    Waits until it finishes. Returns the exit code, or None if it could not be started."""
-    why = check_local_command(cmd)
-    if why:
-        emit("ERROR: " + _ro_block(os.path.basename(str(cmd[0])), cmd[1:], why))
-        return None
-    emit("Running: " + " ".join([os.path.splitext(os.path.basename(cmd[0]))[0], *cmd[1:]]))
-    kwargs = {}
-    if LOGIN_OPTS["gui"] and os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-        emit("A console window opens for the sign-in - complete it there (browser / device code). This continues when it closes.")
+def ekslogin_available():
+    """True when the user's own ekslogin.exe can be found (next to this script, the path given with --ekslogin, or on PATH)."""
     try:
-        return subprocess.run(cmd, **kwargs).returncode
-    except Exception as exc:
-        emit(f"ERROR: could not start {cmd[0]}: {exc}")
-        return None
+        return os.path.isfile(EKSLOGIN_EXE) or bool(shutil.which(EKSLOGIN_EXE))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
-# Signing in.  Three methods (step 2 of the window, --signin-method on the command line):
-#   manual   (DEFAULT)  the tool SHOWS the exact commands (with the real profile name); the user runs one in their own terminal, then presses
-#                       'I have signed in - Verify' (the tool only runs the read-only `aws sts get-caller-identity`). 'Open a terminal for me' starts a
-#                       visible PowerShell window with the chosen `aws sso login` form - local-only, user-initiated, exactly these command forms.
-#   captured            `aws sso login --profile NAME [--use-device-code]` runs with its output captured (chunked reads of stdout AND stderr, no console
-#                       window); the URL and code are parsed out of it and shown. Falls back to --no-browser on an AWS CLI without --use-device-code,
-#                       and when no URL shows up the window offers the manual commands.
-#   console             the same command in its own visible console window; the tool waits and then re-checks the sign-in.
-# ---------------------------------------------------------------------------
-
-DEVICE_CODE_TTL = 600           # seconds a device code stays valid (about 10 minutes; used for the countdown)
-SIGNIN_GRACE = 90               # seconds after the countdown ends that aws gets before the sign-in is stopped as expired
-NO_URL_SECONDS = 6.0            # no URL parsed after this long: tell the user (window) / run aws with its own output (command line)
-MANUAL_POLL_SECONDS = 5         # manual mode: how often the window checks whether the sign-in happened
-MANUAL_POLL_CAP = 900           # ... and for how long (seconds) before it stops waiting
-_URL_RE = re.compile(r"https?://[^\s\"'<>,;]+")
-_CODE_RE = re.compile(r"(?<![A-Za-z0-9])[A-Z0-9]{4}-[A-Z0-9]{4}(?![A-Za-z0-9])")
-_PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@:/+=,-]*")
-_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
-_USAGE_ERROR_WORDS = ("unrecognized arguments", "unknown options", "unknown option", "invalid choice", "no such option", "usage: aws")
-
-
-def clean_output(text):
-    """What a terminal would show: no ANSI escape sequences, CR / CRLF become newlines."""
-    return _ANSI_RE.sub("", str(text or "")).replace("\r\n", "\n").replace("\r", "\n")
-
-
-def parse_device_code(text):
-    """Pull the verification URL and the user code out of what `aws sso login` printed. Tolerant: understands the plain text of aws CLI v2/v1
-    ("Please visit the following URL: ... Then enter the code: ABCD-EFGH", the browser-flow variant "... open the following URL", the one-line
-    variant, the PKCE variant with one long authorization URL), the JSON-ish names (verificationUri, verificationUriComplete, userCode), ANSI
-    colours, CR line ends, URLs wrapped over two lines and trailing punctuation. Works on the whole text collected so far (not line by line).
-    Returns {"url", "complete_url", "code"}; missing parts are None. "url" is the plain verification URL (or the complete one when that is all
-    there is); "complete_url" has the code filled in."""
-    text = re.sub(r"([?&=/%])[ \t]*\n[ \t]*(?=[A-Za-z0-9%_.~=&-]+[ \t]*(?:\n|$))", r"\1", clean_output(text))     # a URL wrapped after ? & = / %
-    urls, code = [], None
-    for raw in text.splitlines():
-        s = raw.strip()
-        if not s or "successfully logged" in s.lower():
-            continue
-        for u in _URL_RE.findall(s):
-            u = u.rstrip(".)]}:!")
-            if u not in urls:
-                urls.append(u)
-        m = re.search(r"user_?code[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9]{4}-?[A-Za-z0-9]{4})", s, re.I)
-        if m and not code:
-            code = m.group(1).upper()
-        bare = _URL_RE.sub(" ", s)
-        if not code and (_CODE_RE.fullmatch(s.rstrip(".")) or (re.search(r"\bcode\b", bare, re.I) and _CODE_RE.search(bare))):
-            code = _CODE_RE.search(bare).group(0)
-    complete = next((u for u in urls if re.search(r"[?&]user_code=", u)), None)
-    plain = next((u for u in urls if u != complete), None)
-    if not code and complete:
-        code = re.search(r"[?&]user_code=([A-Za-z0-9-]+)", complete).group(1).upper()
-    return {"url": plain or complete, "complete_url": complete, "code": code}
-
-
-def is_browser_flow(details):
-    """True when what aws printed is the browser (PKCE) flow: one long authorization URL, no code - it must be opened in a browser on THIS computer."""
-    u = (details or {}).get("url") or ""
-    return bool(u) and not (details or {}).get("code") and any(k in u for k in ("/authorize", "redirect_uri", "code_challenge"))
-
-
-def check_sso_login(args):
-    """None when `args` (after `aws`) is exactly: sso login --profile <name> [--use-device-code | --no-browser]; else the reason."""
-    a = [str(x) for x in (args or [])]
-    if a[:2] != ["sso", "login"]:
-        return "not an sso login"
-    rest = a[2:]
-    if len(rest) < 2 or rest[0] != "--profile" or not _PROFILE_NAME_RE.fullmatch(rest[1]):
-        return "'sso login' is only allowed as: sso login --profile NAME [--use-device-code | --no-browser]"
-    if rest[2:] not in ([], ["--use-device-code"], ["--no-browser"]):
-        return f"'sso login' with {' '.join(rest[2:])} is not allowed"
-    return None
-
-
-# local, read-only information commands the tool itself runs (the 'Test the aws CLI' button and the version check before a sign-in)
-LOCAL_INFO_COMMANDS = (["--version"], ["sso", "login", "help"])
-
-
-def signin_box_lines(details, profile=None, ttl=None):
-    """The clearly formatted box shown in the log / on the command line."""
-    ttl = ttl or DEVICE_CODE_TTL
-    browser = is_browser_flow(details)
-    rows = ["AWS SIGN-IN" + (f"   (profile: {profile})" if profile else ""),
-            "",
-            "1. Open this URL in a browser on THIS computer:" if browser else "1. Open this URL in any browser:", "     " + (details.get("url") or "(not shown by aws)"), ""]
-    if details.get("code"):
-        rows += ["2. Enter this code:", "     " + details["code"], ""]
-    else:
-        rows += ["2. No code is needed - just sign in on that page.", ""]
-    if details.get("complete_url") and details.get("complete_url") != details.get("url"):
-        rows += ["Or open this link (the code is filled in for you):", "     " + details["complete_url"], ""]
-    rows += [f"The code expires in about {max(1, ttl // 60)} minutes. Waiting for you to sign in ..."]
-    width = max(len(r) for r in rows) + 4
-    return ["+" + "-" * width + "+"] + ["|  " + r.ljust(width - 2) + "|" for r in rows] + ["+" + "-" * width + "+"]
-
-
-def explain_signin_failure(res):
-    """A plain-language reason for a sign-in that did not succeed (res = run_sso_login result)."""
-    if res.get("cancelled"):
-        return "The sign-in was cancelled."
-    if res.get("expired"):
-        return "The code expired before the sign-in was completed. Press 'Sign in' to get a new code."
-    text = " ".join(res.get("lines") or []).lower()
-    if "could not be found" in text or ("profile" in text and "not found" in text):
-        return "That profile is not set up in ~/.aws/config. Create it once in a terminal with 'aws configure sso', then press 'Reload profiles'."
-    if "missing the following required sso configuration" in text or ("sso_start_url" in text and "missing" in text):
-        return "That profile has no complete SSO configuration (start URL / region / account / role). Fix it with 'aws configure sso' in a terminal."
-    if "access_denied" in text or "access denied" in text or "denied" in text:
-        return "The sign-in was denied or cancelled in the browser."
-    if "expired" in text or "authorizationpending" in text.replace(" ", ""):
-        return "The code expired before the sign-in was completed. Press 'Sign in' to get a new code."
-    if "timed out" in text or "timeout" in text:
-        return "The sign-in timed out. Press 'Sign in' to try again."
-    if res.get("error"):
-        return res["error"]
-    last = [l.strip() for l in (res.get("lines") or []) if l.strip()][-3:]
-    d = res.get("details") or {}
-    if not (d.get("url") or d.get("code")):
-        rc = res.get("rc")
-        return ("aws " + (f"exited with code {rc}" if rc not in (None, 0) else "finished") + " without printing a sign-in URL."
-                + (" It printed: " + " | ".join(_first_line(l, 100) for l in last) + "." if last else " It printed nothing.")
-                + " Likely causes: the profile has no sso_session / sso_start_url, the AWS CLI is old or broken, or there is no network / proxy. "
-                  "Run one of the commands shown in step 2 in your own terminal, then press 'I have signed in - Verify'.")
-    lastl = last[-1] if last else ""
-    return "aws sso login failed" + (f" (exit code {res['rc']})" if res.get("rc") else "") + (f": {_first_line(lastl, 140)}" if lastl else ".")
-
-
-# ---- the commands shown to the user (manual mode) -------------------------------------------------------------------------------------------
-
-MANUAL_INTRO = "Sign in from your own Command Prompt or PowerShell. If the AWS CLI is not installed yet, install it first, then run this command:"
-AWS_INSTALL_URL = "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
-AWS_INSTALL_WINGET = "winget install Amazon.AWSCLI"      # shown as TEXT only: this tool never installs anything and never runs it
-
-
-def aws_cli_line(version_text=None):
-    """(text, found) for the 'AWS CLI installed?' line. Looks only at PATH (no process is started); version_text is `aws --version` when known."""
-    exe = shutil.which("aws")
-    if not exe:
-        return ("AWS CLI not found on this computer - install it first (" + AWS_INSTALL_URL + " ; on Windows: " + AWS_INSTALL_WINGET + ").", False)
-    return ("AWS CLI installed: " + (version_text or _AWS_VERSION.get(exe, {}).get("text") or exe), True)
-
-
-MANUAL_INSTRUCTIONS = ("Open a terminal (PowerShell), paste the command, open the URL it prints, enter the code, approve, then come back here and press "
-                       "'I have signed in - Verify'.")
-
-
-def signin_commands(login_profile, check_profile=None):
-    """The numbered commands of the manual sign-in, with the real profile name (no --profile when none is selected). Each: {n, key, cmd, note}.
-    These are shown as TEXT; the tool itself only ever runs the verification (aws sts get-caller-identity)."""
-    p = f" --profile {login_profile}" if login_profile else ""
-    check = check_profile or login_profile
-    c = f" --profile {check}" if check else ""
-    return [
-        {"n": "1", "key": "device", "cmd": f"aws sso login{p} --use-device-code",
-         "note": "Device code (recommended): prints a URL and a code. Needs AWS CLI 2.22 or newer - on an older AWS CLI use command 2."},
-        {"n": "2", "key": "no-browser", "cmd": f"aws sso login{p} --no-browser",
-         "note": "Alternative. On an older AWS CLI this is the device-code flow; on a newer one it prints one long URL to open in a browser on THIS computer."},
-        {"n": "3", "key": "browser", "cmd": f"aws sso login{p}",
-         "note": "Normal flow: opens your browser by itself."},
-        {"n": "4a", "key": "configure-sso", "cmd": "aws configure sso",
-         "note": "Only if the profile is not set up for SSO yet. Afterwards choose the new profile name here (this tool never creates or edits it)."},
-        {"n": "4b", "key": "configure-keys", "cmd": "aws configure" + (f" --profile {check}" if check else ""),
-         "note": "Only for access keys. You type them in your own terminal; this tool never asks for or handles keys."},
-        {"n": "5", "key": "verify", "cmd": f"aws sts get-caller-identity{c}",
-         "note": "Verification: shows who you are signed in as. The 'I have signed in - Verify' button runs exactly this."},
-    ]
-
-
-def manual_signin_block(login_profile, check_profile=None, reason=None):
-    """The numbered command block as text lines (command line; same content as the window's manual panel)."""
-    rows = []
-    if reason:
-        rows += [reason, ""]
-    rows += [MANUAL_INTRO, "(" + aws_cli_line()[0] + ")", ""]
-    rows += [MANUAL_INSTRUCTIONS, ""]
-    for item in signin_commands(login_profile, check_profile):
-        rows += [f"  {item['n']}. {item['cmd']}", f"        {item['note']}"]
-    rows += [""]
-    width = max(len(r) for r in rows) + 2
-    return ["+" + "-" * width + "+"] + ["| " + r.ljust(width - 1) + "|" for r in rows] + ["+" + "-" * width + "+"]
-
-
-def signin_failure_help(detail, login_profile, check_profile=None):
-    """The exact error and which command to try next, after a failed verification."""
-    cmds = {i["key"]: i["cmd"] for i in signin_commands(login_profile, check_profile)}
-    low = str(detail or "").lower()
-    if "could not be found" in low or ("profile" in low and "not found" in low):
-        nxt = (f"The profile name was not found in ~/.aws/config - check the spelling (press 'Reload profiles'), or create it with: {cmds['configure-sso']}")
-    elif "sso_start_url" in low or "missing the following required sso" in low:
-        nxt = f"The profile has no complete SSO configuration. Run: {cmds['configure-sso']}"
-    elif "unable to locate credentials" in low:
-        nxt = f"No sign-in found for this profile yet. Run: {cmds['device']}   (older AWS CLI: {cmds['no-browser']}); a profile without SSO needs: {cmds['configure-sso']}"
-    elif is_expired_error(detail):
-        nxt = f"The sign-in expired or was not completed. Run: {cmds['device']}   (older AWS CLI: {cmds['no-browser']})"
-    else:
-        nxt = f"Try: {cmds['no-browser']}   or   {cmds['browser']}"
-    return f"Verification failed: {_first_line(str(detail or 'unknown error'), 200)}\nNext: {nxt}   Then press 'I have signed in - Verify' again."
-
-
-_TERMINAL_FORMS = {"device": ["--use-device-code"], "no-browser": ["--no-browser"], "browser": []}
-
-
-def terminal_signin_plan(profile, form):
-    """(Popen args, displayed command, None) or (None, None, reason): the PowerShell window of 'Open a terminal for me'. User-initiated LOCAL-ONLY exception:
-    only `aws sso login --profile NAME [--use-device-code | --no-browser | nothing]`, checked by the same strict guard as every other command."""
-    flags = _TERMINAL_FORMS.get(form)
-    if flags is None:
-        return None, None, f"'{form}' is not one of the sign-in commands"
-    profile = profile or "default"
-    argv = ["sso", "login", "--profile", profile]
-    why = check_local_command(["aws", *argv, *flags]) if flags else check_sso_login(argv)
-    if why:
-        return None, None, _ro_block("aws", argv + flags, why)
-    shell = shutil.which("powershell") or shutil.which("pwsh") or "powershell"
-    line = " ".join(["aws", *argv, *flags])
-    return [shell, "-NoExit", "-Command", " ".join(["aws", "sso", "login", "--profile", "'" + profile + "'", *flags])], line, None
-
-
-def open_terminal_signin(profile, form, popen=None):
-    """Start a visible PowerShell window that runs the chosen `aws sso login` form and stays open. Returns (ok, command text or reason)."""
-    args, line, why = terminal_signin_plan(profile, form)
-    if why:
-        return False, why
-    if os.name != "nt":
-        return False, "Opening a terminal is only done on Windows - copy the command and run it in your own terminal."
-    try:
-        (popen or subprocess.Popen)(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
-    except Exception as exc:
-        return False, f"could not open a terminal: {exc}"
-    return True, line
-
-
-def manual_signin_cli(login_name, check_name, emit=print, reason=None, input_fn=None, status_fn=None):
-    """Command line, manual method: print the numbered command block, wait for Enter, verify with `aws sts get-caller-identity`, repeat on failure.
-    Returns True when signed in; False on Ctrl+C / no input (stdin is not interactive)."""
-    for line in manual_signin_block(login_name, check_name, reason):
-        emit(line)
-    ask = input_fn or input
-    while True:
-        try:
-            ask("Press Enter after you have signed in, or Ctrl+C to stop: ")
-        except (KeyboardInterrupt, EOFError):
-            emit("")
-            emit("Stopped waiting - no sign-in was verified. Run one of the commands above in your terminal, then run this tool again.")
-            return False
-        st = (status_fn or login_status)(check_name)
-        if st.get("state") == "ok":
-            emit(f"Signed in as {st.get('who') or '?'}")
-            return True
-        for line in signin_failure_help(st.get("detail"), login_name, check_name).splitlines():
-            emit(line)
-
-
-# ---- the aws CLI itself ---------------------------------------------------------------------------------------------------------------------
-
-_AWS_VERSION = {}       # exe path -> {"text", "tuple"}  (only successful reads are remembered)
-
-
-def _aws_env():
-    return dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", AWS_PAGER="", PAGER="", AWS_CLI_AUTO_PROMPT="off")
-
-
-def _nowindow():
-    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
-
-
-def _run_local_info(args, timeout=25, runner=None):
-    """Run one of the LOCAL_INFO_COMMANDS (`aws --version`, `aws sso login help`): returns (text, error). Output of both streams."""
-    exe = shutil.which("aws") or "aws"
-    cmd = [exe, *args]
-    why = check_local_command(cmd)
-    if why:
-        return "", _ro_block("aws", args, why)
-    try:
-        r = (runner or subprocess.run)(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL,
-                                       env=_aws_env(), **_nowindow())
-        return clean_output(f"{getattr(r, 'stdout', '') or ''}\n{getattr(r, 'stderr', '') or ''}").strip(), ""
-    except Exception as exc:
-        return "", str(exc)
-
-
-def aws_version(runner=None, force=False):
-    """{"text": first line of `aws --version`, "tuple": (2, 15, 0) or None}; None when aws could not be run."""
-    exe = shutil.which("aws") or "aws"
-    if exe in _AWS_VERSION and not force:
-        return _AWS_VERSION[exe]
-    text, err = _run_local_info(["--version"], 20, runner)
-    if err or not text:
-        return None
-    m = re.search(r"aws-cli/(\d+)\.(\d+)\.(\d+)", text)
-    info = {"text": _first_line(text, 160), "tuple": tuple(int(x) for x in m.groups()) if m else None}
-    if m:
-        _AWS_VERSION[exe] = info
-    return info
-
-
-def supports_device_code(info):
-    """True / False from the aws version, None when it is not known. --use-device-code exists from AWS CLI v2.22."""
-    t = (info or {}).get("tuple")
-    if not t:
-        return None
-    return t >= (2, 22, 0) if t[0] >= 2 else False
-
-
-def aws_cli_selftest(runner=None):
-    """The 'Test the aws CLI' check: lines with the version and whether `sso login` knows --use-device-code (read from `aws sso login help`)."""
-    lines = []
-    exe = shutil.which("aws")
-    lines.append("aws found at: " + (exe or "NOT FOUND on PATH - install the AWS CLI v2 from https://aws.amazon.com/cli/"))
-    if not exe:
-        return lines
-    info = aws_version(runner, force=True)
-    lines.append("aws --version: " + (info["text"] if info else "could not be run"))
-    sup = supports_device_code(info)
-    text, err = _run_local_info(["sso", "login", "help"], 30, runner)
-    helps = None if (err or not text) else ("--use-device-code" in text)
-    lines.append("aws sso login help: " + ("could not be read (" + _first_line(err, 100) + ")" if helps is None else
-                                           ("lists --use-device-code" if helps else "does not list --use-device-code")))
-    final = helps if helps is not None else sup
-    lines.append("--use-device-code supported: " + ("yes" if final else ("no - use command 2 (--no-browser): on this version it IS the device-code flow" if final is False else "unknown")))
-    return lines
-
-
-# ---- captured / console sign-in ------------------------------------------------------------------------------------------------------------
-
-def _kill_tree(proc):
-    """Stop the aws process and everything it started (on Windows aws.exe has children: taskkill /T /F)."""
-    pid = getattr(proc, "pid", None)
-    if os.name == "nt" and isinstance(pid, int):
-        try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=15, **_nowindow())
-        except Exception:
-            pass
-    try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
-    except Exception:
-        pass
-
-
-def _stream_reader(name, stream, q):
-    """Chunked reads (whatever is available - no waiting for a newline or EOF), decoded incrementally, put on the queue as (name, text)."""
-    import codecs
-    dec = codecs.getincrementaldecoder("utf-8")("replace")
-    try:
-        while True:
-            if hasattr(stream, "read1"):
-                data = stream.read1(4096)
-            elif hasattr(stream, "read"):
-                data = stream.read(4096)
-            else:
-                data = stream.readline()
-            if not data:
-                break
-            q.put((name, dec.decode(data) if isinstance(data, (bytes, bytearray)) else data))
-    except Exception:
-        pass
-    q.put((name, None))
-
-
-def _sso_attempt(cmd, res, emit, on_details, on_raw, on_event, cancel, ttl, popen, profile, no_url_action, kwargs, flag):
-    """One captured run of `cmd`. Fills res (lines, raw, details). Returns {"usage_error", "inherit"}."""
-    out = {"usage_error": False, "inherit": False}
-    try:
-        proc = (popen or subprocess.Popen)(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, bufsize=0, env=_aws_env(), **kwargs)
-    except Exception as exc:
-        res["error"] = f"could not start aws: {exc}"
-        emit("ERROR: " + res["error"])
-        res["start_failed"] = True
-        return out
-    q = queue.Queue()
-    streams = [(n, getattr(proc, n, None)) for n in ("stdout", "stderr")]
-    streams = [(n, s) for n, s in streams if s is not None]
-    for n, s in streams:
-        threading.Thread(target=_stream_reader, args=(n, s, q), daemon=True).start()
-    open_streams = len(streams)
-    t_start, t_details, box_at, boxed, done_text, pending, flagged = time.time(), None, None, None, "", "", False
-    exited_at = None
-    attempt_raw = ""
-    while True:
-        try:
-            name, text = q.get(timeout=0.15)
-        except queue.Empty:
-            name, text = None, ""
-        if name is not None and text is None:
-            open_streams -= 1
-            if open_streams <= 0:
-                break
-            continue
-        if text:
-            text = clean_output(text)
-            res["raw"] += text
-            attempt_raw += text
-            if on_raw:
-                on_raw(text)
-            pending += text
-            while "\n" in pending:
-                line, pending = pending.split("\n", 1)
-                if line.strip():
-                    line = line.rstrip()
-                    res["lines"].append(line)
-                    emit("  aws: " + line)
-            if "successfully logged" in attempt_raw.lower():
-                done_text = "done"
-            if not done_text:
-                found = parse_device_code(attempt_raw)
-                if found != res["details"] and (found["url"] or found["code"]):
-                    res["details"] = found
-                    t_details = t_details or time.time()
-                    if on_details:
-                        on_details(dict(found))
-                    if flagged and on_event:
-                        on_event("url_late", dict(found))
-                    box_at = time.time() + 2.0
-        now = time.time()
-        if res["details"]["url"] and boxed != res["details"] and not done_text and (res["details"]["code"] or (box_at and now >= box_at)):
-            boxed = dict(res["details"])
-            for l in signin_box_lines(boxed, profile, ttl):
-                emit(l)
-        if not flagged and not res["details"]["url"] and not done_text and now - t_start >= NO_URL_SECONDS:
-            flagged = res["no_url"] = True
-            emit(f"No URL received from aws yet after {int(NO_URL_SECONDS)} seconds - this can happen when aws buffers its output.")
-            if on_event:
-                on_event("no_url", {"seconds": int(NO_URL_SECONDS)})
-            if no_url_action == "inherit":
-                out["inherit"] = True
-                _kill_tree(proc)
-                return out
-        if cancel is not None and cancel.is_set():
-            res["cancelled"] = True
-            _kill_tree(proc)
-            break
-        if now - (t_details or t_start) > ttl + SIGNIN_GRACE:
-            res["expired"] = True
-            _kill_tree(proc)
-            break
-        try:
-            gone = proc.poll() is not None
-        except Exception:
-            gone = False
-        if gone:
-            exited_at = exited_at or now
-            if now - exited_at > 1.5:         # a grandchild may keep the pipes open: the process itself is finished
-                break
-        else:
-            exited_at = None
-    if pending.strip():
-        res["lines"].append(pending.strip())
-        emit("  aws: " + pending.strip())
-    try:
-        res["rc"] = proc.wait(timeout=10)
-    except Exception:
-        _kill_tree(proc)
-        res["rc"] = getattr(proc, "returncode", None)
-    low = attempt_raw.lower()
-    out["usage_error"] = (flag == "--use-device-code" and res["rc"] not in (0, None) and not res["details"]["url"] and any(w in low for w in _USAGE_ERROR_WORDS))
-    return out
-
-
-def _sso_cmd(exe, profile, flag):
-    return [exe, "sso", "login", "--profile", str(profile)] + ([flag] if flag else [])
-
-
-def run_sso_login(profile, device_code, emit, on_details=None, cancel=None, ttl=None, popen=None, flag=None, on_raw=None, on_event=None,
-                  console=False, no_url_action=None, runner=None):
-    """Run `aws sso login --profile PROFILE [--use-device-code | --no-browser]` and report what happens.
-    Captured (default): stdout AND stderr are read in chunks (never waiting for a newline), the text is cleaned (ANSI, CR) and the URL / code are parsed
-    from everything collected so far; on_details(dict) fires as soon as they are known, a box goes through emit, on_raw(text) gets every chunk,
-    on_event(kind, data) gets "command", "version", "fallback", "no_url", "url_late". An aws CLI that does not know --use-device-code (older than 2.22, or
-    a usage error) is retried automatically with --no-browser (the device-code flow of those versions). When no URL shows up within NO_URL_SECONDS the
-    window is told ("no_url"); on the command line (no_url_action "inherit") aws is run again with its own output on this console.
-    console=True: the command runs in its own visible console window and this waits for it (the user completes the sign-in there).
-    `flag` forces "--use-device-code", "--no-browser" or "" (plain). `cancel` (threading.Event) stops the process tree.
-    Returns {"ok", "rc", "cancelled", "expired", "error", "lines", "raw", "details", "cmd", "flag", "no_url", "inherited", "version", "fallback"}.
-    LOCAL-ONLY exception of the read-only guarantee: the user's own sign-in (check_local_command allows exactly these command lines)."""
-    ttl = ttl or DEVICE_CODE_TTL
-    exe = shutil.which("aws") or "aws"
-    if flag is None:
-        flag = "--use-device-code" if device_code else ""
-    res = {"ok": False, "rc": None, "cancelled": False, "expired": False, "error": "", "lines": [], "raw": "", "no_url": False, "inherited": False,
-           "details": {"url": None, "complete_url": None, "code": None}, "cmd": None, "flag": flag, "version": None, "fallback": None}
-    if flag == "--use-device-code":
-        info = aws_version()
-        if info:
-            res["version"] = info["text"]
-            if on_event:
-                on_event("version", dict(info, device_code=supports_device_code(info)))
-            if supports_device_code(info) is False:
-                flag = res["flag"] = "--no-browser"
-                res["fallback"] = "version"
-                emit(f"This AWS CLI ({info['text']}) is older than 2.22 and has no --use-device-code: using --no-browser, which is the device-code flow in that version.")
-                if on_event:
-                    on_event("fallback", {"to": flag, "why": "version"})
-    cmd = res["cmd"] = _sso_cmd(exe, profile, flag)
-    why = check_local_command(cmd)
-    if why:
-        res["error"] = _ro_block("aws", cmd[1:], why)
-        emit("ERROR: " + res["error"])
-        return res
-    if on_event:
-        on_event("command", "aws " + " ".join(cmd[1:]))
-    emit("Running: aws " + " ".join(cmd[1:]))
-    if console:
-        return _sso_console(cmd, res, emit, cancel)
-    kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if (LOGIN_OPTS["gui"] and os.name == "nt") else {}
-    if no_url_action is None:
-        no_url_action = "notify" if LOGIN_OPTS["gui"] else "inherit"
-    while True:
-        out = _sso_attempt(cmd, res, emit, on_details, on_raw, on_event, cancel, ttl, popen, profile, no_url_action, kwargs, flag)
-        if res.get("start_failed"):
-            return res
-        if out["usage_error"]:
-            flag = res["flag"] = "--no-browser"
-            res["fallback"] = "usage"
-            res["lines"], res["raw"], res["no_url"] = [], "", False
-            cmd = res["cmd"] = _sso_cmd(exe, profile, flag)
-            emit("aws does not know --use-device-code (older AWS CLI): retrying with --no-browser, which is the device-code flow in that version.")
-            if on_event:
-                on_event("fallback", {"to": flag, "why": "usage"})
-                on_event("command", "aws " + " ".join(cmd[1:]))
-            emit("Running: aws " + " ".join(cmd[1:]))
-            continue
-        break
-    if out["inherit"]:
-        emit("aws printed no sign-in URL that could be read - running it again with its own output on this console (nothing is captured) ...")
-        res["inherited"] = True
-        try:
-            res["rc"] = (runner or subprocess.run)(cmd, env=_aws_env()).returncode
-        except Exception as exc:
-            res["error"] = f"could not start aws: {exc}"
-            emit("ERROR: " + res["error"])
-            return res
-    res["ok"] = res["rc"] == 0 and not res["cancelled"] and not res["expired"]
-    if not res["ok"]:
-        res["error"] = explain_signin_failure(res)
-    return res
-
-
-def _sso_console(cmd, res, emit, cancel):
-    """The sign-in in its own console window (nothing captured); waits until the window's aws exits (or cancel is set)."""
-    kwargs = {"creationflags": subprocess.CREATE_NEW_CONSOLE} if os.name == "nt" else {}
-    emit("A console window opens for the sign-in - complete it there (browser / device code). This continues when it closes.")
-    try:
-        proc = subprocess.Popen(cmd, env=_aws_env(), **kwargs)
-    except Exception as exc:
-        res["error"] = f"could not start aws: {exc}"
-        emit("ERROR: " + res["error"])
-        return res
-    while True:
-        try:
-            res["rc"] = proc.wait(timeout=0.3)
-            break
-        except Exception:
-            pass
-        if cancel is not None and cancel.is_set():
-            res["cancelled"] = True
-            _kill_tree(proc)
-            res["rc"] = getattr(proc, "returncode", None)
-            break
-    res["ok"] = res["rc"] == 0 and not res["cancelled"]
-    if not res["ok"]:
-        res["error"] = explain_signin_failure(res) if res["cancelled"] else (
-            f"The console sign-in ended with exit code {res['rc']}. Run one of the commands shown in step 2 in your own terminal, then press 'I have signed in - Verify'.")
-    return res
-
-
-# ---------------------------------------------------------------------------
-# Account status: is each AWS profile signed in, expiring or expired?  (nothing is changed; no token is ever read into a message)
-#   * local read of the SSO token cache (~/.aws/sso/cache/*.json): only `startUrl` and `expiresAt` are used, never the token itself
-#   * verified with `aws sts get-caller-identity --profile P` (read-only, already on the allow-list), 4 at a time
+# Credentials status of the AWS profiles in ~/.aws: Active / Expiring soon / Expired / Not configured / Unknown.
+# This tool never signs in. It only READS: the local SSO token cache (~/.aws/sso/cache: only startUrl and expiresAt are used - never a token or a
+# secret) and `aws sts get-caller-identity --profile P` (read-only, on the allow-list), 4 at a time.
 # ---------------------------------------------------------------------------
 
 EXPIRING_SECONDS = 30 * 60      # less than this left = "Expiring soon"
-STATUS_WORKERS = 4              # `aws sts get-caller-identity` calls at the same moment when checking accounts
-LAZY_STATUS_LIMIT = 40          # up to this many profiles are all checked in the background; above it: the selected one + 'Check all accounts'
+STATUS_WORKERS = 4              # `aws sts get-caller-identity` calls at the same moment when checking profiles
+LAZY_STATUS_LIMIT = 40          # up to this many profiles are all checked in the background; above it: the selected ones first + 'Re-check all'
+BLOCKED_STATES = ("expired", "not_configured")      # a profile in one of these states is skipped (collect) / marked 'credentials expired' (run)
+ENV_LABEL = "Environment / default credentials"     # the pseudo-entry: what the aws CLI uses without --profile (AWS_* variables, AWS_PROFILE, [default])
+ENV_KEY = "__env__"
 _EXPIRED_PATTERNS = ("expiredtoken", "token has expired", "has expired or is otherwise invalid", "expired or is otherwise invalid", "access token has expired",
                      "refresh token", "invalidclienttokenid", "unable to locate credentials", "security token included in the request is expired",
                      "token is expired", "credentials have expired", "credentials expired")
@@ -1223,12 +618,26 @@ def is_expired_error(err):
     return any(p in low for p in _EXPIRED_PATTERNS) or ("sso" in low and "expired" in low)
 
 
+def renew_command(profile):
+    return "aws sso login" + (f" --profile {profile}" if profile else "")
+
+
+def renew_message(profile, with_ekslogin=None):
+    """The red message for a profile whose credentials are expired or missing. The tool does not sign in: the text only says what to do."""
+    name = profile or ENV_LABEL
+    msg = (f"Credentials for profile {name} are expired or missing. This tool does not sign in. Renew them the way your company does it "
+           f"(for example your company's login tool, or `{renew_command(profile)}` in your own terminal), then press Re-check.")
+    if (ekslogin_available() if with_ekslogin is None else with_ekslogin):
+        msg += " Or choose 'Log in with ekslogin first' under 'How to connect to a cluster'."
+    return msg
+
+
 class CredentialsExpired(RuntimeError):
-    """The credentials of an AWS profile expired (the run continues with the other clusters; the account is shown as Expired)."""
+    """The credentials of an AWS profile are expired or missing (the run continues with the other clusters; the profile is shown as Expired)."""
 
     def __init__(self, profile, message=None):
         self.profile = profile
-        super().__init__(message or f"credentials for profile {profile} expired - sign in again (aws sso login --profile {profile})")
+        super().__init__(message or renew_message(profile))
 
 
 def _parse_expiry(text):
@@ -1270,6 +679,11 @@ def read_sso_cache():
     return out
 
 
+def _lookup_name(name, profiles):
+    """The profile whose settings apply: the given one, or what the aws CLI itself would use (AWS_PROFILE, else [default])."""
+    return name or os.environ.get("AWS_PROFILE") or ("default" if "default" in profiles else None)
+
+
 def _sso_chain(name, profiles):
     """(is_sso, start_url) of a profile, following source_profile for role profiles."""
     seen, n = set(), name
@@ -1284,13 +698,23 @@ def _sso_chain(name, profiles):
     return False, None
 
 
+def _expiry_of(name, profiles, cache):
+    """(is_sso, expiry or None): the SSO token expiry from the local cache, else the expiration written next to temporary credentials (non-secret
+    keys such as aws_session_expiration / expiration in the credentials file, or AWS_CREDENTIAL_EXPIRATION for the environment)."""
+    key = _lookup_name(name, profiles)
+    is_sso, start = _sso_chain(key, profiles)
+    exp = cache.get(start) if (is_sso and start) else None
+    if exp is None:
+        exp = (profiles.get(key) or {}).get("expires_at")
+    if exp is None and not name and not os.environ.get("AWS_PROFILE") and os.environ.get("AWS_CREDENTIAL_EXPIRATION"):
+        exp = _parse_expiry(os.environ.get("AWS_CREDENTIAL_EXPIRATION"))
+    return is_sso, exp
+
+
 def sso_expiry_of(name):
-    """The expiry (aware datetime) of the cached SSO token behind a profile, or None when it cannot be told. Local file read; no token is read into a message."""
+    """The expiry (aware datetime) behind a profile, or None when it cannot be told. Local file read; no token is read into a message."""
     try:
-        if not name:
-            return None
-        is_sso, start = _sso_chain(name, list_aws_profiles())
-        return read_sso_cache().get(start) if (is_sso and start) else None
+        return _expiry_of(name, list_aws_profiles(), read_sso_cache())[1]
     except Exception:
         return None
 
@@ -1311,13 +735,12 @@ def fmt_time(dt):
 
 
 def classify_status(name, err, profiles=None, cache=None, now=None):
-    """Status of one profile from the result of `sts get-caller-identity` (err = None when it worked) and the local SSO cache.
-    {"profile", "state": active | expiring | expired | not_signed_in | unknown, "left" (seconds or None), "expires_at", "detail", "sso"}."""
+    """Status of one profile from the result of `sts get-caller-identity` (err = None when it worked) and the local expiry information.
+    {"profile", "state": active | expiring | expired | not_configured | unknown, "left" (seconds or None), "expires_at", "detail", "sso"}."""
     profiles = list_aws_profiles() if profiles is None else profiles
     cache = read_sso_cache() if cache is None else cache
     now = now or datetime.now(timezone.utc)
-    is_sso, start = _sso_chain(name, profiles)
-    exp = cache.get(start) if (is_sso and start) else None
+    is_sso, exp = _expiry_of(name, profiles, cache)
     left = (exp - now).total_seconds() if exp else None
     st = {"profile": name, "state": "unknown", "left": None, "expires_at": exp, "detail": "", "sso": is_sso}
     if err is None:
@@ -1329,46 +752,40 @@ def classify_status(name, err, profiles=None, cache=None, now=None):
         return st
     low = str(err).lower()
     st["detail"] = _first_line(err, 160)
-    if "does not exist" in low and "sso" in low or ("unable to locate credentials" in low and is_sso and exp is None):
-        st["state"] = "not_signed_in"
+    if "could not be found" in low or ("not found" in low and "profile" in low):
+        st.update(state="not_configured", detail="profile not found in ~/.aws")
+    elif ("does not exist" in low and "sso" in low) or "error loading sso token" in low or "unable to locate credentials" in low or "no credentials" in low:
+        if is_sso and left is not None and left <= 0:
+            st["state"] = "expired"
+        else:
+            st["state"] = "not_configured"
     elif is_expired_error(err):
         st["state"] = "expired"
-    elif "unable to locate credentials" in low or "no credentials" in low:
-        st["state"] = "not_signed_in"
-    elif "could not be found" in low or "not found" in low and "profile" in low:
-        st["detail"] = "profile not found in ~/.aws"
     return st
 
 
 def status_text(st):
-    """The words shown next to an account."""
+    """The words shown in the status chip of a profile."""
     s = st.get("state")
     if s == "active":
         return "Active" + (f" - {fmt_left(st['left'])} left" if st.get("left") else "")
     if s == "expiring":
         return f"Expiring soon - {fmt_left(st.get('left') or 0)} left"
     if s == "expired":
-        return "Credentials expired - sign in again"
-    if s == "not_signed_in":
-        return "Not signed in"
+        return "Credentials expired - renew them outside this tool"
+    if s == "not_configured":
+        return "Not configured" + (f": {_first_line(st['detail'], 60)}" if st.get("detail") else "")
     if s == "unchecked":
         return "Checking ..."
     return "Unknown" + (f": {_first_line(st['detail'], 70)}" if st.get("detail") else "")
 
 
-def expired_message(profile, st=None):
-    """'Credentials for X expired at <time>. Press Sign in to renew'"""
-    exp = (st or {}).get("expires_at")
-    return f"Credentials for {profile} expired" + (f" at {fmt_time(exp)}" if exp else "") + ". Press Sign in to renew."
-
-
 def local_status(name, profiles=None, cache=None, now=None):
-    """Quick status from the local SSO cache only (no aws call): shown until the check with `sts get-caller-identity` has answered."""
+    """Quick status from the local expiry information only (no aws call): shown until the check with `sts get-caller-identity` has answered."""
     profiles = list_aws_profiles() if profiles is None else profiles
     cache = read_sso_cache() if cache is None else cache
     now = now or datetime.now(timezone.utc)
-    is_sso, start = _sso_chain(name, profiles)
-    exp = cache.get(start) if (is_sso and start) else None
+    is_sso, exp = _expiry_of(name, profiles, cache)
     st = {"profile": name, "state": "unchecked", "left": None, "expires_at": exp, "detail": "", "sso": is_sso, "provisional": True}
     if exp is not None:
         left = (exp - now).total_seconds()
@@ -1377,8 +794,9 @@ def local_status(name, profiles=None, cache=None, now=None):
 
 
 def check_accounts(names, on_result=None, cancel=None, workers=STATUS_WORKERS):
-    """Check the sign-in of each profile with `aws sts get-caller-identity --profile P` (read-only), `workers` at a time. on_result(name, status) is
-    called as each answer arrives (from a worker thread). Returns {name: status}. Each status also has 'arn' and 'account' when signed in."""
+    """Check the credentials of each profile with `aws sts get-caller-identity --profile P` (read-only), `workers` at a time. A name of None means
+    'no --profile' (the environment / default credentials). on_result(name, status) is called as each answer arrives (from a worker thread).
+    Returns {name: status}. Each status also has 'arn' and 'account' when the credentials work."""
     names = list(names)
     profiles, cache = list_aws_profiles(), read_sso_cache()
     out = {}
@@ -1405,16 +823,20 @@ def check_accounts(names, on_result=None, cancel=None, workers=STATUS_WORKERS):
 
 
 def print_accounts(emit=print):
-    """--list-accounts: every profile with its sign-in status."""
-    profiles = list_aws_profiles()
-    if not profiles:
-        emit("No AWS profiles found in ~/.aws (config / credentials).")
+    """--list-accounts: every profile with its credentials status."""
+    rows, _err = load_accounts()
+    if not rows:
+        emit("No AWS profiles found in ~/.aws (config / credentials) and no AWS_* credentials in the environment.")
         return {}
-    emit(f"Accounts in ~/.aws ({len(profiles)}) - checking the sign-in of each (read-only: aws sts get-caller-identity) ...")
-    res = check_accounts(sorted(profiles, key=str.lower)) if shutil.which("aws") else {n: local_status(n, profiles) for n in profiles}
-    for n in sorted(profiles, key=str.lower):
-        st = res.get(n) or {"state": "unknown", "detail": "not checked"}
-        emit(f"  {n:<32} {status_text(st):<40} {profile_hint(profiles[n])}")
+    emit(f"AWS profiles ({len(rows)}) - checking the credentials of each (read-only: aws sts get-caller-identity) ...")
+    profiles = list_aws_profiles()
+    ids = [r["id"] for r in rows]
+    res = check_accounts(ids) if shutil.which("aws") else {i: local_status(i, profiles) for i in ids}
+    for r in rows:
+        st = res.get(r["id"]) or {"state": "unknown", "detail": "not checked"}
+        emit(f"  {r['name']:<34} {status_text(st):<52} {r['info']}")
+        if st.get("state") in BLOCKED_STATES:
+            emit("      " + renew_message(r["id"]))
     return res
 
 
@@ -1434,196 +856,68 @@ def _run_captured(cmd, timeout=120):
 
 
 def list_selected_clusters(emit=print):
-    """The cluster list of the chosen login method / source (ekslogin.exe menu / clusters.json, or the aws CLI)."""
+    """The cluster list of the chosen connection method / source (ekslogin.exe menu / clusters.json, or the aws CLI)."""
     return list_clusters(emit)
 
 
-def _use_manual_signin():
-    """Command line: the default sign-in method shows the commands and waits for the user (the window has its own manual panel)."""
-    return (LOGIN_OPTS.get("signin") or "manual") == "manual" and not LOGIN_OPTS["gui"]
+def env_credentials_present():
+    """True when the environment names credentials for the aws CLI (the values are never read into a message)."""
+    return any(os.environ.get(k) for k in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_SESSION_TOKEN", "AWS_WEB_IDENTITY_TOKEN_FILE"))
 
 
-def _login_kwargs():
-    return {"console": True} if LOGIN_OPTS.get("signin") == "console" else {}
-
-
-def cli_ensure_aws(profile, emit, on_details=None, cancel=None, result=None, interactive=True, login_kw=None):
-    """True when the AWS CLI is installed and authenticated for `profile` (`aws sts get-caller-identity`). If not, and the profile has SSO config, signs in
-    with the chosen method (manual: prints the commands and waits for Enter; captured / console: runs `aws sso login`) and checks again."""
-    exe = shutil.which("aws")
-    if not exe:
-        emit("AWS CLI (aws) was not found on PATH - install it (https://aws.amazon.com/cli/), then run: aws configure   (or: aws sso login --profile NAME)")
-        return False
-    ident, err = aws_cli(["sts", "get-caller-identity"], {"profile": profile}, timeout=30)
-    if not err:
-        emit("AWS CLI is signed in" + (f" (profile {profile})" if profile else "") + f" as {ident.get('Arn') if isinstance(ident, dict) else '?'}")
-        return True
-    emit("AWS CLI is not authenticated" + (f" for profile {profile}" if profile else "") + f": {_first_line(err, 110)}")
-    expired = is_expired_error(err)
-    if not interactive:                 # inside a window run: never start a sign-in here - report it (the account is shown as expired)
-        if expired:
-            raise CredentialsExpired(profile or os.environ.get("AWS_PROFILE") or "default")
-        return False
-    profiles = list_aws_profiles()
-    name = profile or os.environ.get("AWS_PROFILE") or "default"
-    if not profile and not os.environ.get("AWS_PROFILE") and name not in profiles:
-        pick, sso_names = implicit_sso_profile(profiles)
-        if pick:
-            name = pick
-            emit(f"No profile selected and no [default] profile - using the " + ("only SSO profile" if len(sso_names) == 1 else "first of the SSO profiles (they share one sign-in)") + f" '{name}'.")
-            profile = name
-            AWS_OPTS["profile"] = name
-        elif sso_names:
-            emit("No profile selected and no [default] profile - pick one with --profile: " + ", ".join(sso_names))
-            return False
-    # a role profile (source_profile = X) signs in through X: follow the chain to the SSO profile
-    login_name, seen = name, set()
-    while login_name in profiles and not profiles[login_name].get("sso") and profiles[login_name].get("source") and login_name not in seen:
-        seen.add(login_name)
-        login_name = profiles[login_name]["source"]
-    info = profiles.get(login_name)
-    if not (info and info.get("sso")):
-        msg = f"Profile '{name}' has no SSO configuration - run `aws configure` (access keys), `aws configure sso`, or `aws login --profile {name}`, then try again."
-        emit(msg)
-        if result is not None:
-            result.update(ok=False, error=msg, lines=[], cancelled=False, expired=False, rc=None)
-        if _use_manual_signin():
-            return manual_signin_cli(name, name, emit, reason=f"Profile '{name}' is not set up for SSO (see commands 4a / 4b).")
-        return False
-    name = login_name
-    profile = profile or name
-    manual = _use_manual_signin()
-    if expired:
-        emit(expired_message(name, classify_status(name, err, profiles)).replace("Press Sign in to renew.", "Sign in again with one of the commands below." if manual else (
-            "Starting the sign-in again (device code) ..." if LOGIN_OPTS["device_code"] else "Starting the sign-in again ...")))
-    if manual:
-        return manual_signin_cli(name, profile, emit, reason=("Credentials expired for profile " if expired else "Not signed in: profile ") + f"{name}.")
-    res = run_sso_login(name, LOGIN_OPTS["device_code"], emit, on_details, cancel, **(login_kw if login_kw is not None else _login_kwargs()))     # LOCAL-ONLY exception: the user's own interactive sign-in
-    if result is not None:
-        result.update(res)
-    if not res["ok"]:
-        rc = res["rc"]
-        emit("aws sso login failed or was cancelled" + (f" (exit code {rc})" if rc else "") + ".")
-        if res.get("error"):
-            emit("Reason: " + res["error"])
-        return False
-    ident, err = aws_cli(["sts", "get-caller-identity"], {"profile": profile}, timeout=30)
-    if err:
-        emit(f"Still not authenticated after aws sso login: {_first_line(err, 110)}")
-        return False
-    emit(f"AWS CLI login OK - signed in as {ident.get('Arn') if isinstance(ident, dict) else '?'}")
-    return True
-
-
-def implicit_sso_profile(profiles):
-    """(profile, sso_profile_names) to sign in with when none is chosen and there is no [default]: the only SSO profile, or the first
-    one when they all share one SSO session (one sign-in covers all of them). Profile is None when it cannot be decided."""
-    names = sorted(n for n, i in profiles.items() if i.get("sso"))
-    keys = {profiles[n].get("sso_key") for n in names}
-    if len(names) == 1 or (names and len(keys) == 1 and None not in keys):
-        return names[0], names
-    return None, names
-
-
-def _aws_check_profile(account):
-    """The profile whose sign-in the window checks: the chosen one, else what the AWS CLI itself would use (AWS_PROFILE / [default]),
-    else the SSO profile that is implied (see implicit_sso_profile)."""
-    if account or os.environ.get("AWS_PROFILE"):
-        return account
-    profiles = list_aws_profiles()
-    return None if "default" in profiles else implicit_sso_profile(profiles)[0]
-
-
-def _aws_login_plan(profile):
-    """(profile `aws sso login` would use for `profile` or None, message when it cannot sign in). Mirrors cli_ensure_aws."""
-    profiles = list_aws_profiles()
-    name = profile or os.environ.get("AWS_PROFILE") or "default"
-    if not profile and not os.environ.get("AWS_PROFILE") and name not in profiles:
-        pick, sso_names = implicit_sso_profile(profiles)
-        if pick:
-            name = pick
-        elif sso_names:
-            return None, ("Several SSO profiles with different sign-ins exist and none is chosen - select one in step 3: " + ", ".join(sso_names[:8])
-                          + (" ..." if len(sso_names) > 8 else ""))
-    login_name, seen = name, set()
-    while login_name in profiles and not profiles[login_name].get("sso") and profiles[login_name].get("source") and login_name not in seen:
-        seen.add(login_name)
-        login_name = profiles[login_name]["source"]
-    info = profiles.get(login_name)
-    if not (info and info.get("sso")):
-        return None, (f"Profile '{name}' has no SSO configuration - in a terminal run `aws configure sso` (or `aws configure` for access keys), "
-                      "then press 'Check status'.")
-    return login_name, ""
-
-
-def login_status(account=None):
-    """Read-only sign-in check for the window (`aws sts get-caller-identity` for the profile; nothing is changed, no sign-in is started).
-    Returns {"state": "ok" | "not_signed_in" | "no_cli", "who", "detail", "hint"}."""
-    if not shutil.which("aws"):
-        return {"state": "no_cli", "who": None, "detail": "The AWS CLI (aws) is not installed (it was not found on PATH).",
-                "hint": "Install it from https://aws.amazon.com/cli/, then press 'Check status'."}
-    check = _aws_check_profile(account)
-    ident, err = aws_cli(["sts", "get-caller-identity"], {"profile": check}, timeout=30)
-    if not err:
-        arn = ident.get("Arn") if isinstance(ident, dict) else None
-        acct = (ident.get("Account") if isinstance(ident, dict) else None) or (re.search(r"arn:aws[a-z-]*:[a-z0-9-]+::(\d{12}):", arn).group(1) if arn and re.search(r"arn:aws[a-z-]*:[a-z0-9-]+::(\d{12}):", arn) else None)
-        return {"state": "ok", "who": f"{arn or '?'}" + (f" (profile {check})" if check else ""), "detail": "", "hint": "",
-                "arn": arn, "account": acct, "profile": check}
-    login_name, why = _aws_login_plan(account)
-    hint = (f"Press 'Sign in' (runs: aws sso login --profile {login_name}): the URL and code are shown in step 2 - open the URL and enter the code."
-            if login_name else why)
-    exp = None
-    try:
-        exp = classify_status(login_name or check or "default", err).get("expires_at") if is_expired_error(err) else None
-    except Exception:
-        exp = None
-    expired = is_expired_error(err) and not ("unable to locate" in str(err).lower() and exp is None)      # never signed in is not 'expired'
-    res = {"state": "not_signed_in", "who": None, "detail": _first_line(err, 160), "hint": hint, "profile": check or login_name,
-           "expired": expired, "expires_at": exp}
-    if res["expired"]:
-        res["hint"] = expired_message(check or login_name or "default", {"expires_at": exp})
-    return res
-
-
-def cli_sign_in(emit, account=None, on_details=None, cancel=None, result=None, force=False, login_kw=None):
-    """The interactive sign-in of the window's 'Sign in' button (aws sso login for the profile, honouring the device-code option).
-    force=True always runs the sign-in (the user asked for it, e.g. to switch to another account); otherwise an existing valid sign-in is kept."""
-    if force:
-        login_name, why = _aws_login_plan(account)
-        if not login_name:
-            if result is not None:
-                result.update(ok=False, error=why, lines=[], cancelled=False, expired=False, rc=None)
-            emit("Cannot sign in: " + why)
-            return False
-        res = run_sso_login(login_name, LOGIN_OPTS["device_code"], emit, on_details, cancel, **(login_kw if login_kw is not None else _login_kwargs()))
-        if result is not None:
-            result.update(res)
-        if not res["ok"]:
-            emit("aws sso login failed or was cancelled" + (f" (exit code {res['rc']})" if res["rc"] else "") + ".")
-            if res.get("error"):
-                emit("Reason: " + res["error"])
-            return False
-        ident, err = aws_cli(["sts", "get-caller-identity"], {"profile": account or login_name}, timeout=30)
-        if err:
-            emit(f"Still not authenticated after aws sso login: {_first_line(err, 110)}")
-            if result is not None:
-                result.update(ok=False, error=f"Signed in, but the profile still has no working credentials: {_first_line(err, 140)}")
-            return False
-        emit(f"AWS CLI login OK - signed in as {ident.get('Arn') if isinstance(ident, dict) else '?'}")
-        return True
-    return cli_ensure_aws(account, emit, on_details, cancel, result, login_kw=login_kw)
+def role_text(info):
+    """Role / SSO information of a profile, where it is known (never a secret)."""
+    info = info or {}
+    parts = []
+    if info.get("role_name"):
+        parts.append("role " + info["role_name"])
+    elif info.get("role_arn"):
+        parts.append("role " + info["role_arn"].rsplit("/", 1)[-1])
+    if info.get("sso"):
+        parts.append("SSO" + (f" {info['start_url']}" if info.get("start_url") else ""))
+    if info.get("source") and not info.get("sso"):
+        parts.append(f"via {info['source']}")
+    return ", ".join(parts) or ("keys / credential_process" if not info.get("role_arn") else "")
 
 
 def load_accounts():
-    """Every AWS profile in ~/.aws (no cap): ([{id, name, code, info, usable}], error_or_None), sorted by name."""
+    """Every AWS profile of ~/.aws (no cap) plus - when the environment names credentials (AWS_ACCESS_KEY_ID ..., AWS_PROFILE) or there is no profile
+    at all - the pseudo-entry 'Environment / default credentials' (id None = no --profile). ([{id, key, name, code, info, role, region, usable}], error_or_None)."""
     try:
         profiles = list_aws_profiles()
     except Exception as exc:
         return [], str(exc)
-    rows = [{"id": n, "name": n, "code": i.get("account") or "-",
+    rows = [{"id": n, "key": n, "name": n, "code": i.get("account") or "-", "role": role_text(i), "region": i.get("region") or "-",
              "info": ("SSO" if i.get("sso") else ("role" if i.get("role_arn") else "keys")) + ", " + (i.get("region") or "no region"),
              "usable": True} for n, i in profiles.items()]
-    return sorted(rows, key=lambda a: a["name"].lower()), None
+    rows.sort(key=lambda a: a["name"].lower())
+    if env_credentials_present() or not rows:
+        cur = profiles.get(os.environ.get("AWS_PROFILE") or "default") or {}
+        rows.insert(0, {"id": None, "key": ENV_KEY, "name": ENV_LABEL, "code": cur.get("account") or "-", "role": role_text(cur) or "AWS_* variables / default chain",
+                        "region": os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or cur.get("region") or "-",
+                        "info": "environment, " + (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or cur.get("region") or "no region"),
+                        "usable": True})
+    return rows, None
+
+
+PREFLIGHT = {"blocked": [], "usable": []}       # the last command-line check of the profiles in scope (see split_usable)
+
+
+def split_usable(accounts, emit=print):
+    """Check the credentials of the profiles in `accounts` ([{id, name}]) and split them: (usable, blocked). A profile that is expired / not configured
+    is NOT used: the renew message is printed for it (this tool does not sign in). Unknown (could not be checked) counts as usable."""
+    res = check_accounts([a["id"] for a in accounts])
+    usable, blocked = [], []
+    for a in accounts:
+        st = res.get(a["id"]) or {"state": "unknown"}
+        if st["state"] in BLOCKED_STATES:
+            blocked.append(a)
+            emit(renew_message(a["id"]))
+        else:
+            usable.append(a)
+    PREFLIGHT.update(blocked=[a["id"] for a in blocked], usable=[a["id"] for a in usable])
+    return usable, blocked
+
 
 
 LIST_WORKERS = 16            # parallel `aws eks list-clusters` calls (one per profile + region)
@@ -1716,7 +1010,7 @@ def scan_clusters(accounts, emit=print, progress=None, cancel=None, on_batch=Non
         for n in names or []:
             acct = (profiles.get(profile or os.environ.get("AWS_PROFILE") or "default") or {}).get("account")
             rows.append({"name": n, "region": region, "profile": profile, "account_id": acct, "where": region, "account": profile,
-                         "account_name": profile or "(default credentials)", "key": f"{acct or profile}/{region}/{n}".lower()})
+                         "account_name": profile or ENV_LABEL, "key": f"{acct or profile}/{region}/{n}".lower()})
         return i, rows, None
     results, failed, done, seen = {}, [], 0, set()
     with ThreadPoolExecutor(max_workers=max(1, min(LIST_WORKERS, total))) as pool:
@@ -1746,7 +1040,7 @@ def scan_clusters(accounts, emit=print, progress=None, cancel=None, on_batch=Non
                 for f in futures:
                     f.cancel()
     if len(failed) > 5:
-        emit(f"  ... {len(failed)} of {total} profile/region lookups failed (not signed in, no access, or EKS not available there).")
+        emit(f"  ... {len(failed)} of {total} profile/region lookups failed (expired credentials, no access, or EKS not available there).")
     stats["ok_scopes"] = [lookups[i] for i in sorted(results)]
     found, seen = [], set()
     for i in sorted(results):                       # profile / region order, whatever order the answers arrived in
@@ -1758,11 +1052,11 @@ def scan_clusters(accounts, emit=print, progress=None, cancel=None, on_batch=Non
     for i, (profile, _region) in enumerate(lookups):
         per_profile[profile][0] += 1
         per_profile[profile][1] += 1 if i in failed else 0
-    stats["profiles"] = [p or "(default credentials)" for p in per_profile]
-    stats["failed_profiles"] = [p or "(default credentials)" for p, (n, f) in per_profile.items() if n and f == n and not stopped()]
+    stats["profiles"] = [p or ENV_LABEL for p in per_profile]
+    stats["failed_profiles"] = [p or ENV_LABEL for p, (n, f) in per_profile.items() if n and f == n and not stopped()]
     stats["expired_profiles"] = sorted({(p or os.environ.get("AWS_PROFILE") or "default") for p, _r, e in stats["failures"] if is_expired_error(e)})
     if stats["expired_profiles"]:
-        emit("  Credentials expired for: " + ", ".join(stats["expired_profiles"]) + " - sign in again (aws sso login --profile NAME) and reload the clusters.")
+        emit("  Credentials expired for: " + ", ".join(stats["expired_profiles"]) + " - renew them outside this tool, press Re-check and collect again.")
     return found, len(failed)
 
 
@@ -1775,11 +1069,11 @@ def scan_summary(found, stats):
     fp = stats.get("failed_profiles") or []
     if fp:
         msg += f", {len(fp)} account{'s' if len(fp) != 1 else ''} failed: " + ", ".join(fp[:8]) + (" ..." if len(fp) > 8 else "")
-    partial = len(stats.get("failures") or []) - sum(1 for f in (stats.get("failures") or []) if (f[0] or "(default credentials)") in fp)
+    partial = len(stats.get("failures") or []) - sum(1 for f in (stats.get("failures") or []) if (f[0] or ENV_LABEL) in fp)
     if partial > 0:
         msg += f"; {partial} region lookup{'s' if partial != 1 else ''} failed and {'were' if partial != 1 else 'was'} skipped"
     if stats.get("expired_profiles"):
-        msg += "; credentials expired for " + ", ".join(stats["expired_profiles"][:6]) + (" ..." if len(stats["expired_profiles"]) > 6 else "") + " - sign in again"
+        msg += "; credentials expired for " + ", ".join(stats["expired_profiles"][:6]) + (" ..." if len(stats["expired_profiles"]) > 6 else "") + " - renew them outside this tool"
     checked = len(stats.get("profiles") or [])
     if checked and stats.get("lookups"):
         msg += f" ({checked} account{'s' if checked != 1 else ''} / profile{'s' if checked != 1 else ''}, {stats['lookups']} region lookups)"
@@ -1847,7 +1141,7 @@ def parse_profile_scope(text):
 
 
 def scope_description(accounts, regions):
-    names = [a["name"] or "(default credentials)" for a in accounts]
+    names = [a["name"] or ENV_LABEL for a in accounts]
     ex = _explicit_regions(regions)
     return (f"{len(names)} profile{'s' if len(names) != 1 else ''} ({', '.join(names[:6])}{' ...' if len(names) > 6 else ''}) x "
             + ("every enabled region" if any(r.lower() in ALL_REGIONS for r in ex) else (", ".join(ex) if ex else "each profile's own region")))
@@ -1855,16 +1149,18 @@ def scope_description(accounts, regions):
 
 def list_clusters_cli(emit=print, accounts=None, progress=None, cancel=None, on_batch=None, regions=None):
     """{'1': 'name (region)', ...} from `aws eks list-clusters` (read-only), numbered in the listed order. Fills CLI_TARGETS.
-    From the command line it signs in first if needed and uses the chosen profile - or, with --all-clusters, EVERY profile in ~/.aws x every
-    region (`all` regions via `aws ec2 describe-regions`, built-in list as fallback), in parallel, de-duplicated, failures logged and skipped.
-    The window passes the profiles it has selected (`accounts`, [{id, name}]) after checking the sign-in. No limit on profiles or regions."""
+    From the command line it uses the profile(s) of --profile (a, a,b,c or all) - or the credentials the aws CLI would use anyway - after checking that their
+    credentials work (a profile that is expired / not configured is skipped with the renew message; this tool never signs in), x the regions of --region
+    (`all` via `aws ec2 describe-regions`, built-in list as fallback), in parallel, de-duplicated, failures logged and skipped.
+    The window passes the profiles it has selected (`accounts`, [{id, name}]). No limit on profiles or regions."""
     CLI_TARGETS.clear()
     all_mode = bool(LOGIN_OPTS.get("all_clusters"))
     if accounts is None:
-        profile = AWS_OPTS.get("profile")
-        if not cli_ensure_aws(profile, emit):
+        PREFLIGHT.update(blocked=[], usable=[])
+        if not shutil.which("aws"):
+            emit("AWS CLI (aws) was not found on PATH - install it from https://aws.amazon.com/cli/ (this tool only uses the credentials that already exist in ~/.aws).")
             return {}
-        profile = AWS_OPTS.get("profile")                        # may have been set to the only SSO profile
+        profile = AWS_OPTS.get("profile")
         accounts = [{"id": profile, "name": profile}]
         scope = AWS_OPTS.get("profile_scope")                    # --profile a,b,c | all (nothing is scanned unless it is asked for)
         if scope == "all":
@@ -1878,6 +1174,11 @@ def list_clusters_cli(emit=print, accounts=None, progress=None, cancel=None, on_
         elif all_mode and scope is None:
             emit("NOTE: --all-clusters no longer scans every profile. Only the selected / default profile is searched; use --profile a,b,c or --profile all "
                  "(and --region r1,r2 or --region all) to search more.")
+        accounts, blocked = split_usable(accounts, emit)
+        if blocked and accounts:
+            emit("NOTE: " + ", ".join(a["name"] or ENV_LABEL for a in blocked) + " skipped (credentials expired or missing); the other profiles are searched.")
+        if not accounts:
+            return {}
         emit("Searching for EKS clusters in: " + scope_description(accounts, regions) + ".")
     if LOGIN_OPTS["method"] == "exe":
         exe_menu_clusters()                                      # read the ekslogin menu once, to see which clusters it offers
@@ -1892,21 +1193,26 @@ def list_clusters_cli(emit=print, accounts=None, progress=None, cancel=None, on_
     clusters = register_clusters(found, len(accounts) > 1)
     if LOGIN_OPTS["method"] == "exe":
         n_menu = sum(1 for t in CLI_TARGETS.values() if t.get("exe_number"))
-        emit(f"{n_menu} of them are in the ekslogin menu (logged in with ekslogin); the other {len(found) - n_menu} are logged in with aws eks update-kubeconfig.")
+        emit(f"{n_menu} of them are in the ekslogin menu (logged in with ekslogin); the other {len(found) - n_menu} are connected with aws eks update-kubeconfig.")
     return clusters
 
 
 def cli_login(number, label, emit):
-    """Log in to cluster `number` with the AWS CLI: make sure `aws` is authenticated, then
-    `aws eks update-kubeconfig`. Returns the kubectl context name. Raises RuntimeError when it fails."""
+    """Connect to cluster `number` with the credentials that already exist in ~/.aws (no sign-in): check they work (`aws sts get-caller-identity`), then
+    `aws eks update-kubeconfig`. Returns the kubectl context name. Raises CredentialsExpired when the profile's credentials are expired / missing,
+    RuntimeError when anything else fails."""
     if not CLI_TARGETS:
         list_clusters_cli(emit)
     tgt = CLI_TARGETS.get(str(number))
     if not tgt:
-        raise RuntimeError(f"cluster {number} is not in the AWS CLI cluster list - run --list with --login-method cli to see the numbers")
+        raise RuntimeError(f"cluster {number} is not in the AWS CLI cluster list - run --list to see the numbers")
     profile = tgt.get("profile") or AWS_OPTS.get("profile")
-    if not cli_ensure_aws(profile, emit, interactive=not LOGIN_OPTS["gui"]):
-        raise RuntimeError("AWS CLI is not authenticated (login failed, was cancelled, or aws is missing)")
+    ident, err = aws_cli(["sts", "get-caller-identity"], {"profile": profile}, timeout=30)
+    if err:
+        if classify_status(profile, err)["state"] in BLOCKED_STATES:
+            raise CredentialsExpired(profile)
+        raise RuntimeError(f"the AWS credentials of {profile or ENV_LABEL} do not work: {_first_line(err, 120)}")
+    emit(f"Using your existing AWS credentials ({profile or ENV_LABEL}): {ident.get('Arn') if isinstance(ident, dict) else '?'}")
     # LOCAL-ONLY exception of the read-only guarantee: `aws eks update-kubeconfig` writes the user's local kubeconfig, never the cluster.
     cmd = [shutil.which("aws"), "eks", "update-kubeconfig", "--name", tgt["name"], "--region", tgt["region"]]
     if profile:
@@ -1920,6 +1226,7 @@ def cli_login(number, label, emit):
     return tgt["alias"]
 
 
+
 # ---------------------------------------------------------------------------
 # READ-ONLY GUARANTEE (enforced, not just promised)
 #
@@ -1929,10 +1236,8 @@ def cli_login(number, label, emit):
 #   kubectl : get (incl. get --raw GET paths), logs, top, version, api-resources, api-versions, cluster-info, explain, auth can-i,
 #             config get-contexts | current-context | view   |   LOCAL-ONLY: config use-context (switches the local kubeconfig's current context)
 #   aws     : exactly the (service, command) pairs of READ_ONLY_CLOUD_COMMANDS below (describe / list / get / filter-log-events ...)
-#             LOCAL-ONLY exceptions: `aws sso login --profile NAME [--use-device-code|--no-browser]` and nothing else of `sso` (the user's own interactive
-#             sign-in: run by the tool for the 'captured' / 'console' sign-in methods, or in a PowerShell window that 'Open a terminal for me' starts -
-#             exactly these forms); `aws --version` and `aws sso login help` (local information); `aws eks update-kubeconfig` (writes the LOCAL kubeconfig
-#             only), and the custom login program ekslogin.exe that the user chose to use.
+#             LOCAL-ONLY exceptions: `aws eks update-kubeconfig` (writes the LOCAL kubeconfig only) and the user's own login program ekslogin.exe
+#             (only when the user chose 'Log in with ekslogin first'). The tool has NO sign-in of its own.
 # No code path installs a tool (no pip / package manager / download / `aws configure`); install hints are printed as text only.
 # ---------------------------------------------------------------------------
 
@@ -1954,7 +1259,7 @@ READ_ONLY_CLOUD_COMMANDS = {         # aws service -> the read-only commands the
     "cloudwatch": {"get-metric-statistics"},
     "logs": {"filter-log-events"},
 }
-LOCAL_ONLY_CLOUD_COMMANDS = {("sso", "login"), ("eks", "update-kubeconfig")}     # local-only: the local kubeconfig; never touches the cluster. (`aws sso login` is handled by check_sso_login: exact form only)
+LOCAL_ONLY_CLOUD_COMMANDS = {("eks", "update-kubeconfig")}     # local-only: the local kubeconfig; never touches the cluster
 _RO = {"lock": threading.Lock(), "reads": 0, "blocked": []}
 
 
@@ -2002,15 +1307,11 @@ def check_aws(args):
 
 
 def check_local_command(cmd):
-    """Guard for the helper that starts login programs: only the listed local-only commands, ekslogin.exe, or a read-only kubectl / aws call."""
+    """Guard for the helper that starts local-only commands: `aws eks update-kubeconfig`, ekslogin.exe (the user's own login program), or a read-only kubectl / aws call."""
     c = [str(x) for x in cmd]
     tool = os.path.splitext(os.path.basename(c[0]))[0].lower() if c else ""
     if tool == "aws":
-        if c[1:] in LOCAL_INFO_COMMANDS:
-            return None                                       # local, read-only: `aws --version`, `aws sso login help` (the 'Test the aws CLI' check)
         pair = tuple(c[1:3])
-        if pair == ("sso", "login"):
-            return check_sso_login(c[1:])                     # local-only: exactly  sso login --profile NAME [--use-device-code | --no-browser]
         if pair in LOCAL_ONLY_CLOUD_COMMANDS:
             return None
         return check_aws(c[1:])
@@ -3032,7 +2333,7 @@ def _first_line(err, n=170):
 
 
 # ---------------------------------------------------------------------------
-# AWS profiles from ~/.aws (read AFTER ekslogin, which may create / refresh them)
+# AWS profiles from ~/.aws (re-read after ekslogin, which may create / refresh them)
 # ---------------------------------------------------------------------------
 
 AWS_ACCOUNT_IN_ARN = re.compile(r"arn:aws[a-z-]*:iam::(\d{12}):")
@@ -3074,7 +2375,7 @@ def list_aws_profiles():
                 name = section
             get = lambda key: parser.get(section, key, fallback=None)
             info = profiles.setdefault(name, {"region": None, "account": None, "role_arn": None, "sso": False, "source": None, "files": [], "sso_key": None,
-                                                         "role_name": None, "start_url": None})
+                                                         "role_name": None, "start_url": None, "expires_at": None})
             info["files"].append("config" if is_config else "credentials")
             info["region"] = info["region"] or get("region")
             role = get("role_arn")
@@ -3087,6 +2388,11 @@ def list_aws_profiles():
             info["source"] = info["source"] or get("source_profile")
             info["role_name"] = info["role_name"] or get("sso_role_name")
             info["start_url"] = info["start_url"] or get("sso_start_url")
+            if not info["expires_at"]:                      # temporary credentials written next to the keys carry a non-secret expiry (the keys / tokens are never read)
+                for _k in ("aws_session_expiration", "aws_expiration", "expiration", "x_security_token_expires"):
+                    if get(_k):
+                        info["expires_at"] = _parse_expiry(get(_k))
+                        break
     for info in profiles.values():
         if not info["start_url"] and info["sso_key"] in sessions:
             info["start_url"] = sessions[info["sso_key"]]
@@ -3146,7 +2452,7 @@ def rank_aws_profiles(profiles, label, cluster, account, exec_profile, preferred
 
 
 def select_aws_profile(label, emit, preferred=None):
-    """After ekslogin: read the profiles in ~/.aws, rank them for the selected cluster, and use the
+    """Read the profiles in ~/.aws (again after ekslogin), rank them for the selected cluster, and use the
     first one that actually has working credentials (checked with sts get-caller-identity).
     The choice is stored in AWS_OPTS['profile_used']. Returns the profile name or None."""
     AWS_OPTS["profile_used"], AWS_OPTS["profile_reason"], AWS_OPTS["profile_region"] = None, None, None
@@ -3172,7 +2478,7 @@ def select_aws_profile(label, emit, preferred=None):
             emit(f"AWS profile '{name}' selected ({reason}); signed in as {ident.get('Arn')}")
             return name
         low = err.lower()
-        hint = f"  -> run: aws sso login --profile {name}" if "sso" in low and ("expire" in low or "login" in low or "token" in low) else ""
+        hint = "  -> credentials expired or missing: renew them outside this tool, then try again" if is_expired_error(err) else ""
         emit(f"  profile '{name}' ({reason}) did not work: {_first_line(err, 110)}{hint}")
         failed.append(name)
     if preferred:
@@ -3379,7 +2685,7 @@ def section_aws(rep, ctx, label):
     if err:
         rep.add(f"AWS credentials: NOT WORKING ({_first_line(err)})")
         if "sso" in err.lower():
-            rep.add(f"  If this is an expired SSO session, run:  aws sso login --profile {target['profile'] or '<profile>'}")
+            rep.add("  " + renew_message(target["profile"], with_ekslogin=False))
         ctx.find("HIGH", "AWS CLI credentials are not valid - AWS-side checks skipped")
         return
     rep.add(f"Signed in as: {ident.get('Arn')}  (account {ident.get('Account')})")
@@ -8369,7 +7675,7 @@ def login_and_debug(cluster_number, label, minutes, emit, skip_login=False, cont
     note = progress or (lambda *a, **k: None)
     listed_by_cli = _lists_via_cli()
     tgt = CLI_TARGETS.get(str(cluster_number)) if listed_by_cli else None
-    # the Cloud CLI method always logs in with aws; the custom login only for clusters its menu does not offer (found by the aws listing)
+    # the default method always connects with aws; ekslogin only for clusters its menu offers (the others, found by the aws listing, use aws eks update-kubeconfig)
     cli = LOGIN_OPTS["method"] == "cli" or bool(tgt and LOGIN_OPTS["method"] == "exe" and not tgt.get("exe_number"))
     ctx_label = label
     if tgt and not cli:
@@ -8379,8 +7685,8 @@ def login_and_debug(cluster_number, label, minutes, emit, skip_login=False, cont
         t0 = time.time()
         if cli:
             if LOGIN_OPTS["method"] == "exe":
-                emit(f"Cluster {label} is not in the ekslogin menu - logging in with `aws eks update-kubeconfig` instead.")
-            emit(f"Logging in to cluster {cluster_number} ({label}) with the AWS CLI ...")
+                emit(f"Cluster {label} is not in the ekslogin menu - connecting with `aws eks update-kubeconfig` instead.")
+            emit(f"Connecting to cluster {cluster_number} ({label}) with your existing AWS credentials (aws eks update-kubeconfig; no sign-in) ...")
             try:
                 ctx = cli_login(cluster_number, label, emit)
             except RuntimeError:
@@ -8394,7 +7700,8 @@ def login_and_debug(cluster_number, label, minutes, emit, skip_login=False, cont
             if not ekslogin(exe_number):
                 note("login", "failed", time.time() - t0)
                 raise RuntimeError(f"ekslogin failed for cluster {cluster_number}")
-        emit("Login OK.")
+            emit("Re-reading ~/.aws (ekslogin may have created or refreshed profiles) ...")
+        emit("Connected." if cli else "Login OK.")
         note("login", "done", time.time() - t0)
     else:
         note("login", "skipped", None)
@@ -8468,7 +7775,7 @@ def parse_cluster_selection(text, known):
 
 def run_clusters(selected, minutes, emit, skip_login=False, context=None, progress=None, cancel=None,
                  options=None, on_finding=None, on_cluster=None):
-    """Run the whole debug for several clusters, ONE AFTER ANOTHER (ekslogin, the kubectl context
+    """Run the whole debug for several clusters, ONE AFTER ANOTHER (the kubeconfig entry, the kubectl context
     and the AWS profile are shared state, so they must not overlap). Every cluster gets its own
     .txt and .html report; with more than one cluster a summary page linking them is written too.
     A failing cluster is recorded and the next one still runs. `cancel` stops after the current step
@@ -8494,7 +7801,7 @@ def run_clusters(selected, minutes, emit, skip_login=False, context=None, progre
         tprofile = (CLI_TARGETS.get(str(number)) or {}).get("profile")
         if tprofile and tprofile in expired_profiles:          # this account's credentials already turned out to be expired: don't try again
             entry.update(status="credentials expired", expired_profile=tprofile,
-                         error=f"credentials for profile {tprofile} expired - sign in again (aws sso login --profile {tprofile}) and run this cluster again")
+                         error=renew_message(tprofile))
             emit(f"SKIPPED {label}: {entry['error']}")
             notify(i, n, label, entry["status"], entry)
             continue
@@ -8515,8 +7822,9 @@ def run_clusters(selected, minutes, emit, skip_login=False, context=None, progre
                 prof = getattr(exc, "profile", None) or tprofile or AWS_OPTS.get("profile") or os.environ.get("AWS_PROFILE") or "default"
                 expired_profiles.add(prof)
                 entry.update(status="credentials expired", expired_profile=prof,
-                             error=f"credentials for profile {prof} expired - sign in again (aws sso login --profile {prof}) and run this cluster again")
-                emit(f"ERROR on cluster {label}: credentials expired for profile {prof} - the other clusters continue.")
+                             error=renew_message(prof))
+                emit(f"ERROR on cluster {label}: credentials for profile {prof or ENV_LABEL} are expired or missing - the other clusters continue.")
+                emit(renew_message(prof))
             else:
                 entry.update(status="failed", error=str(exc))
                 emit(f"ERROR on cluster {label}: {exc}")
@@ -8630,15 +7938,12 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
     msgs = queue.Queue()
     state = {"busy": False, "cancel": None, "html": None, "t0": None, "finished": 0, "total": 1, "term": set(),
              "counts": Counter(), "clusters": {}, "reports": {}, "n": 1,
-             "auth": {"state": "unchecked"}, "checking": False, "signing": False, "auth_for": None, "recheck": None,
-             "accounts": [], "acct_by_id": {}, "acct_chosen": set(), "acct_loading": False, "accounts_loaded": False,
-             "acct_locked": False, "cl_locked": False, "pre": False,
+             "accounts": [], "acct_by_id": {}, "acct_chosen": set(), "acct_loading": False, "accounts_loaded": False, "pre": False,
+             "acct_status": {}, "status_checking": False, "status_cancel": None, "status_gen": 0, "profiles_info": {},
              "crows": [], "by_key": {}, "cchosen": set(), "listing": False, "list_cancel": None, "listed": set(),
              "list_done": 0, "list_total": 0, "rebuild": False, "said": [], "src_user": False, "fell_back": False,
              "scopes": set(), "list_scope": None, "list_t0": None}
     COLORS = {"ok": "#067647", "err": "#c00000", "warn": "#9a7d0a", "info": "#1f4e79", "dim": "#777777"}
-    NEED_SIGNIN = False      # the list of profiles itself needs the sign-in (AWS profiles are read from ~/.aws)
-    PER_ACCOUNT = True      # the sign-in belongs to the chosen profile (AWS profile)
     ACCOUNT0 = AWS_OPTS["profile"]   # the profile given on the command line, if any
     try:                    # symbols above U+FFFF (the magnifier, the severity dots ...) need a Tk that can show them
         tk.Label(root, text="\U0001F50D\U0001F534☁").destroy()
@@ -8744,7 +8049,7 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
     tab_clusters = ttk.Frame(nb, padding=(2, 6, 2, 2))
     tab_collect = ttk.Frame(nb, padding=(2, 6, 2, 2))
     tab_run = ttk.Frame(nb, padding=(2, 6, 2, 2))
-    nb.add(tab_clusters, text=f"{icon('key')} 1  Sign in and choose clusters")
+    nb.add(tab_clusters, text=f"{icon('key')} 1  Choose profiles and clusters")
     nb.add(tab_collect, text=f"{icon('list')} 2  What to collect")
     nb.add(tab_run, text=f"{icon('run')} 3  Run and results")
 
@@ -8754,773 +8059,24 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
     def count_of(n, noun):
         return f"{n} {noun}" + ("" if n == 1 else "s")
 
-    # ---- guide: steps 1 - 4 (login method, sign in, choose profile, choose clusters) with a message line
+    # ---- tab 1: step 1 (AWS profiles + credentials status), step 2 (regions + collect), step 3 (clusters), with a message line at the bottom
     guide = ttk.Frame(tab_clusters, padding=(2, 0, 2, 0))
     guide.pack(fill="both", expand=True)
-    row12 = ttk.Frame(guide)
-    row12.pack(fill="x")
-    s1 = card(row12, f"{icon('gear')} Step 1 - Login method", side="left", fill="y")
-    method_combo = ttk.Combobox(s1, width=30, state="readonly", values=[LOGIN_LABELS["exe"], LOGIN_LABELS["cli"]])
-    method_combo.set(LOGIN_LABELS[LOGIN_OPTS["method"]])
-    method_combo.pack(anchor="w")
-    method_info = tk.StringVar(value="")
-    ttk.Label(s1, textvariable=method_info, wraplength=340, justify="left").pack(anchor="w", pady=(4, 0))
-    ro_note = ttk.Label(s1, text="Read-only guarantee: this tool only reads. It never installs, creates, changes or deletes anything on the cluster or in the cloud account.",
-                        wraplength=340, justify="left", foreground="#067647", font=(FAM, 9, "bold"))
-    ro_note.pack(anchor="w", pady=(6, 0))
-    s2 = card(row12, f"{icon('key')} Step 2 - Sign in", stripe=NAVY, side="left", fill="both", expand=True, padx=(8, 0))
-    s2a = ttk.Frame(s2)
-    s2a.pack(fill="x")
-    ttk.Label(s2a, text="Status:").pack(side="left")
-    auth_badge = tk.Label(s2a, text="Not checked", fg="white", bg=COLORS["dim"], padx=10, pady=2, font=("Segoe UI", 9, "bold"))
-    auth_badge.pack(side="left", padx=6)
-    signin_btn = ttk.Button(s2a, text=f"{icon('key')} Sign in", style="Accent.TButton")
-    signin_btn.pack(side="left", padx=(8, 4))
-    check_btn = ttk.Button(s2a, text=f"{icon('reload')} Re-check")
-    check_btn.pack(side="left")
-    device_var = tk.BooleanVar(value=LOGIN_OPTS["device_code"])
-    device_chk = ttk.Checkbutton(s2a, text="Use device code (default)", variable=device_var)
-    device_chk.pack(side="left", padx=(12, 0))
-    s2m = ttk.Frame(s2)
-    s2m.pack(fill="x", pady=(4, 0))
-    ttk.Label(s2m, text="Sign-in method:").pack(side="left")
-    SIGNIN_KEYS = {v: k for k, v in SIGNIN_METHOD_LABELS.items()}
-    signin_var = tk.StringVar(value=SIGNIN_METHOD_LABELS[_SESSION.get("signin") or LOGIN_OPTS.get("signin") or "manual"])
-    signin_combo = ttk.Combobox(s2m, textvariable=signin_var, width=44, state="readonly", values=list(SIGNIN_METHOD_LABELS.values()))
-    signin_combo.pack(side="left", padx=6)
-    cli_test_btn = ttk.Button(s2m, text="Test the aws CLI")
-    cli_test_btn.pack(side="left", padx=(6, 0))
-    # ---- account / profile: which account is active, switch to another one (or type a new profile name) and sign in to it
-    s2p = ttk.Frame(s2)
-    s2p.pack(fill="x", pady=(6, 0))
-    ttk.Label(s2p, text="Account / profile:").pack(side="left")
-    profile_var = tk.StringVar(value=ACCOUNT0 or _SESSION.get("profile") or "")
-    profile_combo = ttk.Combobox(s2p, textvariable=profile_var, width=34, values=[])
-    profile_combo.pack(side="left", padx=6)
-    use_btn = ttk.Button(s2p, text="Use this profile")
-    use_btn.pack(side="left")
-    switch_btn = ttk.Button(s2p, text="Sign in with a different account")
-    switch_btn.pack(side="left", padx=(6, 0))
-    dd_btn = ttk.Button(s2p, text="Accounts \u25be")
-    dd_btn.pack(side="left", padx=(6, 0))
-    acct_chip = tk.Label(s2p, text="", fg="white", bg=COLORS["dim"], padx=8, pady=2, font=("Segoe UI", 9, "bold"))
-    acct_chip.pack(side="left", padx=(8, 0))
-    # the dropdown: ALL accounts (every profile in ~/.aws) with a coloured status; type to filter, click one to switch to it
-    dd_frame = ttk.Frame(s2)
-    dd_top = ttk.Frame(dd_frame)
-    dd_top.pack(fill="x")
-    ttk.Label(dd_top, text="Accounts (type to filter):").pack(side="left")
-    dd_filter = tk.StringVar(value="")
-    dd_entry = ttk.Entry(dd_top, textvariable=dd_filter, width=26)
-    dd_entry.pack(side="left", padx=6)
-    dd_all_btn = ttk.Button(dd_top, text="Check all accounts")
-    dd_all_btn.pack(side="left")
-    dd_info = tk.StringVar(value="")
-    ttk.Label(dd_top, textvariable=dd_info, style="Desc.TLabel").pack(side="left", padx=8)
-    dd_wrap = ttk.Frame(dd_frame)
-    dd_wrap.pack(fill="x", pady=(4, 0))
-    dd_tree = ttk.Treeview(dd_wrap, columns=("status", "account", "hint"), show="headings", selectmode="browse", height=5)
-    dd_tree.heading("status", text="Status")
-    dd_tree.heading("account", text="Profile  /  AWS account")
-    dd_tree.heading("hint", text="Role / SSO start URL")
-    dd_tree.column("status", width=250)
-    dd_tree.column("account", width=260)
-    dd_tree.column("hint", width=330)
-    dd_scroll = ttk.Scrollbar(dd_wrap, orient="vertical", command=dd_tree.yview)
-    dd_tree.configure(yscrollcommand=dd_scroll.set)
-    dd_scroll.pack(side="right", fill="y")
-    dd_tree.pack(side="left", fill="x", expand=True)
-    for _tag, _col in (("st_active", COLORS["ok"]), ("st_expiring", "#B26A00"), ("st_expired", COLORS["err"]), ("st_none", "#6B7685"), ("st_unknown", "#6B7685")):
-        dd_tree.tag_configure(_tag, foreground=_col)
-    profile_hint_var = tk.StringVar(value="")
-    ttk.Label(s2, textvariable=profile_hint_var, style="Desc.TLabel", wraplength=820, justify="left").pack(fill="x")
-    active_var = tk.StringVar(value="")
-    ttk.Label(s2, textvariable=active_var, wraplength=820, justify="left", font=(FAM, 9, "bold")).pack(fill="x", pady=(2, 0))
-    auth_msg = tk.StringVar(value="")
-    ttk.Label(s2, textvariable=auth_msg, wraplength=820, justify="left").pack(fill="x", pady=(4, 0))
-    # ---- sign-in details (device-code URL and code, countdown, result); shown from the first sign-in attempt on and kept until the next one
-    dc_panel = ttk.LabelFrame(s2, text="Sign-in details", padding=8)
-    dc_r0 = ttk.Frame(dc_panel)
-    dc_r0.pack(fill="x")
-    dc_profile_var = tk.StringVar(value="")
-    ttk.Label(dc_r0, textvariable=dc_profile_var, font=(FAM, 10, "bold")).pack(side="left")
-    dc_chip = tk.Label(dc_r0, text="Starting", fg="white", bg=COLORS["dim"], padx=10, pady=2, font=("Segoe UI", 9, "bold"))
-    dc_chip.pack(side="left", padx=8)
-    dc_cancel_btn = ttk.Button(dc_r0, text="Cancel sign-in", style="Stop.TButton", state="disabled")
-    dc_cancel_btn.pack(side="right")
-    dc_r1 = ttk.Frame(dc_panel)
-    dc_r1.pack(fill="x", pady=(6, 0))
-    ttk.Label(dc_r1, text="URL:", width=6).pack(side="left")
-    dc_url_label = tk.Label(dc_r1, text="", fg="#0B5CAD", cursor="hand2", font=(FAM, 10, "underline"), anchor="w", justify="left", wraplength=560)
-    dc_url_label.pack(side="left", fill="x", expand=True)
-    dc_open_btn = ttk.Button(dc_r1, text="Open in browser", state="disabled")
-    dc_open_btn.pack(side="left", padx=(6, 0))
-    dc_copy_url_btn = ttk.Button(dc_r1, text="Copy URL", state="disabled")
-    dc_copy_url_btn.pack(side="left", padx=(4, 0))
-    dc_r2 = ttk.Frame(dc_panel)
-    dc_r2.pack(fill="x", pady=(4, 0))
-    ttk.Label(dc_r2, text="Code:", width=6).pack(side="left")
-    dc_code_label = tk.Label(dc_r2, text="", fg=NAVY, font=("Consolas", 26, "bold"), anchor="w")
-    dc_code_label.pack(side="left", padx=(0, 12))
-    dc_copy_code_btn = ttk.Button(dc_r2, text="Copy code", state="disabled")
-    dc_copy_code_btn.pack(side="left")
-    dc_count_var = tk.StringVar(value="")
-    ttk.Label(dc_panel, textvariable=dc_count_var, font=(FAM, 10)).pack(anchor="w", pady=(4, 0))
-    dc_result_var = tk.StringVar(value="")
-    dc_result_lbl = tk.Label(dc_panel, textvariable=dc_result_var, anchor="w", justify="left", wraplength=760, font=(FAM, 10, "bold"), fg=COLORS["info"], bg=BG)
-    dc_result_lbl.pack(fill="x", pady=(2, 0))
-    dc_raw_var = tk.StringVar(value="")                 # what aws printed (failure text, kept in step with the box below)
-    dc_note_var = tk.StringVar(value="")
-    ttk.Label(dc_panel, textvariable=dc_note_var, style="Desc.TLabel", wraplength=760, justify="left").pack(fill="x")
-    # no URL received: what to do next (shown after NO_URL_SECONDS, or when aws ended without a URL)
-    dc_nourl = ttk.Frame(dc_panel)
-    dc_nourl_var = tk.StringVar(value="")
-    tk.Label(dc_nourl, textvariable=dc_nourl_var, anchor="w", justify="left", wraplength=760, font=(FAM, 10, "bold"), fg=COLORS["warn"], bg=BG).pack(fill="x")
-    dc_nourl_btns = ttk.Frame(dc_nourl)
-    dc_nourl_btns.pack(fill="x", pady=(4, 0))
-    dc_retry_btn = ttk.Button(dc_nourl_btns, text="Retry with --no-browser")
-    dc_retry_btn.pack(side="left")
-    dc_console_btn = ttk.Button(dc_nourl_btns, text="Run sign-in in a console window instead")
-    dc_console_btn.pack(side="left", padx=(6, 0))
-    dc_copycmd_btn = ttk.Button(dc_nourl_btns, text="Copy command")
-    dc_copycmd_btn.pack(side="left", padx=(6, 0))
-    dc_recheck_btn = ttk.Button(dc_nourl_btns, text="Re-check")
-    dc_recheck_btn.pack(side="left", padx=(6, 0))
-    # the live raw output of aws (read-only, collapsible; expanded while signing in)
-    dc_rawbar = ttk.Frame(dc_panel)
-    dc_rawbar.pack(fill="x", pady=(6, 0))
-    dc_raw_toggle = ttk.Button(dc_rawbar, text="Raw output from aws  [hide]")
-    dc_raw_toggle.pack(side="left")
-    dc_raw_wrap = ttk.Frame(dc_panel)
-    dc_raw_wrap.pack(fill="x", pady=(2, 0))
-    dc_raw_text = tk.Text(dc_raw_wrap, height=7, wrap="word", font=("Consolas", 9), state="disabled", bg="#f6f8fa", relief="solid", bd=1)
-    dc_raw_sb = ttk.Scrollbar(dc_raw_wrap, orient="vertical", command=dc_raw_text.yview)
-    dc_raw_text.configure(yscrollcommand=dc_raw_sb.set)
-    dc_raw_sb.pack(side="right", fill="y")
-    dc_raw_text.pack(side="left", fill="x", expand=True)
-    # ---- manual sign-in (the DEFAULT): the exact commands for the selected profile, each with a Copy button
-    man_panel = ttk.LabelFrame(s2, text="Sign in - run a command yourself", padding=8)
-    man = state["man"] = {"shown": False, "active": False, "login": None, "check": None, "acct": None, "t0": None, "baseline": None, "after": None, "probing": False}
-    man_form = tk.StringVar(value="device")
-    man_instr_var = tk.StringVar(value=MANUAL_INSTRUCTIONS)
-    ttk.Label(man_panel, text=MANUAL_INTRO, wraplength=820, justify="left", font=(FAM, 10, "bold")).pack(fill="x")
-    man_cli_var = tk.StringVar(value="")
-    man_cli_lbl = tk.Label(man_panel, textvariable=man_cli_var, anchor="w", justify="left", wraplength=820, font=(FAM, 10), fg=COLORS["ok"], bg=BG)
-    man_cli_lbl.pack(fill="x", pady=(2, 0))
-    man_inst = ttk.Frame(man_panel)            # install guidance: TEXT with Copy buttons only (shown when aws is not found); nothing is installed or run by this tool
-    man_inst_vars = {"url": tk.StringVar(value=AWS_INSTALL_URL), "winget": tk.StringVar(value=AWS_INSTALL_WINGET)}
-    man_inst_copy = {}
-    for _k, _lab in (("url", "Official install page:"), ("winget", "Windows (winget):")):
-        _r = ttk.Frame(man_inst)
-        _r.pack(fill="x", pady=(2, 0))
-        ttk.Label(_r, text=_lab, width=22).pack(side="left")
-        ttk.Entry(_r, textvariable=man_inst_vars[_k], state="readonly", font=("Consolas", 10)).pack(side="left", fill="x", expand=True)
-        man_inst_copy[_k] = ttk.Button(_r, text="Copy")
-        man_inst_copy[_k].pack(side="left", padx=(6, 0))
-    ttk.Label(man_panel, textvariable=man_instr_var, wraplength=820, justify="left", font=(FAM, 10)).pack(fill="x", pady=(4, 0))
-    man_msg_var = tk.StringVar(value="")
-    tk.Label(man_panel, textvariable=man_msg_var, anchor="w", justify="left", wraplength=820, font=(FAM, 10, "bold"), fg=COLORS["warn"], bg=BG).pack(fill="x", pady=(2, 0))
-    man_cmd_vars, man_copy_btns, man_entries = {}, {}, {}
-    for _it in signin_commands(None):
-        _row = ttk.Frame(man_panel)
-        _row.pack(fill="x", pady=(4, 0))
-        _top = ttk.Frame(_row)
-        _top.pack(fill="x")
-        if _it["key"] in _TERMINAL_FORMS:
-            ttk.Radiobutton(_top, text=f"{_it['n']}.", variable=man_form, value=_it["key"], width=4).pack(side="left")
-        else:
-            ttk.Label(_top, text=f"{_it['n']}.", width=5).pack(side="left", padx=(18, 0))
-        ttk.Label(_top, text=_it["note"], style="Desc.TLabel", wraplength=760, justify="left").pack(side="left", fill="x", expand=True)
-        _line = ttk.Frame(_row)
-        _line.pack(fill="x", padx=(40, 0))
-        man_cmd_vars[_it["key"]] = tk.StringVar(value=_it["cmd"])
-        man_entries[_it["key"]] = ttk.Entry(_line, textvariable=man_cmd_vars[_it["key"]], state="readonly",
-                                            font=("Consolas", 12, "bold") if _it["key"] == "device" else ("Consolas", 10))
-        man_entries[_it["key"]].pack(side="left", fill="x", expand=True)
-        man_copy_btns[_it["key"]] = ttk.Button(_line, text="Copy")
-        man_copy_btns[_it["key"]].pack(side="left", padx=(6, 0))
-    ttk.Label(man_panel, text="The round button in front of 1-3 chooses which command 'Open a terminal for me' runs. Commands 4a / 4b are only shown here as text: "
-                              "this tool never runs them and never asks for keys or secrets.", style="Desc.TLabel", wraplength=820, justify="left").pack(fill="x", pady=(4, 0))
-    man_act = ttk.Frame(man_panel)
-    man_act.pack(fill="x", pady=(6, 0))
-    man_chip = tk.Label(man_act, text="Waiting for you", fg="white", bg=COLORS["dim"], padx=10, pady=2, font=("Segoe UI", 9, "bold"))
-    man_chip.pack(side="left")
-    man_status_var = tk.StringVar(value="")
-    ttk.Label(man_act, textvariable=man_status_var, font=(FAM, 10)).pack(side="left", padx=8)
-    man_stop_btn = ttk.Button(man_act, text="Stop waiting", state="disabled")
-    man_stop_btn.pack(side="right")
-    man_verify_btn = ttk.Button(man_act, text="I have signed in - Verify", style="Accent.TButton")
-    man_verify_btn.pack(side="right", padx=(0, 6))
-    man_term_btn = ttk.Button(man_act, text="Open a terminal for me")
-    man_term_btn.pack(side="right", padx=(0, 6))
-    man_result_var = tk.StringVar(value="")
-    man_result_lbl = tk.Label(man_panel, textvariable=man_result_var, anchor="w", justify="left", wraplength=820, font=(FAM, 10, "bold"), fg=COLORS["info"], bg=BG)
-    man_result_lbl.pack(fill="x", pady=(4, 0))
-    dc = state["dc"] = {"active": False, "shown": False, "url": None, "complete_url": None, "code": None, "t0": None, "details_t0": None,
-                        "ttl": DEVICE_CODE_TTL, "profile": None, "after": None, "raw": [], "outcome": "", "cancel": None, "cmd": None, "raw_open": True}
-    state.update(acct_status={}, dd_open=False, status_checking=False, status_cancel=None)
-    LOGIN_OPTS["gui"] = True        # no console of our own: interactive logins get a window
-
     guide_msg = tk.Label(guide, text="", anchor="w", justify="left", font=("Segoe UI", 10, "bold"), padx=8, pady=4,
                          bg="#eef3f8", fg=COLORS["info"])
-    guide_msg.pack(fill="x", pady=(6, 0))
+    guide_msg.pack(side="bottom", fill="x", pady=(6, 0))
     guide_msg.bind("<Configure>", lambda e: guide_msg.configure(wraplength=max(300, e.width - 20)))
+    cols = ttk.Frame(guide)
+    cols.pack(fill="both", expand=True)
+    col_l = ttk.Frame(cols)
+    col_l.pack(side="left", fill="both", expand=True)
+    col_r = ttk.Frame(cols)
+    col_r.pack(side="left", fill="both", expand=True, padx=(8, 0))
 
     def say(text, kind="info"):
-        """The message line under steps 1-2: what happened and what to do next."""
+        """The message line at the bottom of tab 1: what happened and what to do next."""
         guide_msg.configure(text=text, fg=COLORS.get(kind, COLORS["info"]))
         state["said"] = (state["said"] + [text])[-60:]       # the last messages (the line above shows only the newest)
-
-    def set_badge(text, kind):
-        auth_badge.configure(text=text, bg=COLORS.get(kind, COLORS["dim"]))
-
-    # ---- profiles: selector values with an identity hint, switching accounts
-    PSEP = "   ["
-
-    def profile_name_of(text):
-        return (text or "").split(PSEP)[0].strip()
-
-    def refresh_profile_choices():
-        try:
-            profs = list_aws_profiles()
-        except Exception:
-            profs = {}
-        state["profiles_info"] = profs
-        refresh_dd()
-        show_profile_hint()
-
-    STATE_KIND = {"active": "ok", "expiring": "warn", "expired": "err", "not_signed_in": "dim", "unknown": "dim", "unchecked": "dim"}
-    STATE_TAG = {"active": "st_active", "expiring": "st_expiring", "expired": "st_expired", "not_signed_in": "st_none", "unknown": "st_unknown", "unchecked": "st_none"}
-    STATE_DOT = {"active": "\u25cf", "expiring": "\u25cf", "expired": "\u25cf", "not_signed_in": "\u25cb", "unknown": "\u25cb", "unchecked": "\u25cb"}
-
-    def acct_status_of(name):
-        st = state["acct_status"].get(name)
-        if st is None:
-            try:
-                st = local_status(name, state.get("profiles_info") or {})
-            except Exception:
-                st = {"profile": name, "state": "unchecked", "detail": "", "left": None, "expires_at": None}
-        return st
-
-    def refresh_dd():
-        """Rebuild the account dropdown (rows: coloured status, profile + AWS account, role / SSO start URL) and the selected account's chip."""
-        profs = state.get("profiles_info") or {}
-        ts = terms(dd_filter)
-        dd_tree.delete(*dd_tree.get_children())
-        shown = 0
-        for n, info in sorted(profs.items(), key=lambda kv: kv[0].lower()):
-            st = acct_status_of(n)
-            hint = profile_hint(info)
-            hay = f"{n} {info.get('account') or ''} {hint} {status_text(st)}".lower()
-            if not hit(hay, ts):
-                continue
-            shown += 1
-            dd_tree.insert("", "end", iid=n, tags=(STATE_TAG.get(st["state"], "st_unknown"),),
-                           values=(f"{STATE_DOT.get(st['state'], '')} {status_text(st)}", f"{n}   ({info.get('account') or 'account ?'})", hint))
-        dd_info.set(f"{shown} of {len(profs)} account(s)" if profs else "No profiles in ~/.aws yet - run 'aws configure sso' in a terminal, then 'Reload profiles'.")
-        names = [n for n in sorted(profs, key=str.lower)]
-        profile_combo.configure(values=[f"{n}{PSEP}{profile_hint(profs[n])}]  -  {status_text(acct_status_of(n))}" for n in names])
-        state["dd_values"] = list(profile_combo.cget("values"))
-        update_acct_chip()
-
-    def update_acct_chip():
-        n = profile_name_of(profile_var.get()) or signin_account()
-        if not n:
-            acct_chip.configure(text="", bg=BG)
-            return
-        st = acct_status_of(n)
-        acct_chip.configure(text=status_text(st), bg=COLORS.get(STATE_KIND.get(st["state"], "dim"), COLORS["dim"]))
-
-    def set_acct_status(name, st):
-        state["acct_status"][name] = st
-        refresh_dd()
-        if st["state"] == "expired" and name == signin_account() and state["auth"]["state"] == "ok" and not state["signing"]:
-            mark_expired(name, st)
-
-    def start_status_checks(names):
-        """Check the sign-in of these profiles in the background (4 aws calls at a time, nothing is changed)."""
-        names = [n for n in names if n]
-        if not names or not shutil.which("aws"):
-            return
-        cancel = state["status_cancel"] = threading.Event()
-        state["status_checking"] = True
-        dd_info.set(f"checking {len(names)} account(s) ...")
-
-        def work():
-            try:
-                check_accounts(names, lambda n, st: msgs.put(("acct_status", n, st)), cancel)
-            finally:
-                msgs.put(("acct_status_done",))
-        threading.Thread(target=work, daemon=True).start()
-
-    def check_all_accounts(_event=None):
-        profs = state.get("profiles_info") or {}
-        active = signin_account()
-        names = ([active] if active in profs else []) + [n for n in sorted(profs, key=str.lower) if n != active]
-        start_status_checks(names)
-
-    def auto_check_accounts():
-        """After the profiles are read: the selected account first; with up to LAZY_STATUS_LIMIT profiles all of them in the background, otherwise
-        only the selected one (the others show what the local SSO cache says, and 'Check all accounts' checks them)."""
-        profs = state.get("profiles_info") or {}
-        if not is_cli() or not profs:
-            return
-        active = signin_account()
-        if len(profs) <= LAZY_STATUS_LIMIT:
-            check_all_accounts()
-        elif active in profs:
-            start_status_checks([active])
-
-    def mark_expired(profile, st=None, source="use"):
-        """Credentials of `profile` expired (found while listing / running, or by a check): show it everywhere and offer 'Sign in again'."""
-        st = dict(st or {})
-        if st.get("state") != "expired":
-            try:
-                st = {**classify_status(profile, "ExpiredToken: the credentials have expired", state.get("profiles_info") or {}), **{k: v for k, v in st.items() if k == "expires_at" and v}}
-            except Exception:
-                st = {"profile": profile, "state": "expired", "detail": "", "left": None, "expires_at": None}
-        state["acct_status"][profile] = st
-        msg = expired_message(profile, st)
-        if profile == signin_account():
-            state["auth"] = {"state": "not_signed_in", "who": None, "detail": msg, "hint": msg, "expired": True, "expires_at": st.get("expires_at"), "profile": profile}
-            set_badge("Credentials expired", "err")
-            auth_msg.set(msg)
-            say(msg, "err")
-        else:
-            say(f"Credentials for {profile} expired - choose it in the Accounts list and press 'Sign in again'. The other accounts are not affected.", "warn")
-        refresh_dd()
-        update_controls()
-
-    def toggle_dd(_event=None):
-        state["dd_open"] = not state["dd_open"]
-        if state["dd_open"]:
-            dd_frame.pack(fill="x", pady=(4, 0), after=s2p)
-            refresh_dd()
-        else:
-            dd_frame.pack_forget()
-
-    def dd_pick(name=None):
-        name = name or (dd_tree.selection() or [None])[0]
-        if name:
-            switch_profile(name)
-
-    def filter_combo(event):
-        if event.keysym in ("Return", "Up", "Down", "Escape", "Tab", "Left", "Right", "Shift_L", "Shift_R", "Control_L", "Control_R"):
-            return
-        typed = profile_var.get().strip().lower()
-        allv = state.get("dd_values") or []
-        profile_combo.configure(values=[v for v in allv if typed in v.lower()] or allv)
-
-    def show_profile_hint(*_args):
-        update_acct_chip()
-        n = profile_name_of(profile_var.get())
-        info = state.get("profiles_info", {}).get(n)
-        profile_hint_var.set(("Identity hint: " + profile_hint(info)) if info else
-                             (f"'{n}' is not in ~/.aws/config yet - create it once in a terminal with 'aws configure sso'; nothing is created or edited here." if n else
-                              "Pick a profile (or type a new profile name) and press 'Sign in with a different account'. Empty = automatic (the profile chosen in step 3, "
-                              "AWS_PROFILE or [default])."))
-
-    def update_active_label():
-        a = state["auth"]
-        prof = signin_account() or a.get("profile") or "(automatic)"
-        if a["state"] == "ok":
-            active_var.set(f"Active profile: {prof}      Signed in as: {a.get('arn') or a.get('who') or '?'}"
-                           + (f"   (account {a['account']})" if a.get("account") else ""))
-        else:
-            active_var.set(f"Active profile: {prof}      Not signed in" if a["state"] != "unchecked" else f"Active profile: {prof}      Sign-in not checked yet")
-
-    def dc_chip_set(text, kind):
-        dc_chip.configure(text=text, bg=COLORS.get(kind, COLORS["dim"]))
-
-    def dc_show():
-        if not dc["shown"]:
-            dc["shown"] = True
-            dc_panel.pack(fill="x", pady=(6, 0), after=(man_panel if man["shown"] else s2m))          # right under the buttons, so it is never pushed off screen
-
-    def dc_begin(profile):
-        """A sign-in attempt starts: reset the details panel (it stays visible until the next attempt)."""
-        if dc.get("after"):
-            try:
-                root.after_cancel(dc["after"])
-            except Exception:
-                pass
-        dc.update(active=True, url=None, complete_url=None, code=None, t0=time.time(), details_t0=None, ttl=DEVICE_CODE_TTL, profile=profile, raw=[], outcome="", after=None, cmd=None)
-        if man["active"]:
-            man_stop("")
-        dc_show()
-        dc_nourl_hide()
-        dc_note_var.set("")
-        dc_raw_clear()
-        dc_raw_set_open(True)
-        if state["dd_open"]:
-            toggle_dd()                                              # make room: the account list closes while the code is shown
-        dc_profile_var.set(f"Signing in: profile {profile or '(automatic)'}")
-        dc_url_label.configure(text="(waiting for aws to print the sign-in URL ...)")
-        dc_code_label.configure(text="")
-        dc_result_var.set("")
-        dc_raw_var.set("")
-        dc_result_lbl.configure(fg=COLORS["info"])
-        for b in (dc_open_btn, dc_copy_url_btn, dc_copy_code_btn):
-            b.state(["disabled"])
-        dc_chip_set("Starting", "info")
-        dc_cancel_btn.state(["!disabled"])
-        dc_tick()
-
-    def dc_raw_append(text):
-        try:
-            dc_raw_text.configure(state="normal")
-            dc_raw_text.insert("end", text)
-            dc_raw_text.see("end")
-            dc_raw_text.configure(state="disabled")
-        except Exception:
-            pass
-
-    def dc_raw_clear():
-        dc_raw_text.configure(state="normal")
-        dc_raw_text.delete("1.0", "end")
-        dc_raw_text.configure(state="disabled")
-
-    def dc_raw_set_open(flag):
-        dc["raw_open"] = bool(flag)
-        if flag:
-            dc_raw_wrap.pack(fill="x", pady=(2, 0))
-        else:
-            dc_raw_wrap.pack_forget()
-        dc_raw_toggle.configure(text="Raw output from aws  [" + ("hide" if flag else "show") + "]")
-
-    def dc_nourl_show(message):
-        dc_nourl_var.set(message)
-        dc_nourl.pack(fill="x", pady=(4, 0), before=dc_rawbar)
-
-    def dc_nourl_hide():
-        dc_nourl.pack_forget()
-        dc_nourl_var.set("")
-
-    def dc_event(kind, data):
-        """Events of run_sso_login: the command line, the aws version, fallbacks, 'no URL yet'."""
-        if kind == "command":
-            dc["cmd"] = data
-            dc_raw_append("$ " + data + "\n")
-        elif kind == "version":
-            sup = data.get("device_code")
-            dc_raw_append(f"# aws --version: {data.get('text')}   --use-device-code supported: " + ("yes" if sup else ("no" if sup is False else "unknown")) + "\n")
-        elif kind == "fallback":
-            dc_raw_append("# --use-device-code is not available in this AWS CLI: using --no-browser (the device-code flow of that version)\n")
-            dc_note_var.set("Using --no-browser: in this AWS CLI version it is the device-code flow (URL and code).")
-        elif kind == "no_url":
-            dc_nourl_show("No URL received from aws yet - this can happen when aws buffers output. Use one of the buttons below, or run the commands shown above in your own terminal.")
-            man_open(reason="Automatic sign-in did not show a URL. Run one of these commands in your terminal, then press Verify.")
-        elif kind == "url_late":
-            dc_nourl_hide()
-
-    def dc_details(d):
-        dc["url"], dc["complete_url"], dc["code"] = d.get("url"), d.get("complete_url"), d.get("code")
-        dc_nourl_hide()
-        if is_browser_flow(d):
-            dc_note_var.set("This is the browser sign-in: open the URL in a browser on THIS computer (it finishes through a localhost address on this machine; "
-                            "it does not work from another computer).")
-        if dc["details_t0"] is None:
-            dc["details_t0"] = time.time()
-        dc_url_label.configure(text=dc["url"] or "")
-        dc_code_label.configure(text=dc["code"] or "")
-        for b, ok in ((dc_open_btn, dc["url"]), (dc_copy_url_btn, dc["url"]), (dc_copy_code_btn, dc["code"])):
-            b.state(["!disabled"] if ok else ["disabled"])
-        dc_chip_set("Waiting for you", "info")
-        dc_refresh_raw()
-        dc_tick(reschedule=False)
-
-    def dc_refresh_raw():
-        if dc["raw"] and (not dc["url"] or (dc["outcome"] and dc["outcome"] != "ok")):
-            dc_raw_var.set("What aws printed:\n" + "\n".join(dc["raw"][-8:]))
-        else:
-            dc_raw_var.set("")
-
-    def dc_tick(reschedule=True):
-        if not dc["active"]:
-            return
-        if dc["details_t0"] is None:
-            dc_count_var.set("Starting the sign-in ... (waiting for aws to print the URL and the code)")
-        else:
-            left = int(dc["ttl"] - (time.time() - dc["details_t0"]))
-            if left > 0:
-                dc_count_var.set(f"waiting for you to sign in... {left // 60:02d}:{left % 60:02d}  (the code expires in about {max(1, dc['ttl'] // 60)} minutes)")
-            else:
-                dc_count_var.set("This code has expired - press 'Cancel sign-in', then 'Sign in' to get a new one.")
-                dc_chip_set("Expired", "err")
-        if reschedule:
-            dc["after"] = root.after(1000, dc_tick)
-
-    def dc_end(result, ok, post):
-        dc["active"] = False
-        if dc.get("after"):
-            try:
-                root.after_cancel(dc["after"])
-            except Exception:
-                pass
-            dc["after"] = None
-        dc_cancel_btn.state(["disabled"])
-        d = result.get("details") or {}
-        if d.get("url") and not dc["url"]:
-            dc_details(d)
-        if ok:
-            dc["outcome"] = "ok"
-            who = (post or {}).get("arn") or (post or {}).get("who") or "?"
-            dc_chip_set("Signed in", "ok")
-            dc_count_var.set("Sign-in complete.")
-            dc_result_var.set(f"Signed in as {who}" + (f"   (account {post['account']})" if post and post.get("account") else ""))
-            dc_result_lbl.configure(fg=COLORS["ok"])
-        else:
-            dc["outcome"] = "cancelled" if result.get("cancelled") else ("expired" if result.get("expired") else "failed")
-            dc_chip_set({"cancelled": "Cancelled", "expired": "Expired"}.get(dc["outcome"], "Failed"), "warn" if dc["outcome"] == "cancelled" else "err")
-            dc_count_var.set("")
-            dc_result_var.set(result.get("error") or "The sign-in did not complete.")
-            dc_result_lbl.configure(fg=COLORS["warn"] if dc["outcome"] == "cancelled" else COLORS["err"])
-        dc_refresh_raw()
-        if ok:
-            dc_nourl_hide()
-            dc_raw_set_open(False)
-        elif dc["outcome"] == "failed":
-            if not dc["url"]:
-                dc_nourl_show("No URL received from aws. Retry with --no-browser, run the sign-in in a console window, or copy the command and run it in your own terminal, then press Re-check.")
-            man_open(reason=("Automatic sign-in did not show a URL. Run one of these commands in your terminal, then press Verify." if not dc["url"] else
-                             "The automatic sign-in did not complete. Run one of these commands in your terminal, then press Verify."))
-
-    def dc_cancel():
-        ev = dc.get("cancel")
-        if ev is not None and dc["active"]:
-            ev.set()
-            dc_chip_set("Cancelling", "warn")
-            dc_cancel_btn.state(["disabled"])
-
-    def dc_copy(what):
-        val = dc["url"] if what == "url" else dc["code"]
-        if not val:
-            return
-        root.clipboard_clear()
-        root.clipboard_append(val)
-        dc_count_var.set(("URL" if what == "url" else "Code") + " copied to the clipboard." if not dc["active"] else dc_count_var.get())
-        status.set(("URL" if what == "url" else "Code") + " copied to the clipboard.")
-
-    def dc_open():
-        target = dc["complete_url"] or dc["url"]
-        if target:
-            webbrowser.open(target)
-
-    def run_after_signin(fn):
-        """Run fn now, or - when a captured sign-in is still running - cancel it and run fn as soon as it has ended."""
-        if state["signing"] and dc.get("cancel") is not None:
-            state["pending"] = fn
-            dc["cancel"].set()
-            dc_chip_set("Cancelling", "warn")
-        else:
-            fn()
-
-    def run_pending():
-        fn = state.pop("pending", None)
-        if fn:
-            root.after(150, fn)
-
-    def dc_retry_nobrowser():
-        run_after_signin(lambda: sign_in(force=True, method="captured", flag="--no-browser"))
-
-    def dc_console():
-        run_after_signin(lambda: sign_in(force=True, method="console"))
-
-    def dc_copy_command():
-        cmd = ((man["login"] and f"aws sso login --profile {man['login']} --use-device-code")
-               or (dc.get("profile") and f"aws sso login --profile {dc['profile']} --use-device-code") or "aws sso login --use-device-code")
-        root.clipboard_clear()
-        root.clipboard_append(cmd)
-        status.set("Command copied: " + cmd)
-        dc_nourl_var.set(dc_nourl_var.get() + "   (copied: " + cmd + ")" if "(copied:" not in dc_nourl_var.get() else dc_nourl_var.get())
-
-    def dc_recheck():
-        run_after_signin(man_verify)
-
-    def cli_test():
-        cli_test_btn.state(["disabled"])
-        dc_show()
-        dc_raw_append("# Testing the aws CLI ...\n")
-
-        def work():
-            try:
-                lines = aws_cli_selftest()
-            except Exception as exc:
-                lines = [f"test failed: {exc}"]
-            msgs.put(("dc", "selftest", lines))
-        threading.Thread(target=work, daemon=True).start()
-
-    # ---- manual sign-in: show the commands, wait for the user, verify with sts get-caller-identity
-    def man_show():
-        if not man["shown"]:
-            man["shown"] = True
-            man_panel.pack(fill="x", pady=(6, 0), after=s2m)
-
-    def man_cli_check():
-        """The 'AWS CLI installed?' line: PATH lookup now, `aws --version` in the background."""
-        text, found = aws_cli_line()
-        man_cli_var.set(text)
-        man_cli_lbl.configure(fg=COLORS["ok"] if found else COLORS["err"])
-        if found:
-            man_inst.pack_forget()
-
-            def work():
-                try:
-                    info = aws_version()
-                except Exception:
-                    info = None
-                msgs.put(("dc", "cliinfo", info["text"] if info else None))
-            threading.Thread(target=work, daemon=True).start()
-        else:
-            man_inst.pack(fill="x", pady=(2, 0), after=man_cli_lbl)
-
-    def man_chip_set(text, kind):
-        man_chip.configure(text=text, bg=COLORS.get(kind, COLORS["dim"]))
-
-    def man_refresh():
-        """Put the real profile name into the commands. Returns (why the profile cannot sign in or '', has SSO)."""
-        acct = signin_account()
-        try:
-            login_name, why = _aws_login_plan(acct)
-        except Exception as exc:
-            login_name, why = None, str(exc)
-        try:
-            check = acct or _aws_check_profile(None)
-        except Exception:
-            check = acct
-        login = login_name or acct or check
-        check = check or login
-        man.update(acct=acct, login=login, check=check)
-        for item in signin_commands(login, check):
-            man_cmd_vars[item["key"]].set(item["cmd"])
-        return why, bool(login_name)
-
-    def man_open(reason=None, force=False):
-        """Show the manual sign-in panel for the selected profile and start waiting (checks every MANUAL_POLL_SECONDS whether the sign-in happened)."""
-        if state["auth"]["state"] == "ok" and not force and not reason:
-            say(f"Already signed in as {state['auth'].get('who') or '?'}. Use 'Sign in with a different account' to sign in with another profile.", "ok")
-            return
-        why, sso_ok = man_refresh()
-        man_show()
-        man_cli_check()
-        if state["dd_open"]:
-            toggle_dd()
-        msg = reason or ""
-        if not msg and not sso_ok and why:
-            msg = why + " Use command 4a / 4b first."
-        man_msg_var.set(msg)
-        man_form.set("device" if device_var.get() else "browser")
-        man_result_var.set("")
-        man_result_lbl.configure(fg=COLORS["info"])
-        if man.get("after"):
-            try:
-                root.after_cancel(man["after"])
-            except Exception:
-                pass
-        man.update(active=True, t0=time.time(), baseline=sso_expiry_of(man["check"]), probing=False)
-        man_stop_btn.state(["!disabled"])
-        man_chip_set("Waiting for you", "info")
-        man_status_var.set("Waiting for you to sign in...")
-        man["after"] = root.after(int(MANUAL_POLL_SECONDS * 1000), man_tick)
-        say("Run one of the numbered commands in step 2 in your terminal (open the URL it prints, enter the code), then press 'I have signed in - Verify'. "
-            "This window also notices the sign-in by itself.", "info")
-
-    def man_tick():
-        man["after"] = None
-        if not man["active"]:
-            return
-        if time.time() - man["t0"] > MANUAL_POLL_CAP:
-            man_stop(f"Stopped waiting after {MANUAL_POLL_CAP // 60} minutes. Press 'I have signed in - Verify' when you have signed in.")
-            return
-        if not man["probing"] and not (state["busy"] or state["checking"] or state["signing"] or state["listing"]):
-            exp = sso_expiry_of(man["check"])
-            if exp is None or (exp > datetime.now(timezone.utc) and exp != man["baseline"]):       # a new token appeared (or it cannot be told): ask sts
-                man["probing"] = True
-                acct = man["acct"]
-
-                def work():
-                    try:
-                        res = login_status(acct)
-                    except Exception as exc:
-                        res = {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": ""}
-                    msgs.put(("auth", res, "manual_auto"))
-                threading.Thread(target=work, daemon=True).start()
-        man["after"] = root.after(int(MANUAL_POLL_SECONDS * 1000), man_tick)
-
-    def man_stop(message=None):
-        man["active"] = False
-        if man.get("after"):
-            try:
-                root.after_cancel(man["after"])
-            except Exception:
-                pass
-            man["after"] = None
-        man_stop_btn.state(["disabled"])
-        if message != "":
-            man_chip_set("Stopped", "dim")
-            man_status_var.set(message or "Stopped waiting. Press 'I have signed in - Verify' when you have signed in.")
-
-    def man_verify():
-        if state["checking"] or state["signing"] or state["busy"] or state["listing"]:
-            man_result_var.set("Please wait for the current action to finish, then press Verify again.")
-            return
-        man_result_var.set("Verifying with: aws sts get-caller-identity" + (f" --profile {man['check']}" if man.get("check") else "") + " ...")
-        man_result_lbl.configure(fg=COLORS["info"])
-        man_chip_set("Verifying", "info")
-        check_status(source="manual_verify")
-
-    def man_signed_in(res):
-        man_stop("")
-        man_chip_set("Signed in", "ok")
-        man_status_var.set("Signed in.")
-        man_msg_var.set("")
-        man_result_var.set(f"Signed in as {res.get('arn') or res.get('who') or '?'}" + (f"   (account {res['account']})" if res.get("account") else ""))
-        man_result_lbl.configure(fg=COLORS["ok"])
-
-    def man_failed(text):
-        man_chip_set("Not signed in" if not man["active"] else "Waiting for you", "err" if not man["active"] else "info")
-        man_result_var.set(text)
-        man_result_lbl.configure(fg=COLORS["err"])
-
-    def man_copy(key):
-        cmd = man_cmd_vars[key].get()
-        root.clipboard_clear()
-        root.clipboard_append(cmd)
-        status.set("Copied: " + cmd)
-
-    def man_terminal():
-        profile = man.get("login")
-        ok, info = open_terminal_signin(profile, man_form.get())
-        if ok:
-            man_result_var.set(f"A PowerShell window opened and runs: {info}   Complete the sign-in there, then press 'I have signed in - Verify'.")
-            man_result_lbl.configure(fg=COLORS["info"])
-        else:
-            man_result_var.set("Could not open a terminal: " + info)
-            man_result_lbl.configure(fg=COLORS["err"])
-
-    def handle_dc(msg):
-        kind = msg[1]
-        if kind == "rawtext":
-            dc_raw_append(msg[2])
-        elif kind == "event":
-            dc_event(msg[2], msg[3])
-        elif kind == "cliinfo":
-            if msg[2]:
-                man_cli_var.set("AWS CLI installed: " + msg[2])
-        elif kind == "selftest":
-            cli_test_btn.state(["!disabled"])
-            for ln in msg[2]:
-                dc_raw_append("# " + ln + "\n")
-            say("aws CLI test: " + "  |  ".join(msg[2]), "info")
-        elif kind == "start":
-            dc_begin(msg[2])
-        elif kind == "details":
-            dc_details(msg[2])
-        elif kind == "raw":
-            dc["raw"] = (dc["raw"] + [msg[2]])[-40:]
-            dc_refresh_raw()
-        elif kind == "end":
-            dc_end(msg[2], msg[3], msg[4])
 
     def search_box(parent, var, width=30):
         box = ttk.Frame(parent)
@@ -9531,70 +8087,93 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
         clear.pack(side="left")
         return box, entry, clear
 
-    row34 = ttk.Frame(guide)
-    row34.pack(fill="x", pady=(6, 0))
-    # ---- step 3: the profiles (searchable list)
-    s3 = card(row34, f"{icon('cloud')} Step 3 - Choose profile", side="left", fill="both", expand=True)
+    # ---- step 1: the AWS profiles of ~/.aws with a credentials status chip (the parts below the list are packed first, from the bottom, so they are never clipped)
+    s3 = card(col_l, f"{icon('key')} Step 1 - Choose AWS profile(s)", fill="both", expand=True)
+    uses_note = ttk.Label(s3, text="Uses your existing AWS credentials from ~/.aws - no sign-in in this tool.",
+                          wraplength=520, justify="left", foreground="#067647", font=(FAM, 9, "bold"))
+    uses_note.pack(side="top", anchor="w", pady=(0, 4))
     acct_filter = tk.StringVar(value="")
     box3, acct_search, acct_search_x = search_box(s3, acct_filter)
-    box3.pack(fill="x")
+    box3.pack(side="top", fill="x")
     acct_count = tk.StringVar(value="")
     acct_sel = tk.StringVar(value="0 selected")
     _cnt_row = ttk.Frame(s3)
-    _cnt_row.pack(fill="x")
+    _cnt_row.pack(side="top", fill="x")
     ttk.Label(_cnt_row, textvariable=acct_count).pack(side="left")
     ttk.Label(_cnt_row, textvariable=acct_sel, font=(FAM, 9, "bold")).pack(side="left", padx=(12, 0))
-    scope_var = tk.StringVar(value="all")                   # which collected clusters are SHOWN (all / only the selected profiles); collecting always needs a selection
-    scope_row = ttk.Frame(s3)
-    scope_all_rb = ttk.Radiobutton(scope_row, text="", value="all", variable=scope_var)
-    scope_all_rb.pack(side="left")
-    scope_sel_rb = ttk.Radiobutton(scope_row, text="", value="sel", variable=scope_var)
-    scope_sel_rb.pack(side="left", padx=(12, 0))
+    ro_note = ttk.Label(s3, text="Read-only: nothing is installed, created, changed or deleted on the cluster or in the cloud account. Local writes: reports "
+                                 "and the kubeconfig entry / context only.",
+                        wraplength=520, justify="left", foreground="#067647", font=(FAM, 9, "bold"))
+    ro_note.pack(side="bottom", anchor="w", pady=(4, 0))
+    # how to connect to a cluster: the existing credentials (default) or ekslogin first
+    conn = ttk.Frame(s3)
+    conn.pack(side="bottom", fill="x", pady=(6, 0))
+    ttk.Label(conn, text="How to connect to a cluster:", font=(FAM, 10, "bold")).pack(anchor="w")
+    method_combo = ttk.Combobox(conn, width=58, state="readonly", values=[LOGIN_LABELS["cli"], LOGIN_LABELS["exe"]])
+    method_combo.set(LOGIN_LABELS[LOGIN_OPTS["method"]])
+    method_combo.pack(anchor="w", pady=(2, 0))
+    method_info = tk.StringVar(value="")
+    ttk.Label(conn, textvariable=method_info, wraplength=520, justify="left", style="Desc.TLabel").pack(anchor="w", pady=(2, 0))
+    # the red message for a selected profile whose credentials are expired or missing: text only (the tool never signs in, never runs the command)
+    renew_box = tk.Frame(s3, bg="#FDE7E7", highlightbackground="#B42318", highlightthickness=1)
+    renew_var = tk.StringVar(value="")
+    renew_lbl = tk.Label(renew_box, textvariable=renew_var, anchor="w", justify="left", wraplength=380, font=(FAM, 9, "bold"), fg="#B42318", bg="#FDE7E7", padx=8, pady=4)
+    renew_copy_btn = ttk.Button(renew_box, text="Copy example command")
+    renew_copy_btn.pack(side="right", padx=8, pady=4)
+    renew_lbl.pack(side="left", fill="x", expand=True)
+    acct_status = tk.StringVar(value="")
+    acct_status_lbl = ttk.Label(s3, textvariable=acct_status, wraplength=520, justify="left", style="Desc.TLabel")
+    acct_status_lbl.pack(side="bottom", anchor="w", pady=(4, 0))
+    a_btns = ttk.Frame(s3)
+    a_btns.pack(side="bottom", fill="x", pady=(4, 0))
+    acct_all_btn = ttk.Button(a_btns, text="Select all (shown)")
+    acct_all_btn.pack(side="left")
+    acct_clear_btn = ttk.Button(a_btns, text="Clear")
+    acct_clear_btn.pack(side="left", padx=4)
+    check_btn = ttk.Button(a_btns, text=f"{icon('reload')} Check credentials", style="Accent.TButton")
+    check_btn.pack(side="left", padx=(8, 0))
+    recheck_all_btn = ttk.Button(a_btns, text="Re-check all")
+    recheck_all_btn.pack(side="left", padx=4)
+    acct_reload_btn = ttk.Button(a_btns, text=f"{icon('reload')} Reload profiles")
+    acct_reload_btn.pack(side="left")
     a_wrap = ttk.Frame(s3)
-    a_wrap.pack(fill="both", expand=True)
-    acct_tree = striped(ttk.Treeview(a_wrap, columns=("code", "info"), show="tree headings", selectmode="extended", height=7))
+    a_wrap.pack(side="top", fill="both", expand=True)
+    acct_tree = striped(ttk.Treeview(a_wrap, columns=("status", "account", "role", "region"), show="tree headings", selectmode="extended", height=6))
     acct_tree.heading("#0", text="Profile")
-    acct_tree.heading("code", text="AWS account")
-    acct_tree.heading("info", text="Type, region")
-    acct_tree.column("#0", width=230)
-    acct_tree.column("code", width=230)
-    acct_tree.column("info", width=110)
+    acct_tree.heading("status", text="Credentials status")
+    acct_tree.heading("account", text="Account id")
+    acct_tree.heading("role", text="Role / SSO")
+    acct_tree.heading("region", text="Region")
+    acct_tree.column("#0", width=120)
+    acct_tree.column("status", width=190)
+    acct_tree.column("account", width=95)
+    acct_tree.column("role", width=100)
+    acct_tree.column("region", width=75)
     a_scroll = ttk.Scrollbar(a_wrap, orient="vertical", command=acct_tree.yview)
     acct_tree.configure(yscrollcommand=a_scroll.set)
     a_scroll.pack(side="right", fill="y")
     acct_tree.pack(side="left", fill="both", expand=True)
     acct_tree.tag_configure("hint", foreground="#888888")
-    a_btns = ttk.Frame(s3)
-    a_btns.pack(fill="x", pady=(4, 0))
-    acct_all_btn = ttk.Button(a_btns, text="Select all (shown)")
-    acct_all_btn.pack(side="left")
-    acct_clear_btn = ttk.Button(a_btns, text="Clear")
-    acct_clear_btn.pack(side="left", padx=4)
-    acct_reload_btn = ttk.Button(a_btns, text=f"{icon('reload')} Reload profiles")
-    acct_reload_btn.pack(side="left")
-    acct_status = tk.StringVar(value="")
-    ttk.Label(s3, textvariable=acct_status, wraplength=640, justify="left").pack(anchor="w", pady=(4, 0))
+    for _tag, _col in (("st_active", COLORS["ok"]), ("st_expiring", "#B26A00"), ("st_expired", COLORS["err"]), ("st_none", "#6B7685"), ("st_unknown", "#6B7685")):
+        acct_tree.tag_configure(_tag, foreground=_col)
 
-    # ---- step 4: the clusters (searchable multi-select list)
-    s4 = card(row34, f"{icon('helm')} Step 4 - Choose clusters  (click one, Ctrl/Shift-click for several; they run one after another)", stripe=NAVY, side="left", fill="both", expand=True, padx=(8, 0))
-    filter_var = tk.StringVar(value="")
-    box4, cl_search, cl_search_x = search_box(s4, filter_var)
-    box4.pack(fill="x")
-    cl_count = tk.StringVar(value="")
-    ttk.Label(s4, textvariable=cl_count).pack(anchor="w")
+    # ---- step 2: regions + collect clusters (on demand)
+    s2 = card(col_r, f"{icon('cloud')} Step 2 - Choose regions and collect clusters", stripe=NAVY, fill="x")
     source_var = tk.StringVar(value="all")
-    src_row = ttk.Frame(s4)
+    src_row = ttk.Frame(s2)
     src_row.pack(fill="x")
-    ttk.Label(src_row, text="Cluster list:").pack(side="left")
-    source_all_rb = ttk.Radiobutton(src_row, text=SOURCE_LABELS["all"], value="all", variable=source_var)
-    source_all_rb.pack(side="left", padx=(6, 0))
-    source_menu_rb = ttk.Radiobutton(src_row, text=SOURCE_LABELS["menu"], value="menu", variable=source_var)
-    source_menu_rb.pack(side="left", padx=(12, 0))
+    ttk.Label(src_row, text="Cluster list:").pack(side="left", anchor="n")
+    src_col = ttk.Frame(src_row)
+    src_col.pack(side="left", padx=(6, 0))
+    source_all_rb = ttk.Radiobutton(src_col, text=SOURCE_LABELS["all"], value="all", variable=source_var)
+    source_all_rb.pack(anchor="w")
+    source_menu_rb = ttk.Radiobutton(src_col, text=SOURCE_LABELS["menu"], value="menu", variable=source_var)
+    source_menu_rb.pack(anchor="w")
     region0 = AWS_OPTS["region"]
     _reg_start = _SESSION.get("regions") if _SESSION.get("regions") is not None else (region0 or "")
     region_var = tk.StringVar(value=_reg_start)
-    region_row = ttk.Frame(s4)
-    region_row.pack(fill="x")
+    region_row = ttk.Frame(s2)
+    region_row.pack(fill="x", pady=(4, 0))
     ttk.Label(region_row, text="Region(s):").pack(side="left")
     region_entry = ttk.Entry(region_row, textvariable=region_var, width=24)
     region_entry.pack(side="left", padx=4)
@@ -9602,10 +8181,10 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
     allreg_chk = ttk.Checkbutton(region_row, text="All regions", variable=allreg_var)
     allreg_chk.pack(side="left", padx=(0, 6))
     region_hint = tk.StringVar(value="comma separated; blank = each selected profile's own region")
-    ttk.Label(region_row, textvariable=region_hint).pack(side="left")
+    ttk.Label(s2, textvariable=region_hint, style="Desc.TLabel").pack(anchor="w")
     est_var = tk.StringVar(value="")
-    ttk.Label(s4, textvariable=est_var, font=(FAM, 9, "bold")).pack(anchor="w")
-    collect_row = ttk.Frame(s4)
+    ttk.Label(s2, textvariable=est_var, font=(FAM, 9, "bold")).pack(anchor="w", pady=(2, 0))
+    collect_row = ttk.Frame(s2)
     collect_row.pack(fill="x", pady=(4, 0))
     collect_btn = ttk.Button(collect_row, text="Collect clusters from selected profiles", style="Accent.TButton")
     collect_btn.pack(side="left")
@@ -9613,17 +8192,36 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
     refresh_sel_btn.pack(side="left", padx=(6, 0))
     list_stop_btn = ttk.Button(collect_row, text="Stop", state="disabled")
     list_stop_btn.pack(side="left", padx=(6, 0))
+    cl_status = tk.StringVar(value="")
+    ttk.Label(s2, textvariable=cl_status, wraplength=520, justify="left").pack(anchor="w", pady=(4, 0))
+    list_bar = ttk.Progressbar(s2, mode="determinate", length=300)
+    list_bar.pack(anchor="w", pady=(2, 0))
+
+    # ---- step 3: the clusters (searchable multi-select list)
+    s4 = card(col_r, f"{icon('helm')} Step 3 - Choose clusters  (Ctrl/Shift-click for several)", fill="both", expand=True, pady=(6, 0))
+    filter_var = tk.StringVar(value="")
+    box4, cl_search, cl_search_x = search_box(s4, filter_var)
+    box4.pack(fill="x")
+    cl_count = tk.StringVar(value="")
+    ttk.Label(s4, textvariable=cl_count).pack(anchor="w")
+    scope_var = tk.StringVar(value="all")                   # which collected clusters are SHOWN (all / only the selected profiles); collecting always needs a selection
+    scope_row = ttk.Frame(s4)
+    scope_row.pack(fill="x")
+    scope_all_rb = ttk.Radiobutton(scope_row, text="", value="all", variable=scope_var)
+    scope_all_rb.pack(side="left")
+    scope_sel_rb = ttk.Radiobutton(scope_row, text="", value="sel", variable=scope_var)
+    scope_sel_rb.pack(side="left", padx=(12, 0))
     c_wrap = ttk.Frame(s4)
     c_wrap.pack(fill="both", expand=True)
-    cluster_tree = striped(ttk.Treeview(c_wrap, columns=("where", "acct", "via"), show="tree headings", selectmode="extended", height=7))
+    cluster_tree = striped(ttk.Treeview(c_wrap, columns=("acct", "where", "via"), show="tree headings", selectmode="extended", height=7))
     cluster_tree.heading("#0", text="Cluster")
+    cluster_tree.heading("acct", text="Account / Profile")
     cluster_tree.heading("where", text="Region")
-    cluster_tree.heading("acct", text="Profile")
-    cluster_tree.heading("via", text="Login with")
-    cluster_tree.column("#0", width=230)
-    cluster_tree.column("where", width=110)
-    cluster_tree.column("acct", width=150)
-    cluster_tree.column("via", width=170)
+    cluster_tree.heading("via", text="Connect with")
+    cluster_tree.column("#0", width=220)
+    cluster_tree.column("acct", width=170)
+    cluster_tree.column("where", width=100)
+    cluster_tree.column("via", width=150)
     c_scroll = ttk.Scrollbar(c_wrap, orient="vertical", command=cluster_tree.yview)
     cluster_tree.configure(yscrollcommand=c_scroll.set)
     c_scroll.pack(side="right", fill="y")
@@ -9639,18 +8237,11 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
     refresh_btn.pack(side="left")
     manual_var = tk.StringVar(value="")
     ttk.Label(c_btns, text="  or type numbers:").pack(side="left")
-    manual_entry = ttk.Entry(c_btns, textvariable=manual_var, width=16)
+    manual_entry = ttk.Entry(c_btns, textvariable=manual_var, width=14)
     manual_entry.pack(side="left", padx=4)
-    ttk.Label(c_btns, text="e.g. 1,3,5  2-4  all").pack(side="left")
+    ttk.Label(c_btns, text="e.g. 1,3,5  2-4  all", style="Desc.TLabel").pack(side="left")
     sel_text = tk.StringVar(value="Selected: none")
-    ttk.Label(s4, textvariable=sel_text, wraplength=640, justify="left").pack(anchor="w", pady=(4, 0))
-    cl_status = tk.StringVar(value="")
-    ttk.Label(s4, textvariable=cl_status, wraplength=640, justify="left").pack(anchor="w")
-    list_bar = ttk.Progressbar(s4, mode="determinate", length=300)
-    list_bar.pack(anchor="w", pady=(2, 0))
-    acct_widgets = [acct_search, acct_search_x, scope_all_rb, scope_sel_rb, acct_all_btn, acct_clear_btn]
-    cl_widgets = [cl_search, cl_search_x, select_all_btn, clear_btn, manual_entry]
-    cl_widgets.append(region_entry)
+    ttk.Label(s4, textvariable=sel_text, wraplength=520, justify="left").pack(anchor="w", pady=(4, 0))
 
     # ---- action bar: window, run / stop, run state
     ttk.Label(top, text="Last (minutes):").pack(side="left")
@@ -9807,7 +8398,7 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
     ttk.Label(bottom, textvariable=tasks_var, style="Footer.TLabel").pack(side="left")
     elapsed = tk.StringVar(value="")
     ttk.Label(bottom, textvariable=elapsed, style="Footer.TLabel").pack(side="left", padx=(10, 0))
-    ttk.Label(bottom, text="Read-only: nothing is installed, created, changed or deleted", style="Footer.TLabel").pack(side="left", padx=(14, 0))
+    ttk.Label(bottom, text="Uses your existing AWS credentials from ~/.aws - no sign-in in this tool. Read-only: nothing is installed, created, changed or deleted", style="Footer.TLabel").pack(side="left", padx=(14, 0))
     folder_btn = ttk.Button(bottom, text=f"{icon('folder')} Open reports folder", style="Footer.TButton")
     folder_btn.pack(side="right")
     open_btn = ttk.Button(bottom, text=f"{icon('report')} Open HTML report", state="disabled", style="Footer.TButton")
@@ -9835,7 +8426,7 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
         widget.state(["!disabled"] if enabled else ["disabled"])
 
     def is_cli():
-        """True when the cluster list is read with aws (Cloud CLI method, or the custom login with the source 'All clusters I can access')."""
+        """True when the cluster list is read with aws (the default method, or ekslogin with the source 'Collect clusters from selected profiles')."""
         return _lists_via_cli()
 
     def default_source():
@@ -9857,21 +8448,8 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
         state["by_key"] = {r["key"]: r for r in state["crows"]}
 
     def effective_accounts():
-        """The profiles the cluster listing covers: the selected ones, or all usable ones ('All profiles')."""
-        chosen = [a for a in state["accounts"] if a["id"] in state["acct_chosen"]]
-        if chosen or state["accounts"]:
-            return chosen
-        if state["accounts_loaded"]:                    # no profile in ~/.aws at all: the environment credentials ("default credentials") are the only scope
-            return [{"id": None, "name": "default credentials", "code": "", "info": "", "usable": True}]
-        return []
-
-    def signin_account():
-        """The account the sign-in belongs to (the AWS profile; the other clouds sign in once)."""
-        typed = profile_name_of(profile_var.get())
-        if typed:
-            return typed
-        chosen = [a["id"] for a in state["accounts"] if a["id"] in state["acct_chosen"]]
-        return chosen[0] if scope_var.get() == "sel" and chosen else None
+        """The profiles the cluster collection covers: the selected ones (rows of load_accounts, 'id' None = environment / default credentials)."""
+        return [a for a in state["accounts"] if a["key"] in state["acct_chosen"]]
 
     def update_scope_labels():
         usable = len([a for a in state["accounts"] if a.get("usable", True)])
@@ -9882,38 +8460,150 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
             scope_all_rb.configure(text="(auto) - picked after login")
             scope_sel_rb.configure(text=f"Use the selected profile ({len(state['acct_chosen'])})")
 
-    # ---- step 3 list
+    # ---- step 1: profiles with a credentials status chip
+    STATE_TAG = {"active": "st_active", "expiring": "st_expiring", "expired": "st_expired", "not_configured": "st_none", "unknown": "st_unknown", "unchecked": "st_none"}
+    STATE_DOT = {"active": "●", "expiring": "●", "expired": "●", "not_configured": "○", "unknown": "○", "unchecked": "○"}
+
+    def status_of(key):
+        st = state["acct_status"].get(key)
+        if st is None:
+            a = state["acct_by_id"].get(key)
+            try:
+                st = local_status(a["id"] if a else key, state.get("profiles_info") or {})
+            except Exception:
+                st = {"profile": key, "state": "unchecked", "detail": "", "left": None, "expires_at": None}
+        return st
+
+    def chip_text(st):
+        return f"{STATE_DOT.get(st['state'], '')} {status_text(st)}"
+
     def rebuild_account_list():
         acct_tree.delete(*acct_tree.get_children())
-        if state["acct_locked"]:
-            acct_tree.insert("", "end", iid="__hint__", text="Sign in first (step 2)", tags=("hint",))
-            acct_count.set("")
-            return
         ts = terms(acct_filter)
-        shown = [a for a in state["accounts"] if hit(a["hay"], ts)]
-        for n, a in enumerate(shown):
-            acct_tree.insert("", "end", iid=a["id"], text=a["name"], values=(a["code"], a["info"]), tags=(("odd", "even")[n % 2],))
-        acct_tree.selection_set([a["id"] for a in shown if a["id"] in state["acct_chosen"]])
+        shown = []
+        for a in state["accounts"]:
+            st = status_of(a["key"])
+            a["hay"] = f"{a['name']} {a['code']} {a['role']} {a['region']} {status_text(st)}".lower()
+            if hit(a["hay"], ts):
+                shown.append((a, st))
+        for n, (a, st) in enumerate(shown):
+            acct_tree.insert("", "end", iid=a["key"], text=a["name"], values=(chip_text(st), a["code"], a["role"], a["region"]),
+                             tags=(STATE_TAG.get(st["state"], "st_unknown"), ("odd", "even")[n % 2]))
+        acct_tree.selection_set([a["key"] for a, _st in shown if a["key"] in state["acct_chosen"]])
         acct_count.set(f"Showing {len(shown)} of {len(state['accounts'])}")
         acct_sel.set(f"{len(state['acct_chosen'])} selected")
 
-    def on_acct_select(_event=None):
-        if state["acct_locked"]:
+    def blocked_selected():
+        """[(profile id, status)] of the SELECTED profiles whose credentials are expired or missing."""
+        out = []
+        for a in state["accounts"]:
+            if a["key"] in state["acct_chosen"]:
+                st = status_of(a["key"])
+                if st["state"] in BLOCKED_STATES:
+                    out.append((a["id"], st))
+        return out
+
+    def renew_text(blocked):
+        lines = [renew_message(p) for p, _st in blocked[:3]]
+        if len(blocked) > 3:
+            lines.append(f"... and {len(blocked) - 3} more selected profile(s) with expired or missing credentials.")
+        return "\n".join(lines)
+
+    def update_renew_box():
+        """The red message under the profile list: shown while a selected profile has expired / missing credentials (text only - nothing is run)."""
+        blocked = blocked_selected()
+        if blocked:
+            renew_var.set(renew_text(blocked))
+            renew_box.pack(side="bottom", fill="x", pady=(6, 0), before=acct_status_lbl)
+        else:
+            renew_box.pack_forget()
+            renew_var.set("")
+
+    def copy_renew_command():
+        blocked = blocked_selected()
+        cmd = renew_command(blocked[0][0] if blocked else None)
+        root.clipboard_clear()
+        root.clipboard_append(cmd)
+        status.set("Copied (run it yourself, in your own terminal): " + cmd)
+
+    def after_status_change():
+        rebuild_account_list()
+        update_renew_box()
+        update_banner()
+
+    def set_acct_status(key, st):
+        state["acct_status"][key] = st
+        after_status_change()
+
+    def status_summary():
+        c = Counter(status_of(a["key"])["state"] for a in state["accounts"])
+        names = (("active", "Active"), ("expiring", "Expiring soon"), ("expired", "Expired"), ("not_configured", "Not configured"), ("unknown", "Unknown"), ("unchecked", "not checked"))
+        return ", ".join(f"{c[k]} {label}" for k, label in names if c[k])
+
+    def start_status_checks(keys):
+        """Check the credentials of these profiles in the background (`aws sts get-caller-identity`, read-only, 4 at a time); the selected ones come first."""
+        keys = [k for k in dict.fromkeys(keys) if k in state["acct_by_id"]]
+        keys.sort(key=lambda k: 0 if k in state["acct_chosen"] else 1)
+        if not keys:
             return
+        if not shutil.which("aws"):
+            acct_status.set("The AWS CLI (aws) was not found on PATH - the status comes from the local cache only. Install it from https://aws.amazon.com/cli/ ; this tool only uses credentials that already exist in ~/.aws.")
+            return
+        if state.get("status_cancel") is not None:
+            state["status_cancel"].set()
+        cancel = state["status_cancel"] = threading.Event()
+        state["status_gen"] += 1
+        gen = state["status_gen"]
+        state["status_checking"] = True
+        acct_status.set(f"Checking the credentials of {count_of(len(keys), 'profile')} ...")
+        update_controls()
+        ids = [state["acct_by_id"][k]["id"] for k in keys]
+
+        def work():
+            try:
+                check_accounts(ids, lambda n, st: msgs.put(("acct_status", n or ENV_KEY, st)), cancel)
+            finally:
+                msgs.put(("acct_status_done", gen))
+        threading.Thread(target=work, daemon=True).start()
+
+    def check_selected(_event=None):
+        keys = [a["key"] for a in state["accounts"] if a["key"] in state["acct_chosen"]]
+        start_status_checks(keys or list(state["acct_by_id"]))
+
+    def check_all_accounts(_event=None):
+        start_status_checks(list(state["acct_by_id"]))
+
+    def auto_check_accounts():
+        """After the profiles are read: up to LAZY_STATUS_LIMIT profiles are all checked in the background (the selected ones first), otherwise only the selected ones."""
+        if len(state["accounts"]) <= LAZY_STATUS_LIMIT:
+            check_all_accounts()
+        else:
+            check_selected() if state["acct_chosen"] else acct_status.set("Many profiles: press 'Check credentials' for the selected ones, or 'Re-check all'.")
+
+    def mark_expired(profile):
+        """The credentials of `profile` turned out to be expired while listing / running: show it in the list and the red message."""
+        key = profile or ENV_KEY
+        try:
+            st = classify_status(profile, "ExpiredToken: the credentials have expired", state.get("profiles_info") or {})
+        except Exception:
+            st = {"profile": profile, "state": "expired", "detail": "", "left": None, "expires_at": None}
+        state["acct_status"][key] = st
+        after_status_change()
+        say(renew_message(profile), "err")
+
+    def on_acct_select(_event=None):
         visible = set(acct_tree.get_children())
         state["acct_chosen"] = (state["acct_chosen"] - visible) | (set(acct_tree.selection()) & visible)
         if state["acct_chosen"] and scope_var.get() == "all":
             scope_var.set("sel")
         if scope_var.get() == "sel" and len(state["acct_chosen"]) == 1:
             only = next(iter(state["acct_chosen"]))
-            profile_var.set(only)
-            state["active_profile"] = _SESSION["profile"] = only
+            state["active_profile"] = _SESSION["profile"] = state["acct_by_id"][only]["id"] if only in state["acct_by_id"] else only
         on_scope_change()
 
     def on_scope_radio():
         if scope_var.get() == "all":
             state["acct_chosen"] = set()               # 'All' is explicit: no leftover selection
-            profile_var.set("")
             state["active_profile"] = None
             rebuild_account_list()
         on_scope_change()
@@ -9927,7 +8617,6 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
 
     def acct_clear():
         state["acct_chosen"] = set()
-        profile_var.set("")
         state["active_profile"] = None
         scope_var.set("all")
         rebuild_account_list()
@@ -9940,42 +8629,33 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
         acct_count_refresh()
         rebuild_cluster_list()
         cluster_hint()
-        if PER_ACCOUNT and is_cli():
-            if state["recheck"]:
-                root.after_cancel(state["recheck"])
-            state["recheck"] = root.after(500, recheck_account)
+        update_renew_box()
+        chosen = [k for k in state["acct_chosen"] if k not in state["acct_status"]]
+        if chosen and len(state["accounts"]) > LAZY_STATUS_LIMIT:
+            start_status_checks(chosen)             # many profiles: the ones you select are checked as you select them
 
     def acct_count_refresh():
         acct_sel.set(f"{len(state['acct_chosen'])} selected")
         update_estimate()
 
-    def recheck_account():
-        state["recheck"] = None
-        if signin_account() != state["auth_for"]:
-            check_status()
-
-    # ---- step 4 list
+    # ---- step 3 list
     def scoped_rows():
         rows = state["crows"]
         if is_cli() and scope_var.get() == "sel":
-            rows = [r for r in rows if r.get("account") in state["acct_chosen"]]
+            ids = {state["acct_by_id"][k]["id"] for k in state["acct_chosen"] if k in state["acct_by_id"]}
+            rows = [r for r in rows if r.get("account") in ids]
         return rows
 
     def rebuild_cluster_list():
         cluster_tree.delete(*cluster_tree.get_children())
-        if state["cl_locked"]:
-            cluster_tree.insert("", "end", iid="__hint__", text="Sign in first (step 2)", tags=("hint",))
-            cl_count.set("")
-            update_selected_label()
-            return
         rows = scoped_rows()
         ts = terms(filter_var)
         shown = [r for r in rows if hit(r["hay"], ts)]
         if is_cli() and not rows and not state["listing"]:
-            cluster_tree.insert("", "end", iid="__hint__", text="Select one or more profiles above, then press 'Collect clusters from selected profiles'.", tags=("hint",))
+            cluster_tree.insert("", "end", iid="__hint__", text="Select one or more profiles in step 1, then press 'Collect clusters from selected profiles'.", tags=("hint",))
         for n, r in enumerate(shown):
             cluster_tree.insert("", "end", iid=r["key"], text=(f"{r['number']} - {r['name']}" if r.get("number") else r["name"]),
-                                values=(r.get("where") or "", r.get("account_name") or "", r.get("via") or ""), tags=(("odd", "even")[n % 2],))
+                                values=(r.get("account_name") or "", r.get("where") or "", r.get("via") or ""), tags=(("odd", "even")[n % 2],))
         cluster_tree.selection_set([r["key"] for r in shown if r["key"] in state["cchosen"]])
         cl_count.set(f"Showing {len(shown)} of {len(rows)}")
         update_selected_label()
@@ -9991,8 +8671,6 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
             root.after(200, go)
 
     def on_tree_select(_event=None):
-        if state["cl_locked"]:
-            return
         visible = set(cluster_tree.get_children())
         state["cchosen"] = (state["cchosen"] - visible) | (set(cluster_tree.selection()) & visible)
         update_selected_label()
@@ -10028,96 +8706,52 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
         rebuild_cluster_list()
 
     def cluster_hint():
-        """The line under the cluster list: where the list stands."""
-        if state["cl_locked"]:
-            cl_status.set("Sign in first (step 2).")
-        elif state["listing"]:
+        """The line under the Collect button: where the list stands."""
+        if state["listing"]:
             sc = state.get("list_scope")
             el = int(time.time() - (state.get("list_t0") or time.time()))
-            cl_status.set(f"Listing clusters: {state['list_done']}/{state['list_total']}" + (f" ({sc[0] or 'default credentials'}, {sc[1]})" if sc else "")
+            cl_status.set(f"Listing clusters: {state['list_done']}/{state['list_total']}" + (f" ({sc[0] or ENV_LABEL}, {sc[1]})" if sc else "")
                           + f"   elapsed {el // 60:02d}:{el % 60:02d}   ({count_of(len(state['crows']), 'cluster')} so far)")
         elif is_cli() and not state["scopes"] and not state["crows"]:
-            cl_status.set("Nothing is collected yet. Select profile(s) in step 3 and press 'Collect clusters from selected profiles'.")
+            cl_status.set("Nothing is collected yet. Select profile(s) in step 1 and press 'Collect clusters from selected profiles'.")
         elif is_cli():
             new, _total, _np, _nr = scope_estimate()
             if new:
                 cl_status.set((state.get("hint_note") or "") + f"{new} selected profile/region pair(s) are not collected yet - press 'Collect clusters from selected profiles'.")
 
-    # ---- sign-in state: badge, message, what is unlocked
+    # ---- what is enabled, the banner
     def update_controls():
         cli = is_cli()
         busy, listing = state["busy"], state["listing"]
-        auth_ok = state["auth"]["state"] == "ok"
-        working = state["signing"] or state["checking"]
-        idle = not busy and not listing and not working
-        set_state(signin_btn, cli and idle)
-        set_state(check_btn, cli and idle)
-        set_state(device_chk, cli and not working)
-        set_state(signin_combo, cli and not working)
-        set_state(cli_test_btn, cli and not working)
-        if man["shown"] and man.get("acct") != signin_account():
-            man_refresh()                                            # the commands always name the selected profile
-        expired_now = state["auth"].get("expired") and state["auth"]["state"] != "ok"
-        signin_btn.configure(text=f"{icon('key')} " + ("Sign in again" if expired_now else "Sign in"),
-                             style="Accent.TButton" if state["auth"]["state"] != "ok" else "TButton")
-        set_state(dd_btn, cli and idle)
-        set_state(dd_all_btn, cli and not state["status_checking"])
-        set_state(switch_btn, cli and idle)
-        set_state(use_btn, cli and idle)
-        set_state(profile_combo, cli and idle)
-        dc_cancel_btn.state(["!disabled"] if (state["signing"] and dc["active"]) else ["disabled"])
-        update_active_label()
-        for rb in (source_all_rb, source_menu_rb):                  # the choice only exists for the custom login; the Cloud CLI always lists from aws
-            set_state(rb, LOGIN_OPTS["method"] == "exe" and not busy and not listing and not working)
-        state["acct_locked"] = cli and NEED_SIGNIN and not auth_ok
-        state["cl_locked"] = cli and not auth_ok
-        for w in acct_widgets:
-            set_state(w, not state["acct_locked"])
-        for w in cl_widgets:
-            set_state(w, not state["cl_locked"])
-        set_state(acct_all_btn, not state["acct_locked"])
-        set_state(acct_reload_btn, not state["acct_locked"] and not busy and not state["acct_loading"])
-        set_state(refresh_btn, not state["cl_locked"] and not busy and not listing)
-        set_state(collect_btn, cli and not state["cl_locked"] and not busy and not listing)
-        set_state(refresh_sel_btn, cli and not state["cl_locked"] and not busy and not listing)
+        idle = not busy and not listing
+        set_state(check_btn, not busy)
+        set_state(recheck_all_btn, not busy)
+        set_state(acct_reload_btn, not busy and not state["acct_loading"])
+        set_state(refresh_btn, not busy and not listing)
+        set_state(collect_btn, cli and idle)
+        set_state(refresh_sel_btn, cli and idle)
         list_stop_btn.state(["!disabled"] if listing else ["disabled"])
         set_state(allreg_chk, cli and not listing)
-        set_state(select_all_btn, not state["cl_locked"])
-        set_state(clear_btn, not state["cl_locked"])
-        acct_tree.configure(selectmode="none" if state["acct_locked"] else "extended")
-        cluster_tree.configure(selectmode="none" if state["cl_locked"] else "extended")
-        method_combo.configure(state="disabled" if (busy or listing or working) else "readonly")
+        set_state(region_entry, not listing)
+        for rb in (source_all_rb, source_menu_rb):                  # the choice only exists with ekslogin; the default method always lists from aws
+            set_state(rb, LOGIN_OPTS["method"] == "exe" and idle)
+        method_combo.configure(state="disabled" if (busy or listing) else "readonly")
         run_btn.state(["disabled"] if (busy or listing) else ["!disabled"])
         stop_btn.state(["!disabled"] if (busy or listing) else ["disabled"])
         for w in section_widgets:
             set_state(w, not busy)
         update_banner()
-        s3.configure(text=f"{icon('cloud')} Step 3 - Choose profile" + ("   [locked - sign in first]" if state["acct_locked"] else
-                                                       (f"   [{len(state['accounts'])} loaded]" if state["accounts"] else "")))
-        s4.configure(text=f"{icon('helm')} Step 4 - Choose clusters  (click one, Ctrl/Shift-click for several; they run one after another)"
-                          + ("   [locked - sign in first]" if state["cl_locked"] else ""))
-        if state.get("locks") != (state["acct_locked"], state["cl_locked"]):
-            state["locks"] = (state["acct_locked"], state["cl_locked"])
-            rebuild_account_list()
-            rebuild_cluster_list()
         update_estimate()
         cluster_hint()
 
     def update_banner():
-        """The subtitle of the banner: window, who is signed in, how many profiles were found."""
+        """The subtitle of the banner: window, where the credentials come from, how many profiles were found."""
         try:
             mins = max(1, int(minutes_var.get()))
         except ValueError:
             mins = default_minutes
-        auth = state["auth"]
-        if auth["state"] == "ok":
-            who = f"signed in as {auth.get('who') or '?'}"
-        elif not is_cli():
-            who = "sign-in handled by ekslogin"
-        elif auth["state"] == "no_cli":
-            who = "aws not installed"
-        else:
-            who = "not signed in"
+        who = ("Uses your existing AWS credentials from ~/.aws - no sign-in in this tool" if LOGIN_OPTS["method"] == "cli"
+               else "ekslogin first, then ~/.aws is re-read - this tool does not sign in itself")
         n = len(state["accounts"])
         line = f"{icon('clock')} Last {mins} minutes      {icon('key')} {who}      {icon('list')} {n} profile{'' if n == 1 else 's'}      read-only: nothing is changed or installed"
         if line != banner_sub.get():
@@ -10144,226 +8778,24 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
 
     def apply_method_ui():
         exe = LOGIN_OPTS["method"] == "exe"
-        if is_cli() and exe:
-            method_info.set("Logs in with ekslogin.exe; the cluster list is read with aws: every cluster you can access. Clusters that are not in the "
-                            "ekslogin menu are logged in with aws eks update-kubeconfig.")
-        elif is_cli():
-            method_info.set("Uses the AWS CLI (aws): sign in in step 2, then the profiles and clusters are read from AWS.")
+        if exe:
+            method_info.set("Runs your ekslogin.exe with the cluster's menu number first, then re-reads ~/.aws (ekslogin may refresh profiles). "
+                            "Clusters not in its menu use aws eks update-kubeconfig.")
         else:
-            method_info.set("Uses ekslogin.exe: it signs in when you press Run. The cluster list comes from ekslogin.")
+            method_info.set("Uses the credentials already in ~/.aws; aws eks update-kubeconfig writes the kubeconfig entry. Nothing signs in here.")
         region_hint.set("comma separated; blank = each selected profile's own region; all = every enabled region")
         update_scope_labels()
         if not is_cli():
-            state["auth"] = {"state": "unchecked"}
-            set_badge("Handled by ekslogin", "dim")
-            auth_msg.set("Uses ekslogin.exe - it signs in when you press Run. The sign-in buttons are only used with the Cloud CLI method "
-                         "or when the list of all clusters is read with aws.")
-            say("Custom login: choose the profile if you want to force one (otherwise it is picked after login), select the clusters in step 4 and press "
-                "'Login & Debug'.", "info")
+            say("ekslogin menu: the clusters below come from ekslogin. Select them in step 3 and press 'Login & Debug'.", "info")
         else:
-            set_badge("Not checked", "dim")
-            auth_msg.set("")
-            if exe:
-                say("Custom login with the cluster list read from aws: sign in to aws in step 2 (or choose 'Only the clusters from ekslogin menu' in step 4).", "info")
+            say("Select the AWS profile(s) in step 1 (check their credentials status), then press 'Collect clusters from selected profiles' in step 2.", "info")
 
-    def apply_auth(res, source):
-        if source == "manual_auto":            # the background check of the manual panel: only a success matters
-            man["probing"] = False
-            if res["state"] != "ok" or not man["active"]:
-                return
-            source = "manual_verify"
-        state["checking"] = state["signing"] = False
-        if not is_cli():                      # the method was switched while this was running
-            update_controls()
-            return
-        was_ok = state["auth"]["state"] == "ok"
-        state["auth"] = res
-        st = res["state"]
-        prof_for = res.get("profile") or signin_account()
-        if prof_for and st in ("ok", "not_signed_in"):
-            try:
-                stat = classify_status(prof_for, None if st == "ok" else (res.get("detail") or "Unable to locate credentials"), state.get("profiles_info") or {})
-                if st == "ok":
-                    stat.update(arn=res.get("arn"), account=res.get("account"))
-                state["acct_status"][prof_for] = stat
-                refresh_dd()
-            except Exception:
-                pass
-        if st == "ok":
-            who = res.get("who") or "?"
-            set_badge(f"Signed in as {who}", "ok")
-            auth_msg.set("You are signed in. Next: step 3 and step 4.")
-            lead = {"signin_ok": "Login OK - ", "manual_verify": "Login OK - ", "already": "Already signed in - "}.get(source, "")
-            if man["shown"] and (man["active"] or source == "manual_verify"):
-                man_signed_in(res)
-            say(f"{lead}signed in as {who}. Next: choose the profile in step 3 (or keep 'All profiles') and the clusters in step 4.", "ok")
-        elif st == "no_cli":
-            set_badge("aws not installed", "err")
-            auth_msg.set(res.get("detail") or "")
-            say(f"{res.get('detail')} {res.get('hint')}", "err")
-        elif source == "manual_verify":
-            hint = signin_failure_help(res.get("detail"), man.get("login"), man.get("check"))
-            set_badge("Not signed in", "err")
-            auth_msg.set(hint)
-            say(hint.replace("\n", "  "), "err")
-            man_failed(hint)
-        elif res.get("expired") and source != "signin_fail":
-            prof = res.get("profile") or signin_account() or "default"
-            msg = expired_message(prof, {"expires_at": res.get("expires_at")})
-            set_badge("Credentials expired", "err")
-            auth_msg.set(msg)
-            say(msg, "err")
-        else:
-            set_badge("Not signed in", "err")
-            auth_msg.set(f"Reason: {res.get('detail') or 'unknown'}\nNext: {res.get('hint')}")
-            if source == "signin_fail":
-                say("Sign-in failed or was cancelled (" + (res.get("detail") or "no details") + "). Press 'Sign in' to try again, or run 'aws sso login --profile NAME' in a "
-                    "terminal and then press 'Check status'.", "err")
-            else:
-                say("Not signed in. " + (res.get("hint") or ""), "err")
-        if st != "ok" and source == "check" and LOGIN_OPTS["method"] == "exe" and LOGIN_OPTS.get("source") == "all" and not state["src_user"]:
-            fall_back_to_menu(res.get("detail") or "aws is not signed in")      # not the user's choice: don't lock the list, show the ekslogin menu
-            return
-        if st == "ok" and state["accounts_loaded"] and not state["accounts"]:
-            say(acct_status.get(), "warn")
-        update_controls()
-        if st == "ok" and (not was_ok or source in ("signin_ok", "already", "manual_verify")):
-            if not state["accounts_loaded"] or not state["accounts"]:
-                load_accounts_async()
-
-    def fall_back_to_menu(reason):
-        """The default 'All clusters I can access' needs aws; when it is missing or not signed in, show the ekslogin menu instead."""
-        state["fell_back"] = True
-        source_var.set("menu")
-        LOGIN_OPTS["source"] = "menu"
-        state.update(crows=[], by_key={}, cchosen=set(), clusters={}, listed=set(), scopes=set(), checking=False, signing=False)
-        apply_method_ui()
-        update_controls()
-        rebuild_cluster_list()
-        reset_steps()
-        load_clusters()
-        state["fb_msg"] = (f"aws cannot list your clusters ({_first_line(reason, 90)}) - showing only the clusters from the ekslogin menu. For every cluster you can access: "
-                           "choose 'All clusters I can access (via aws)' in step 4 and press 'Sign in'. The list is retried after the next ekslogin login.")
-        say(state["fb_msg"], "warn")
-
-    def check_status(_event=None, source="check"):
-        if not is_cli() or state["checking"] or state["signing"] or state["busy"] or state["listing"]:
-            return
-        sync_login_opts()
-        acct = signin_account()
-        state.update(checking=True, auth_for=acct)
-        set_badge("Checking...", "info")
-        auth_msg.set("Checking whether aws is signed in ...")
-        say("Checking the sign-in ...", "info")
-        update_controls()
-
-        def work():
-            try:
-                res = login_status(acct)
-            except Exception as exc:
-                res = {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": "Press 'Sign in'."}
-            msgs.put(("auth", res, source))
-        threading.Thread(target=work, daemon=True).start()
-
-    def switch_profile(name, signin=False):
-        """Make `name` the active account/profile: the cluster lists start again for it (step 3 selects it, step 4 is re-listed once it is signed in).
-        With signin=True the interactive sign-in (device code) runs for it. Nothing in ~/.aws is created or edited."""
-        name = profile_name_of(name)
-        if not name:
-            say("Choose a profile in the 'Account / profile' box (or type a new profile name) first.", "warn")
-            return False
-        if not _PROFILE_NAME_RE.fullmatch(name):
-            say(f"'{name}' is not a valid profile name.", "err")
-            return False
-        if state["busy"] or state["listing"] or state["checking"] or state["signing"]:
-            say("Wait for the current run / listing / sign-in to finish (or press Stop / Cancel sign-in) before switching the account.", "warn")
-            return False
-        changed = name != state.get("active_profile")
-        profile_var.set(name)
-        state["active_profile"] = _SESSION["profile"] = name
-        state["pre"] = True
-        if name in state["acct_by_id"]:
-            state["acct_chosen"] = {name}
-            scope_var.set("sel")
-        if changed:
-            state.update(cchosen=set(), auth={"state": "unchecked"})                 # the collected clusters stay (per-scope cache)
-            manual_var.set("")
-            set_badge("Not checked", "dim")
-            reset_steps()
-        sync_login_opts()
-        update_scope_labels()
-        rebuild_account_list()
-        rebuild_cluster_list()
-        show_profile_hint()
-        update_controls()
-        if signin:
-            sign_in(force=True)
-        else:
-            check_status(source="switch")
-        return True
-
-    def on_profile_commit(_event=None):
-        profile_var.set(profile_name_of(profile_var.get()))
-        switch_profile(profile_var.get())
-
-    def on_switch_account():
-        switch_profile(profile_var.get(), signin=True)
-
-    def sign_in(_event=None, force=False, method=None, flag=None):
-        if not is_cli() or state["checking"] or state["signing"] or state["busy"] or state["listing"]:
-            return
-        typed = profile_name_of(profile_var.get())
-        if typed and typed != state.get("active_profile") and not force:
-            switch_profile(typed, signin=True)          # a profile was typed / picked but not yet activated: switch to it, then sign in
-            return
-        sync_login_opts()
-        method = method or LOGIN_OPTS["signin"]
-        if method == "manual":                          # the default: show the commands, the user runs one, then Verify
-            man_open(force=force)
-            return
-        acct = signin_account()
-        cancel = threading.Event()
-        state.update(signing=True, auth_for=acct)
-        dc["cancel"] = cancel
-        set_badge("Signing in...", "info")
-        auth_msg.set("Running the sign-in ...")
-        update_controls()
-
-        def emit(line):
-            msgs.put(("line", line))
-            if line.startswith("  aws: "):
-                msgs.put(("dc", "raw", line[7:]))
-
-        def work():
-            try:
-                if not force:
-                    pre = login_status(acct)
-                    if pre["state"] != "not_signed_in":
-                        msgs.put(("auth", pre, "already" if pre["state"] == "ok" else "check"))
-                        return
-                msgs.put(("dc", "start", acct))
-                msgs.put(("say", ("A console window opens for the sign-in - complete it there. This window continues when it closes."
-                                  if method == "console" else
-                                  "Sign-in started - the URL and the code are shown in step 2 ('Sign-in details'): open the URL in a browser and enter the code. "
-                                  "This window continues when you are done."), "info"))
-                result = {}
-                kw = {"flag": flag, "console": method == "console", "on_raw": lambda t: msgs.put(("dc", "rawtext", t)),
-                      "on_event": lambda k, d: msgs.put(("dc", "event", k, d))}
-                ok = cli_sign_in(emit, acct, on_details=lambda d: msgs.put(("dc", "details", d)), cancel=cancel, result=result, force=force, login_kw=kw)
-                post = login_status(acct)
-                msgs.put(("dc", "end", result, ok and post["state"] == "ok", post))
-                msgs.put(("auth", post, "signin_ok" if ok else "signin_fail"))
-            except Exception as exc:
-                msgs.put(("dc", "end", {"error": str(exc)}, False, None))
-                msgs.put(("auth", {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": "Press 'Sign in' to try again."}, "signin_fail"))
-        threading.Thread(target=work, daemon=True).start()
-
-    # ---- step 3 loading (profiles are read once and cached for the session; 'Reload profiles' refreshes)
+    # ---- step 1 loading (profiles are read once and cached for the session; 'Reload profiles' refreshes - also after ekslogin ran)
     def load_accounts_async(force=False):
         if state["acct_loading"] or (state["accounts_loaded"] and not force):
             return
         state["acct_loading"] = True
-        acct_status.set("Loading profiles ...")
+        acct_status.set("Reading the profiles in ~/.aws ...")
         update_controls()
 
         def work():
@@ -10371,19 +8803,20 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
                 accts, err = load_accounts()
             except Exception as exc:
                 accts, err = [], str(exc)
-            for a in accts:
-                a["hay"] = f"{a['name']} {a['code']} {a['info']}".lower()
-            msgs.put(("accounts", accts, err))
+            try:
+                profs = list_aws_profiles()
+            except Exception:
+                profs = {}
+            msgs.put(("accounts", accts, err, profs))
         threading.Thread(target=work, daemon=True).start()
 
-    def on_accounts(accts, err):
+    def on_accounts(accts, err, profs=None):
         state["acct_loading"] = False
         state["accounts_loaded"] = True
         state["accounts"] = accts
-        state["acct_by_id"] = {a["id"]: a for a in accts}
+        state["acct_by_id"] = {a["key"]: a for a in accts}
+        state["profiles_info"] = profs or {}
         state["acct_chosen"] &= set(state["acct_by_id"])
-        refresh_profile_choices()
-        auto_check_accounts()
         first = ACCOUNT0
         if first and not state["pre"]:
             state["pre"] = True
@@ -10401,25 +8834,23 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
         update_controls()
         rebuild_account_list()
         rebuild_cluster_list()
+        update_renew_box()
         state["acct_err"] = err
         if not accts:
-            acct_status.set("No AWS profiles found in ~/.aws/config. Fix: in a terminal run 'aws configure sso' (or 'aws configure'), then press 'Reload profiles'. Environment credentials still work: step 4 then uses the default credentials." + (f" (details: {err})" if err else ""))
-            if state["auth"]["state"] in ("ok", "unchecked") or not is_cli():
-                say(acct_status.get(), "warn" if is_cli() else "info")
+            acct_status.set("No AWS profiles found in ~/.aws/config / credentials and no AWS_* credentials in the environment. Set them up the way your company does "
+                            "(this tool does not sign in or create profiles), then press 'Reload profiles'." + (f" (details: {err})" if err else ""))
+            say(acct_status.get(), "warn")
             return
-        usable = len([a for a in accts if a.get("usable", True)])
-        acct_status.set(f"{count_of(len(accts), 'profile')} loaded" + (f" ({usable} usable)" if usable != len(accts) else "") + ".")
-        if is_cli() and state["auth"]["state"] == "ok":
-            say(f"{count_of(len(accts), 'profile')} loaded. Step 3: select the profile(s); step 4: press 'Collect clusters from selected profiles' (nothing is listed automatically).", "ok")
+        acct_status.set(f"{count_of(len(accts), 'profile')} found.")
+        auto_check_accounts()
+        if is_cli():
+            say(f"{count_of(len(accts), 'profile')} found. Step 1: select the profile(s) and check their credentials; step 2: press 'Collect clusters from selected profiles' "
+                "(nothing is listed automatically).", "ok")
 
-    # ---- step 4 loading (clusters are listed per profile in parallel; the list grows while it runs)
-    def maybe_auto_list():
-        """Nothing is listed automatically any more: the clusters are collected only when the user presses the button."""
-        cluster_hint()
-
-    def scope_estimate():
+    # ---- step 2: clusters are listed per profile in parallel; the list grows while it runs
+    def scope_estimate(accts=None):
         """(new pairs, all pairs, profiles, regions) the selected profiles x the Region(s) box would search, without any cloud call ('all' counts the built-in region list)."""
-        accts = effective_accounts()
+        accts = effective_accounts() if accts is None else accts
         text = region_var.get().strip()
         ex = _explicit_regions(text)
         profs = list_aws_profiles() if accts else {}
@@ -10439,7 +8870,7 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
             return
         new, total, nprof, nreg = scope_estimate()
         if not nprof:
-            est_var.set("No profile selected: select one or more profiles in step 3.")
+            est_var.set("No profile selected: select one or more profiles in step 1.")
         else:
             est_var.set(f"{total} profile/region pair(s) selected ({count_of(nprof, 'profile')} x {count_of(nreg, 'region')})" + (f"; {new} not collected yet" if state["scopes"] else "")
                         + ("   [All regions: about " + str(len(FALLBACK_REGIONS)) + " per profile]" if "all" in region_var.get().lower() else ""))
@@ -10460,21 +8891,24 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
             region_var.set("")
 
     def collect_clusters(refresh=False):
-        """The button: `aws eks list-clusters` for the SELECTED profiles x the Region(s) only. Scopes already collected are skipped (refresh=True collects them again)."""
+        """The button: `aws eks list-clusters` for the SELECTED profiles x the Region(s) only - and only for profiles whose credentials are not Expired / Not
+        configured (those are skipped with a note). Scopes already collected are skipped (refresh=True collects them again)."""
         if state["busy"]:
             status.set("Wait for the current run to finish (or press Stop) before collecting clusters.")
             return
         if state["listing"]:
             return
         sync_login_opts()
-        if state["auth"]["state"] != "ok":
-            say("Sign in first (step 2): press 'Sign in', or 'Check status' if you already signed in.", "warn")
+        chosen = effective_accounts()
+        if not chosen:
+            say("Select one or more profiles in step 1 first (or press 'Select all (shown)'), then press 'Collect clusters from selected profiles'.", "warn")
             return
-        accts = effective_accounts()
+        skipped = [a for a in chosen if status_of(a["key"])["state"] in BLOCKED_STATES]
+        accts = [a for a in chosen if a not in skipped]
         if not accts:
-            say("Select one or more profiles in step 3 first (or press 'Select all (shown)'), then press 'Collect clusters from selected profiles'.", "warn")
+            say(renew_text([(a["id"], None) for a in skipped]), "err")
             return
-        new, total, nprof, nreg = scope_estimate()
+        new, total, nprof, nreg = scope_estimate(accts)
         todo = total if refresh else new
         if not todo:
             say("All selected profile/region pairs are already collected - the list below is up to date. Press 'Refresh selected' to collect them again.", "ok")
@@ -10483,14 +8917,14 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
             if not messagebox.askyesno("Collect clusters", f"This will search {todo} profile/region pairs and can take several minutes. Continue?"):
                 say("Collecting stopped before it started - select fewer profiles / regions.", "info")
                 return
-        ids = {a["id"] for a in accts}
         simple = [{"id": a["id"], "name": a["name"]} for a in accts]
         regions_text = region_var.get().strip() or None
         done_before = set(state["scopes"])
         cancel = threading.Event()
-        state.update(listing=True, list_cancel=cancel, list_done=0, list_total=todo, list_scope=None, list_t0=time.time(), hint_note="")
+        note = ("Skipped (credentials expired or missing - renew them outside this tool, then Re-check): " + ", ".join(a["name"] for a in skipped) + ".   ") if skipped else ""
+        state.update(listing=True, list_cancel=cancel, list_done=0, list_total=todo, list_scope=None, list_t0=time.time(), hint_note=note)
         list_bar.configure(maximum=max(1, todo), value=0)
-        say(f"Collecting clusters: {todo} profile/region pair(s) ... the list below fills in as results arrive (Stop cancels).", "info")
+        say(note + f"Collecting clusters: {todo} profile/region pair(s) ... the list below fills in as results arrive (Stop cancels).", "warn" if skipped else "info")
         update_controls()
         list_tick()
 
@@ -10505,8 +8939,8 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
                 if not refresh:
                     lookups = [x for x in lookups if x not in done_before]
                 if not lookups:
-                    msgs.put(("cdone", [], 0, False, [], {"lookups": 0, "failures": [], "profiles": [], "failed_profiles": [], "attempted": [], "ok_scopes": [],
-                                                          "noregion": list(noregion)}))
+                    msgs.put(("cdone", [], 0, False, [a["id"] for a in simple], {"lookups": 0, "failures": [], "profiles": [], "failed_profiles": [], "attempted": [], "ok_scopes": [],
+                                                                               "noregion": list(noregion)}))
                     return
                 found, failed = scan_clusters(simple, lambda l: msgs.put(("line", l)), lambda d, t: msgs.put(("lprog", d, t, stats.get("last_scope"))), cancel,
                                               lambda batch: msgs.put(("cbatch", list(batch))), stats=stats, lookups=lookups)
@@ -10565,7 +8999,7 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
         summary = scan_summary(found, stats) if stats else f"{count_of(n, 'cluster')} found in {count_of(len(scanned), 'profile')}."
         n_menu = sum(1 for t in CLI_TARGETS.values() if t.get("exe_number"))
         if LOGIN_OPTS["method"] == "exe" and n:
-            summary += f" {n_menu} in the ekslogin menu, {n - n_menu} logged in with aws eks update-kubeconfig."
+            summary += f" {n_menu} in the ekslogin menu, {n - n_menu} connected with aws eks update-kubeconfig."
         if stats.get("lookups") == 0 and not cancelled:
             cl_status.set("Nothing new to collect." if not stats.get("noregion") else "No region known for: " + ", ".join(stats["noregion"][:5]) + " - type a region in the Region(s) box.")
             say(cl_status.get(), "warn" if stats.get("noregion") else "info")
@@ -10577,19 +9011,21 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
             say(f"Listing stopped - {count_of(n, 'cluster')} found so far. Press 'Collect clusters from selected profiles' to continue (collected profile/region pairs are kept).", "warn")
         elif not n:
             cl_status.set("No clusters found.")
-            say("No EKS clusters found for the selected profile(s) and region(s). Check that the profile is signed in and has access, and type the right region(s) in the Region(s) box (or tick All regions)." + skipped, "warn")
+            say("No EKS clusters found for the selected profile(s) and region(s). Check that the profile has working credentials and access, and type the right region(s) "
+                "in the Region(s) box (or tick All regions)." + skipped, "warn")
         else:
             cl_status.set(summary + (skipped if not stats else ""))
-            say(f"{summary} Step 4: search / select the clusters, then press 'Login & Debug'." + (skipped if not stats else ""),
+            say(f"{summary} Step 3: search / select the clusters, then press 'Login & Debug'." + (skipped if not stats else ""),
                 "ok" if not (stats or {}).get("failed_profiles") and not failed else "warn")
         for prof in (stats or {}).get("expired_profiles") or []:          # expired while listing: not a generic failure
-            mark_expired(prof)
+            mark_expired(None if prof == (os.environ.get("AWS_PROFILE") or "default") and prof not in state["acct_by_id"] else prof)
         update_controls()
 
     # ---- run options, steps list
     def plan(options):
-        rows = [("login", "Login (Cloud CLI: aws)" if LOGIN_OPTS["method"] == "cli" else
-                 ("Login (ekslogin; aws for clusters not in its menu)" if is_cli() else "Login (ekslogin)")), ("context", "Select kubectl context"), ("profile", "Select AWS profile (~/.aws)")]
+        rows = [("login", "Log in with ekslogin (aws eks update-kubeconfig for clusters that are not in its menu)" if LOGIN_OPTS["method"] == "exe" else
+                 "Write kubeconfig entry (aws eks update-kubeconfig, existing credentials)"),
+                ("context", "Select kubectl context"), ("profile", "Select AWS profile (~/.aws)")]
         rows += [(k, t) for k, t, _ in run_steps(options)] + [("report", "Write HTML report")]
         return rows
 
@@ -10626,39 +9062,35 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
         stripe_tree(run_tree)
 
     def sync_login_opts():
-        """Read the login method and the chosen profile (and region) into the options a run (or a cluster listing) uses."""
-        LOGIN_OPTS["method"] = "cli" if method_combo.get() == LOGIN_LABELS["cli"] else "exe"
-        LOGIN_OPTS["device_code"] = device_var.get()
-        LOGIN_OPTS["signin"] = _SESSION["signin"] = SIGNIN_KEYS.get(signin_var.get(), "manual")        # remembered for the session
+        """Read the connection method and the chosen profile (and region) into the options a run (or a cluster listing) uses."""
+        LOGIN_OPTS["method"] = "exe" if method_combo.get() == LOGIN_LABELS["exe"] else "cli"
         LOGIN_OPTS["source"] = "all" if LOGIN_OPTS["method"] == "cli" else source_var.get()
         picked = state["acct_chosen"] if scope_var.get() == "sel" else set()
         if state["pre"] or not ACCOUNT0:      # keep the command-line value until the list has been read
-            AWS_OPTS["profile"] = next(iter(picked)) if len(picked) == 1 else None
+            only = next(iter(picked)) if len(picked) == 1 else None
+            AWS_OPTS["profile"] = state["acct_by_id"][only]["id"] if only in state["acct_by_id"] else None
         AWS_OPTS["region"] = (region_var.get().strip() or None) if is_cli() else region0
 
     def reset_listing():
-        """The cluster list (and the sign-in state) start again after the login method or the list source changed."""
-        state.update(crows=[], by_key={}, cchosen=set(), clusters={}, listed=set(), scopes=set(), checking=False, signing=False)
+        """The cluster list starts again after the connection method or the list source changed."""
+        state.update(crows=[], by_key={}, cchosen=set(), clusters={}, listed=set(), scopes=set())
         manual_var.set("")
         sync_login_opts()
         apply_method_ui()
         update_controls()
         rebuild_cluster_list()
         reset_steps()
-        if is_cli():
-            check_status()
-        else:
+        if not is_cli():
             load_clusters()
-        if not (is_cli() and NEED_SIGNIN):
-            load_accounts_async()
+        load_accounts_async()
 
     def on_method_change(_event=None):
         if state["busy"] or state["listing"]:
             method_combo.set(LOGIN_LABELS[LOGIN_OPTS["method"]])
-            status.set("Wait for the current run / listing to finish (or press Stop) before changing the login method.")
+            status.set("Wait for the current run / listing to finish (or press Stop) before changing how to connect.")
             return
         if method_combo.get() == LOGIN_LABELS["exe"] and not state["src_user"]:
-            source_var.set(default_source())                     # not chosen by the user: the default is 'all' when aws is installed
+            source_var.set(default_source())
         reset_listing()
 
     def on_source_change(_event=None):
@@ -10667,8 +9099,6 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
             status.set("Wait for the current run / listing to finish (or press Stop) before changing the cluster list source.")
             return
         state["src_user"] = True
-        state["fell_back"] = False
-        state["fb_msg"] = ""
         reset_listing()
 
     def start():
@@ -10678,14 +9108,14 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
             status.set("Wait for the cluster listing to finish (or press Stop).")
             return
         sync_login_opts()
-        if is_cli() and state["auth"]["state"] != "ok":
-            say("Sign in first (step 2): press 'Sign in', or 'Check status' if you already signed in.", "warn")
-            status.set("Not signed in - see step 2.")
-            return
+        if is_cli():
+            blocked = blocked_selected()
+            if blocked:
+                say(renew_text(blocked), "err")          # a cluster of such a profile is marked 'credentials expired'; the others still run
         selected = chosen_clusters()
         if not selected:
             status.set("Select at least one cluster in the list (or type numbers like 1,3).")
-            say("Select at least one cluster in step 4 (or type numbers like 1,3), then press 'Login & Debug'.", "warn")
+            say("Select at least one cluster in step 3 (or type numbers like 1,3), then press 'Login & Debug'.", "warn")
             return
         try:
             minutes = max(1, int(minutes_var.get()))
@@ -10769,19 +9199,18 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
                     write(msg[1])
                 elif kind == "say":
                     say(msg[1], msg[2])
-                elif kind == "dc":
-                    handle_dc(msg)
                 elif kind == "acct_status":
                     set_acct_status(msg[1], msg[2])
                 elif kind == "acct_status_done":
-                    state["status_checking"] = False
-                    refresh_dd()
-                    update_controls()
-                elif kind == "auth":
-                    apply_auth(msg[1], msg[2])
-                    run_pending()
+                    if msg[1] == state["status_gen"]:
+                        state["status_checking"] = False
+                        acct_status.set("Credentials checked: " + status_summary() + ".")
+                        blocked = blocked_selected()
+                        if blocked:
+                            say(renew_text(blocked), "err")
+                        update_controls()
                 elif kind == "accounts":
-                    on_accounts(msg[1], msg[2])
+                    on_accounts(msg[1], msg[2], msg[3] if len(msg) > 3 else None)
                 elif kind == "allreg":
                     state["all_regions"] = msg[1]
                     update_estimate()
@@ -10849,10 +9278,7 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
                     update_controls()
                     if msg[1]:
                         cl_status.set(f"{len(msg[1])} cluster(s) from ekslogin.")
-                        if state.get("fb_msg") and state["fell_back"] and not state["src_user"]:
-                            say(state["fb_msg"], "warn")           # keep the explanation of the automatic fall-back visible
-                        else:
-                            say(f"{len(msg[1])} cluster(s) found. Select one or more in step 4, then press 'Login & Debug'.", "ok")
+                        say(f"{len(msg[1])} cluster(s) found. Select one or more in step 3, then press 'Login & Debug'.", "ok")
                         status.set(f"{len(msg[1])} cluster(s) found. Select one or more, then press Login & Debug.")
                     else:
                         cl_status.set("No clusters.")
@@ -10863,11 +9289,7 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
                     ok = [r for r in results["items"] if r["html"]]
                     state["html"] = results["index"] or (ok[0]["html"] if ok else None)
                     if LOGIN_OPTS["method"] == "exe":
-                        load_accounts_async(force=True)          # ekslogin may have created / refreshed the profiles
-                        if state["fell_back"] and not state["src_user"] and LOGIN_OPTS.get("source") == "menu":
-                            state["fell_back"] = False           # the login may have signed aws in: try the full list again
-                            source_var.set("all")
-                            reset_listing()
+                        load_accounts_async(force=True)          # ekslogin may have created / refreshed the profiles: read ~/.aws again and re-check the credentials
                     progress_bar.configure(value=state["total"])
                     if state["html"]:
                         open_btn.state(["!disabled"])
@@ -10908,11 +9330,9 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
     folder_btn.configure(command=open_folder)
     select_all_btn.configure(command=select_all)
     clear_btn.configure(command=clear_selection)
-    signin_btn.configure(command=sign_in)
-    def recheck(_event=None):
-        check_status()
-        check_all_accounts()
-    check_btn.configure(command=recheck)
+    check_btn.configure(command=check_selected)
+    recheck_all_btn.configure(command=check_all_accounts)
+    renew_copy_btn.configure(command=copy_renew_command)
     acct_all_btn.configure(command=acct_select_all)
     acct_clear_btn.configure(command=acct_clear)
     acct_reload_btn.configure(command=lambda: load_accounts_async(force=True))
@@ -10927,39 +9347,7 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
     method_combo.bind("<<ComboboxSelected>>", on_method_change)
     source_all_rb.configure(command=lambda: on_source_change())
     source_menu_rb.configure(command=lambda: on_source_change())
-    device_var.trace_add("write", lambda *_: sync_login_opts())
-    profile_combo.bind("<<ComboboxSelected>>", on_profile_commit)
-    profile_combo.bind("<Return>", on_profile_commit)
-    profile_var.trace_add("write", show_profile_hint)
-    use_btn.configure(command=on_profile_commit)
-    switch_btn.configure(command=on_switch_account)
-    dc_cancel_btn.configure(command=dc_cancel)
-    dc_retry_btn.configure(command=dc_retry_nobrowser)
-    dc_console_btn.configure(command=dc_console)
-    dc_copycmd_btn.configure(command=dc_copy_command)
-    dc_recheck_btn.configure(command=dc_recheck)
-    dc_raw_toggle.configure(command=lambda: dc_raw_set_open(not dc["raw_open"]))
-    cli_test_btn.configure(command=cli_test)
-    man_verify_btn.configure(command=man_verify)
-    man_stop_btn.configure(command=lambda: man_stop())
-    for _k, _b in man_inst_copy.items():
-        _b.configure(command=lambda k=_k: (root.clipboard_clear(), root.clipboard_append(man_inst_vars[k].get()), status.set("Copied: " + man_inst_vars[k].get())))
-    man_term_btn.configure(command=man_terminal)
-    for _k, _b in man_copy_btns.items():
-        _b.configure(command=lambda k=_k: man_copy(k))
-    signin_combo.bind("<<ComboboxSelected>>", lambda e: (sync_login_opts(), update_controls()))
-    dc_open_btn.configure(command=dc_open)
-    dc_copy_url_btn.configure(command=lambda: dc_copy("url"))
-    dc_copy_code_btn.configure(command=lambda: dc_copy("code"))
-    dc_url_label.bind("<Button-1>", lambda e: dc_open())
     state["active_profile"] = ACCOUNT0 or _SESSION.get("profile") or None
-    dd_btn.configure(command=toggle_dd)
-    dd_all_btn.configure(command=check_all_accounts)
-    dd_filter.trace_add("write", lambda *_: refresh_dd())
-    dd_tree.bind("<ButtonRelease-1>", lambda e: dd_pick())
-    dd_tree.bind("<Return>", lambda e: dd_pick())
-    profile_combo.bind("<KeyRelease>", filter_combo)
-    refresh_profile_choices()
     state["src_user"] = LOGIN_OPTS.get("source") in ("all", "menu")      # given on the command line (--all-clusters) = the user's choice
     LOGIN_OPTS["source"] = "all" if LOGIN_OPTS["method"] == "cli" else (LOGIN_OPTS.get("source") or default_source())
     source_var.set(LOGIN_OPTS["source"])
@@ -10972,39 +9360,26 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
                 alllogs_var=alllogs_var, ns_var=ns_var, load_profiles=lambda: load_accounts_async(force=True),
                 select_all_btn=select_all_btn, clear_btn=clear_btn, filter_var=filter_var, manual_var=manual_var,
                 run_tree=run_tree, sel_text=sel_text, chosen_clusters=chosen_clusters,
-                method_combo=method_combo, device_var=device_var, on_method_change=on_method_change,
+                method_combo=method_combo, method_info=method_info, on_method_change=on_method_change,
                 acct_tree=acct_tree, acct_filter=acct_filter, acct_count=acct_count, cl_count=cl_count, scope_var=scope_var,
-                acct_all_btn=acct_all_btn, acct_clear_btn=acct_clear_btn, acct_reload_btn=acct_reload_btn, refresh_btn=refresh_btn, acct_sel=acct_sel, collect_btn=collect_btn, refresh_sel_btn=refresh_sel_btn, list_stop_btn=list_stop_btn, allreg_var=allreg_var, allreg_chk=allreg_chk,
+                acct_all_btn=acct_all_btn, acct_clear_btn=acct_clear_btn, acct_reload_btn=acct_reload_btn, refresh_btn=refresh_btn, acct_sel=acct_sel,
+                collect_btn=collect_btn, refresh_sel_btn=refresh_sel_btn, list_stop_btn=list_stop_btn, allreg_var=allreg_var, allreg_chk=allreg_chk,
                 est_var=est_var, collect_clusters=collect_clusters, scope_estimate=scope_estimate,
-                signin_btn=signin_btn, check_btn=check_btn, auth_badge=auth_badge, auth_msg=auth_msg, guide_msg=guide_msg,
-                acct_status=acct_status, cl_status=cl_status, method_info=method_info, search_icon=SEARCH_ICON,
-                s3=s3, s4=s4, list_bar=list_bar, acct_search=acct_search, cl_search=cl_search, scope_all_rb=scope_all_rb,
-                scope_sel_rb=scope_sel_rb, check_status=check_status, sign_in=sign_in, load_clusters=load_clusters,
+                check_btn=check_btn, recheck_all_btn=recheck_all_btn, check_selected=check_selected, check_all_accounts=check_all_accounts,
+                renew_box=renew_box, renew_var=renew_var, renew_copy_btn=renew_copy_btn, update_renew_box=update_renew_box, uses_note=uses_note,
+                guide_msg=guide_msg, acct_status=acct_status, cl_status=cl_status, search_icon=SEARCH_ICON,
+                s2=s2, s3=s3, s4=s4, list_bar=list_bar, acct_search=acct_search, cl_search=cl_search, scope_all_rb=scope_all_rb,
+                scope_sel_rb=scope_sel_rb, load_clusters=load_clusters, mark_expired=mark_expired, status_of=status_of, set_acct_status=set_acct_status,
                 source_var=source_var, source_all_rb=source_all_rb, source_menu_rb=source_menu_rb, on_source_change=lambda: on_source_change(),
-                region_hint=region_hint, profile_var=profile_var, profile_combo=profile_combo, switch_btn=switch_btn, use_btn=use_btn,
-                active_var=active_var, profile_hint_var=profile_hint_var, dc_panel=dc_panel, dc_url_label=dc_url_label, dc_code_label=dc_code_label,
-                dc_open_btn=dc_open_btn, dc_copy_url_btn=dc_copy_url_btn, dc_copy_code_btn=dc_copy_code_btn, dc_cancel_btn=dc_cancel_btn,
-                dc_chip=dc_chip, dc_count_var=dc_count_var, dc_result_var=dc_result_var, dc_raw_var=dc_raw_var, dc_profile_var=dc_profile_var,
-                dc=dc, dc_tick=dc_tick, dd_btn=dd_btn, signin_var=signin_var, signin_combo=signin_combo, cli_test_btn=cli_test_btn, cli_test=cli_test,
-                dc_raw_text=dc_raw_text, dc_raw_toggle=dc_raw_toggle, dc_raw_wrap=dc_raw_wrap, dc_nourl=dc_nourl, dc_nourl_var=dc_nourl_var, dc_retry_btn=dc_retry_btn,
-                dc_console_btn=dc_console_btn, dc_copycmd_btn=dc_copycmd_btn, dc_recheck_btn=dc_recheck_btn, dc_note_var=dc_note_var, sync_login_opts=sync_login_opts,
-                man=man, man_panel=man_panel, man_cli_var=man_cli_var, man_cli_lbl=man_cli_lbl, man_inst=man_inst, man_inst_vars=man_inst_vars, man_inst_copy=man_inst_copy, man_cmd_vars=man_cmd_vars, man_entries=man_entries, man_copy_btns=man_copy_btns, man_verify_btn=man_verify_btn,
-                man_stop_btn=man_stop_btn, man_term_btn=man_term_btn, man_status_var=man_status_var, man_msg_var=man_msg_var, man_result_var=man_result_var,
-                man_chip=man_chip, man_form=man_form, man_open=man_open, man_tick=man_tick, man_verify=man_verify, man_stop=man_stop, man_terminal=man_terminal,
-                dc_retry=dc_retry_nobrowser, dc_console=dc_console, dc_copy_command=dc_copy_command, dc_recheck=dc_recheck, dd_tree=dd_tree, dd_frame=dd_frame, dd_filter=dd_filter, dd_all_btn=dd_all_btn, acct_chip=acct_chip,
-                recheck=recheck, mark_expired=mark_expired, refresh_dd=refresh_dd, check_all_accounts=check_all_accounts, dd_pick=dd_pick, toggle_dd=toggle_dd,
-                filter_combo=filter_combo, start_status_checks=start_status_checks, device_chk=device_chk, switch_profile=switch_profile, dc_copy=dc_copy, dc_open=dc_open, dc_cancel=dc_cancel)
+                region_hint=region_hint, sync_login_opts=sync_login_opts, start_status_checks=start_status_checks, status_summary=status_summary)
     _GUI.update(ro_note=ro_note, region_var=region_var, banner=banner, banner_sub=banner_sub, notebook=nb, tab_clusters=tab_clusters, tab_collect=tab_collect, tab_run=tab_run,
                 section_vars=section_vars, section_checks=section_checks, sec_count=sec_count, sec_note=sec_note, sec_card=sec_card,
                 sec_all_btn=sec_all_btn, sec_none_btn=sec_none_btn, sec_net_btn=sec_net_btn, sec_nonet_btn=sec_nonet_btn,
                 selected_sections=selected_sections, set_sections=set_sections, run_chip=run_chip, tasks_var=tasks_var, footer=bottom,
                 action_bar=top, minutes_var=minutes_var, alllogs_chk=alllogs_chk, ns_entry=ns_entry, section_widgets=section_widgets)
-    if is_cli():
-        check_status()
-    else:
+    if not is_cli():
         load_clusters()
-    if not (is_cli() and NEED_SIGNIN):
-        load_accounts_async()
+    load_accounts_async()
     poll()
     root.mainloop()
 
@@ -11012,27 +9387,6 @@ def run_gui(default_minutes, skip_login=False, context=None, sections=None):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
-def sign_in_only(profile):
-    """--sign-in-only: run the sign-in for the profile (URL + code box on screen), then show who is signed in. Returns the exit code."""
-    if not shutil.which("aws"):
-        print("ERROR: the AWS CLI (aws) was not found on PATH - install it from https://aws.amazon.com/cli/", file=sys.stderr)
-        return 1
-    login_name, why = _aws_login_plan(profile or _aws_check_profile(None))
-    if _use_manual_signin():
-        shown = login_name or profile or _aws_check_profile(None)
-        return 0 if manual_signin_cli(shown, profile or shown, lambda l: print(l, flush=True), reason=why or None) else 1
-    if not login_name:
-        print("ERROR: " + why, file=sys.stderr)
-        return 1
-    res = run_sso_login(login_name, LOGIN_OPTS["device_code"], lambda l: print(l, flush=True), **_login_kwargs())
-    if not res["ok"]:
-        print("Sign-in failed: " + (res.get("error") or "unknown error"), file=sys.stderr)
-        return 1
-    st = login_status(profile or login_name)
-    print(("Signed in as " + st["who"]) if st["state"] == "ok" else "Sign-in finished, but no working credentials were found: " + (st.get("detail") or ""))
-    return 0 if st["state"] == "ok" else 1
-
 
 def resolve_cli_sections(args):
     """The sections the command line asks for: None = all, else a list of ids. Raises ValueError with a clear message."""
@@ -11075,36 +9429,32 @@ def _cli_progress(key, status, secs):
 
 def main():
     global LOOKBACK_MINUTES, EKSLOGIN_EXE, LOG_TAIL_LINES, SUPPORT_LABEL, TRAFFIC_SAMPLE_SECONDS, PARALLEL_WORKERS
-    parser = argparse.ArgumentParser(description="EKS debugger: log in, then show what happened in the last N minutes")
+    parser = argparse.ArgumentParser(description="EKS debugger: uses the AWS credentials that already exist in ~/.aws (no sign-in in this tool), connects to the chosen "
+                                                 "clusters and shows what happened in the last N minutes")
     parser.add_argument("--minutes", type=int, default=None, help=f"time window in minutes (default {LOOKBACK_MINUTES})")
-    parser.add_argument("--cluster", help="cluster number(s) or name to log in to and debug (no GUI): 3 | 1,3,5 | 2-4 | all | my-cluster. "
+    parser.add_argument("--cluster", help="cluster number(s) or name to debug (no GUI), numbered as in --list: 3 | 1,3,5 | 2-4 | all | my-cluster. "
                                           "Several clusters run one after another and get a combined summary page")
     parser.add_argument("--name", help="label for the report when ONE cluster is given with --cluster (default: from the cluster list)")
-    parser.add_argument("--list", action="store_true", help="print the clusters ekslogin offers (with --all-clusters or --login-method cli: every cluster aws can see - name, region, account / profile) and exit")
+    parser.add_argument("--list", action="store_true", help="collect and print the clusters of --profile (a | a,b,c | all) x --region (r | r1,r2 | all): number, name, region, account / profile; "
+                                                            "with --connect ekslogin and no --all-clusters: the clusters the ekslogin menu offers. Exits 1 when the credentials of every profile are expired / missing")
     parser.add_argument("--all-clusters", action="store_true",
-                        help="list / select among EVERY cluster the signed-in user can access, read with the aws CLI from all profiles in ~/.aws x all regions "
-                             "(or the regions of --region); with the custom login, clusters that are not in the ekslogin menu are logged in with aws eks update-kubeconfig")
-    parser.add_argument("--skip-login", action="store_true", help="don't run ekslogin; use the current kubectl context")
-    parser.add_argument("--ekslogin", help="path to ekslogin.exe")
+                        help="with --connect ekslogin: list the clusters found with aws (selected profiles x regions) instead of the ekslogin menu; clusters that are not in the "
+                             "menu are connected with aws eks update-kubeconfig. (With the default connection this is what --list does anyway.)")
+    parser.add_argument("--skip-login", "--skip-kubeconfig", dest="skip_login", action="store_true",
+                        help="don't run ekslogin and don't write the kubeconfig entry; use the current kubectl context as it is")
+    parser.add_argument("--ekslogin", help="path to ekslogin.exe (only used with --connect ekslogin)")
     parser.add_argument("--no-gui", action="store_true", help="never open the GUI")
-    parser.add_argument("--login-method", choices=["exe", "cli"], default="exe",
-                        help="how to log in: exe = the custom ekslogin.exe (default); cli = the standard AWS CLI (aws) - then --list / --cluster use the cluster list read from aws")
-    parser.add_argument("--device-code", action=argparse.BooleanOptionalAction, default=True,
-                        help="sign in with a device code (aws sso login --use-device-code): the URL and the code are printed in a box / shown in the "
-                             "window (default). --no-device-code uses the browser flow instead")
-    parser.add_argument("--signin-method", choices=["manual", "captured", "console"], default=default_signin_method(),
-                        help="how a sign-in is done: manual (default) = the exact commands are printed, you run one in your own terminal and press Enter, then the tool verifies "
-                             "with aws sts get-caller-identity; captured = the tool runs aws sso login and prints the URL and code in a box (--device-code / --no-device-code "
-                             "apply); console = aws sso login in its own console window")
-    parser.add_argument("--sign-in-only", action="store_true",
-                        help="only sign in (see --signin-method; the manual commands are printed by default) and exit; shows who you are signed in as")
+    parser.add_argument("--connect", choices=["creds", "ekslogin"], default=None,
+                        help="how to connect to a cluster: creds = use the credentials that already exist in ~/.aws, no sign-in (default); ekslogin = run your own ekslogin.exe "
+                             "first (the cluster number is its menu number), then ~/.aws is re-read")
+    parser.add_argument("--login-method", choices=["exe", "cli"], default=None, help=argparse.SUPPRESS)      # older spelling of --connect (exe = ekslogin, cli = creds)
     parser.add_argument("--aws-cluster", help="EKS cluster name for the AWS checks (default: read from kubeconfig)")
     parser.add_argument("--region", help="AWS region for the AWS checks (default: read from kubeconfig). For --list / --all-clusters: a region, several (r1,r2) or 'all' to search")
-    parser.add_argument("--profile", help="AWS profile (from ~/.aws) to use for the AWS checks. Default: chosen automatically after login. For --list: several profiles "
-                                          "(a,b,c) or 'all' to search them for clusters - nothing is scanned unless you name the scope")
+    parser.add_argument("--profile", help="AWS profile (from ~/.aws) whose existing credentials are used (default: what the aws CLI would use - AWS_PROFILE, [default] or the AWS_* variables). "
+                                          "For --list / --cluster: several profiles (a,b,c) or 'all' to search them for clusters - nothing is scanned unless you name the scope")
     parser.add_argument("--context", help="kubectl context to use (default: matched from the selected cluster)")
     parser.add_argument("--list-profiles", action="store_true", help="list the AWS profiles found in ~/.aws and exit")
-    parser.add_argument("--list-accounts", action="store_true", help="list the accounts (profiles in ~/.aws) with their sign-in status (Active / Expiring soon / Credentials expired / Not signed in) and exit")
+    parser.add_argument("--list-accounts", action="store_true", help="list the AWS profiles of ~/.aws (plus the environment / default credentials) with their credentials status (Active / Expiring soon / Expired / Not configured / Unknown) and exit")
     parser.add_argument("--open", action="store_true", help="open the HTML report in your browser when done")
     parser.add_argument("--no-logs", action="store_true", help="skip pulling pod logs; alias for --skip-sections logs")
     parser.add_argument("--logs-all", action="store_true", help="also read logs of ALL running pods (capped), not just unhealthy / warning / core add-on pods")
@@ -11114,7 +9464,7 @@ def main():
                         help=f"seconds to sample live pod/node traffic from the kubelet (default {TRAFFIC_SAMPLE_SECONDS}, 0 = skip)")
     parser.add_argument("--no-aws", action="store_true", help="skip the AWS CLI section (kubectl data only); alias for --skip-sections aws")
     parser.add_argument("--workers", type=int, default=None,
-                        help=f"collection tasks that run at the same time after the login (default {PARALLEL_WORKERS}; 1 = one after another, exactly as before). "
+                        help=f"collection tasks that run at the same time after the kubeconfig step (default {PARALLEL_WORKERS}; 1 = one after another, exactly as before). "
                              f"At most {KUBECTL_CONCURRENCY} kubectl and {AWS_CONCURRENCY} aws calls run at the same moment")
     parser.add_argument("--sections", default=None, help="collect only these report sections (comma separated ids; see --list-sections). The overview is always collected")
     parser.add_argument("--skip-sections", default=None, help="do not collect these sections (comma separated ids; see --list-sections)")
@@ -11150,14 +9500,12 @@ def main():
         sys.stdout.reconfigure(errors="replace")
     except Exception:
         pass
-    LOGIN_OPTS.update(method=args.login_method, device_code=args.device_code, signin=args.signin_method, source="all" if args.all_clusters else None, all_clusters=args.all_clusters)
+    connect = args.connect or ({"exe": "ekslogin", "cli": "creds"}.get(args.login_method) if args.login_method else "creds")
+    LOGIN_OPTS.update(method="exe" if connect == "ekslogin" else "cli", source="all" if args.all_clusters else None, all_clusters=args.all_clusters)
 
     if args.list_accounts:
         print_accounts()
         return
-
-    if args.sign_in_only:
-        sys.exit(sign_in_only(args.profile))
 
     if args.list_profiles:
         found = list_aws_profiles()
@@ -11174,16 +9522,20 @@ def main():
         if not clusters:
             print("No clusters found (see the messages above)." if _lists_via_cli() else
                   "No clusters found (could not parse the ekslogin menu). Create clusters.json: {\"1\": \"name\", ...}")
+            if PREFLIGHT["blocked"] and not PREFLIGHT["usable"]:
+                sys.exit(1)
         for k, v in sorted(clusters.items(), key=lambda kv: int(kv[0])):
             t = CLI_TARGETS.get(k) if _lists_via_cli() else None
             extra = ""
             if t:
-                extra = f"   [account {t.get('account_id') or '?'}, profile {t.get('profile') or '(default credentials)'}" + (f", login: {t['via']}" if LOGIN_OPTS["method"] == "exe" else "") + "]"
+                extra = f"   [account {t.get('account_id') or '?'}, profile {t.get('profile') or '(default credentials)'}" + (f", connect: {t['via']}" if LOGIN_OPTS["method"] == "exe" else "") + "]"
             print(f"{k} - {v}{extra}")
         return
 
     if args.cluster or args.skip_login and args.no_gui:
-        known = list_selected_clusters(lambda l: print(l, flush=True))
+        known = {} if (args.skip_login and not args.cluster) else list_selected_clusters(lambda l: print(l, flush=True))
+        if not known and PREFLIGHT["blocked"] and not PREFLIGHT["usable"]:
+            sys.exit(1)                 # every profile in scope has expired / missing credentials: the renew message was printed above
         selected = parse_cluster_selection(args.cluster or "0", known)
         if not selected:
             print("ERROR: no valid cluster in --cluster (use a number such as 3, 1,3,5, 2-4, all, or a cluster name from --list).", file=sys.stderr)
