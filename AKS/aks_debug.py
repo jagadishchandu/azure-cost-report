@@ -14,6 +14,8 @@ happened (and what is happening) in the last N minutes, and save it as an intera
     python aks_debug.py --list-subscriptions                # show the Azure subscriptions `az` can see
 
 Everything is READ-ONLY (kubectl get / top / logs, and az show / list / metrics / log-analytics query).
+The one opt-in exception is the "Privileged roles (PIM)" tab (4th tab; also --pim-list / --pim-activate-all): it lists the roles you hold through
+Privileged Identity Management and, only after you confirm, submits SELF-ACTIVATION requests for your own eligible roles. See the README.
 
 What is collected
     * Cluster: context, versions, API server readiness
@@ -30,7 +32,7 @@ What is collected
 
 Login methods (--login-method)
     exe (default)  the custom akslogin.exe wrapper, as before.
-    cli            the standard Azure CLI (`az`): signs in if needed (device code with --device-code), lists the
+    cli            the standard Azure CLI (`az`): signs in if needed (device code by default; --no-device-code = browser), lists the
                    clusters, and writes the kubeconfig entry for each selected cluster. Everything after the login
                    (context, cloud details, report) is the same. See the README, section "Login methods".
     e.g.  python aks_debug.py --login-method cli --subscription <id> --cluster all
@@ -51,6 +53,7 @@ import sys
 import threading
 import time
 import types
+import uuid
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -147,7 +150,7 @@ ICONS = {
     "bell": ("\U0001F514", "E"), "gear": ("⚙", "W"), "scale": ("\U0001F4C8", "A"), "trophy": ("\U0001F3C6", "T"), "log": ("\U0001F4DC", "L"),
     "clock": ("\U0001F552", "t"), "folder": ("\U0001F4C1", "/"), "layers": ("\U0001F9E9", "+"), "pending": ("○", "o"), "skip": ("➖", "-"),
     "crit": ("\U0001F534", "C"), "high": ("\U0001F7E0", "H"), "med": ("\U0001F7E1", "M"), "info": ("\U0001F535", "I"),
-    "speed": ("⚡", "~"), "list": ("\U0001F4CB", "="),
+    "speed": ("⚡", "~"), "list": ("\U0001F4CB", "="), "shield": ("\U0001F6E1", "S"),
 }
 _ICON_PLAIN = [False]
 
@@ -535,12 +538,12 @@ KUBECTL_FORBIDDEN_RAW_SEGMENTS = ("exec", "attach", "portforward")           # `
 # Every cloud command the report uses. EVERYTHING else is refused. (Only read verbs: list / show / get-upgrades / query.)
 READ_ONLY_CLOUD_COMMANDS = {
     "az": (
-        ("account", "list"), ("account", "show"), ("extension", "list"), ("graph", "query"),
+        ("account", "list"), ("account", "show"), ("account", "get-access-token"), ("extension", "list"), ("graph", "query"),
         ("aks", "list"), ("aks", "show"), ("aks", "get-upgrades"),
         ("network", "vnet", "subnet", "show"), ("network", "nsg", "show"), ("network", "nsg", "list"),
         ("network", "public-ip", "show"), ("network", "public-ip", "list"), ("network", "route-table", "show"),
         ("network", "lb", "list"), ("network", "nat", "gateway", "list"), ("network", "watcher", "flow-log", "list"), ("network", "firewall", "list"),
-        ("role", "assignment", "list"), ("vmss", "list"), ("vmss", "list-instances"),
+        ("role", "assignment", "list"), ("ad", "signed-in-user", "show"), ("vmss", "list"), ("vmss", "list-instances"),
         ("monitor", "diagnostic-settings", "list"), ("monitor", "metrics", "list"), ("monitor", "activity-log", "list"),
         ("monitor", "log-analytics", "workspace", "show"), ("monitor", "log-analytics", "query"),
     ),
@@ -549,12 +552,14 @@ CLOUD_FORBIDDEN_FLAGS = ("--yes", "-y", "--no-wait", "--set", "--add", "--remove
 # The ONLY commands that are not reads. All are LOCAL-ONLY (they write the local kubeconfig file / the CLI's own sign-in state, never the
 # cluster or the cloud account), run with fixed argument shapes, and are checked by assert_local_only_command() / assert_read_only_kubectl().
 LOCAL_ONLY_COMMANDS = (
-    "az login [--use-device-code]                                  (interactive user sign-in; local CLI token cache)",
+    "az login [--use-device-code] [--tenant T] [-o none] [--only-show-errors]   (interactive user sign-in; local CLI token cache; nothing else)",
     "az aks get-credentials --resource-group --name [--subscription] --overwrite-existing   (writes the LOCAL kubeconfig file only)",
     "kubelogin convert-kubeconfig -l azurecli                      (rewrites the LOCAL kubeconfig file only)",
     "kubectl config use-context <name>                             (switches the context in the LOCAL kubeconfig file only)",
     "akslogin.exe                                                  (your organisation's sign-in tool; sign-in only, started when you choose it)",
+    "powershell -NoExit -Command \"az login [--use-device-code] [--tenant T]\"   ('Open a terminal for me': a visible window YOU asked for; exactly these az login forms and nothing else)",
 )
+LOCAL_INFO_COMMANDS = ("az --version",)      # prints the installed version of the Azure CLI (shown in the 'Azure CLI installed?' line); changes nothing
 # Dynamic extension install would put software on this machine the first time `az graph` etc. is used: switched off for every az process
 # through the environment (never with `az config set`).
 AZ_SAFE_ENV = {"AZURE_EXTENSION_USE_DYNAMIC_INSTALL": "no", "AZURE_EXTENSION_DYNAMIC_INSTALL_ALLOW_PREVIEW": "false"}
@@ -569,6 +574,7 @@ class _ReadOnlyGuard:
         self.reads = 0
         self.local = 0
         self.blocked = []        # (time, tool, command text, reason)
+        self.pim = []            # PIM self-activation requests SENT this session (the one opt-in exception): dicts {time, type, name, scope, minutes}
 
     def read(self):
         with self._lock:
@@ -577,6 +583,10 @@ class _ReadOnlyGuard:
     def local_only(self):
         with self._lock:
             self.local += 1
+
+    def pim_record(self, entry):
+        with self._lock:
+            self.pim.append(dict(entry))
 
     def block(self, tool, cmd, reason):
         text = " ".join(str(x) for x in cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
@@ -590,15 +600,19 @@ class _ReadOnlyGuard:
     def since(self, mark):
         """Counts since mark(): {"reads", "local", "blocked": [...]}."""
         with self._lock:
-            return {"reads": self.reads - mark[0], "local": self.local - mark[1], "blocked": list(self.blocked[mark[2]:])}
+            return {"reads": self.reads - mark[0], "local": self.local - mark[1], "blocked": list(self.blocked[mark[2]:]), "pim": list(self.pim)}
 
     def reset(self):
         with self._lock:
             self.reads = self.local = 0
             self.blocked = []
+            self.pim = []
 
 
 GUARD = _ReadOnlyGuard()
+
+
+TENANT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")     # a tenant id (GUID) or domain name for `az login --tenant`
 
 
 def _blocked_message(what):
@@ -678,6 +692,8 @@ def assert_read_only_cloud(tool, args):
     words = _cloud_words(args)
     if words not in READ_ONLY_CLOUD_COMMANDS.get(tool, ()):
         raise ReadOnlyViolation(_blocked_message(" ".join(words) if words else (args[0] if args else "(none)")))
+    if tool == "az" and words == ("account", "get-access-token"):
+        return _assert_token_expiry_args(args)          # only the expiry time may be queried - never the token itself
     for tok in args[len(words):]:
         hit = _flag_hit(tok, CLOUD_FORBIDDEN_FLAGS)
         if hit:
@@ -693,7 +709,19 @@ def assert_local_only_command(cmd):
     args = list(cmd[1:])
     if os.path.normcase(os.path.normpath(cmd[0])) == os.path.normcase(os.path.normpath(AKSLOGIN_EXE)) and not args:
         return "local"
-    if exe == "az" and args and args[0].lower() == "login" and all(a == "--use-device-code" for a in args[1:]):
+    if exe == "az" and args and args[0].lower() == "login":
+        # exactly: az login [--use-device-code] [--tenant <id or domain>] [-o none] [--only-show-errors]   (no service principal, identity, password ...)
+        j = 1
+        while j < len(args):
+            a = args[j]
+            if a in ("--use-device-code", "--only-show-errors"):
+                j += 1
+            elif a == "--tenant" and j + 1 < len(args) and TENANT_RE.match(args[j + 1]):
+                j += 2
+            elif a in ("-o", "--output") and j + 1 < len(args) and args[j + 1].lower() == "none":
+                j += 2
+            else:
+                raise ReadOnlyViolation(_blocked_message("az login " + a))
         return "local"
     if exe == "az" and [a.lower() for a in args[:2]] == ["aks", "get-credentials"]:
         j, rest = 0, args[2:]
@@ -708,6 +736,15 @@ def assert_local_only_command(cmd):
     if exe == "kubelogin" and args == ["convert-kubeconfig", "-l", "azurecli"]:
         return "local"
     raise ReadOnlyViolation(_blocked_message(" ".join([exe, *args[:3]]).strip()))
+
+
+def assert_local_info(cmd):
+    """The one local information command (`az --version`: the first line is shown in the 'Azure CLI installed?' line). Raises ReadOnlyViolation otherwise."""
+    if not isinstance(cmd, (list, tuple)) or len(cmd) != 2 or not all(isinstance(a, str) for a in cmd):
+        raise ReadOnlyViolation(_blocked_message("(malformed command)"))
+    if os.path.splitext(os.path.basename(cmd[0]))[0].lower() == "az" and cmd[1] == "--version":
+        return "read"
+    raise ReadOnlyViolation(_blocked_message(" ".join(cmd[:3])))
 
 
 def _az_env():
@@ -729,6 +766,13 @@ def guard_lines(info):
     else:
         lines.append("Allowed: kubectl get / logs / top / version / config (read) / api-resources / api-versions / cluster-info / explain / auth can-i; "
                      "az list / show / get-upgrades / query / metrics list / log-analytics query only.")
+    lines.append(PIM_EXCEPTION_STATEMENT)
+    pim = info.get("pim") or []
+    if pim:
+        lines.append(f"Privileged roles (PIM) activations requested in this session: {len(pim)} (your own eligible roles, after you confirmed; none came from this report run):")
+        lines += [f"  {x['time']}  {x['type']}  {x['name']}  ({x['scope']})  for {pim_duration_text(x['minutes'])}" for x in pim]
+    else:
+        lines.append("Privileged roles (PIM) activations requested in this session: 0.")
     return lines
 
 
@@ -808,32 +852,459 @@ def list_clusters(emit=None) -> dict:
 # Login method: the standard Azure CLI (`az`) instead of akslogin.exe  (--login-method cli)
 # ---------------------------------------------------------------------------
 
-LOGIN_OPTS = {"method": "exe", "device_code": False, "gui": False, "all_clusters": False}   # method: "exe" (akslogin.exe, default) or "cli" (az)
+SIGNIN_METHOD_LABELS = {"manual": "I run the command myself (recommended)", "captured": "Show URL and code here (captured)", "console": "Open a console window for me"}
+def default_signin_method():
+    """manual unless the environment says otherwise (AKS_DEBUG_SIGNIN_METHOD=captured|console|manual; used by automated tests)."""
+    v = (os.environ.get("AKS_DEBUG_SIGNIN_METHOD") or "").strip().lower()
+    return v if v in SIGNIN_METHOD_LABELS else "manual"
+
+
+LOGIN_OPTS = {"method": "exe", "device_code": True, "gui": False, "all_clusters": False, "tenant": None,
+              "signin": default_signin_method()}   # method: "exe" (akslogin.exe, default) or "cli" (az); device_code: ON by default; signin: manual (default) | captured | console
 LOGIN_LABELS = {"exe": "Custom login (akslogin)", "cli": "Cloud CLI (az)"}   # the GUI combobox values
 CLI_TARGETS = {}    # cluster number (str) -> what the CLI listing found; fed into AZ_OPTS after the login
 
+DEVICE_CODE_EXPIRY_SECONDS = 900      # a device code is valid for about 15 minutes
+SIGNIN_KEEP_LINES = 200               # raw sign-in output lines kept
+_URL_RE = re.compile(r"https?://[^\s\"'<>)]+", re.I)
+_CODE_RE = re.compile(r"\b(?:enter|use|type|input)\s+(?:the\s+)?(?:device\s+)?code\s*[:=]?\s*([A-Z0-9][A-Z0-9-]{5,14})\b", re.I)
+_CODE_FALLBACK_RE = re.compile(r"\bcode\s*[:=]?\s*([A-Z0-9]{8,10})\b")
+_JSONISH_RE = re.compile(r'^(?:[\[\]{}]|"[^"]*"\s*:)')
 
-def _run_interactive(cmd, emit):
-    """Run an interactive login command (browser / device-code flow). Its output is NOT captured: from the
-    command line it uses this console; from the GUI (no console) it gets its own console window on Windows.
-    Waits until it finishes. Returns the exit code, or None if it could not be started."""
+
+def parse_device_code(text):
+    """(url, code) from the text `az login --use-device-code` prints, e.g.
+    'To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code ABCD1234 to authenticate.'
+    Handles other wording (login.microsoft.com/device, 'use the code', 'code: X') and wrapped lines (whitespace is collapsed).
+    Either value is None when it is not (yet) in the text."""
+    flat = " ".join(str(text or "").split())
+    m = _CODE_RE.search(flat) or _CODE_FALLBACK_RE.search(flat)
+    code = m.group(1).upper() if m else None
+    urls = [u.rstrip(".,;:!?]") for u in _URL_RE.findall(flat)]
+    url = None
+    if urls:
+        url = next((u for u in urls if "device" in u.lower()), urls[0])
+    return url, code
+
+
+def explain_signin_error(text):
+    """Plain-language reason for a failed `az login` (from its error output)."""
+    t = " ".join(str(text or "").split())
+    low = t.lower()
+    if "aadsts50076" in low or "aadsts50079" in low or "multi-factor" in low or "multifactor" in low or "mfa" in low.split():
+        return ("Your organisation requires multi-factor authentication (MFA) and it was not completed. Start the sign-in again and approve the "
+                "MFA prompt in the browser.")
+    if "aadsts53003" in low or "conditional access" in low or "aadsts50105" in low:
+        return ("A conditional access policy blocked the sign-in (for example: unmanaged device, location or app not allowed). "
+                "Try from a compliant device / the corporate network, or ask your administrator.")
+    if "aadsts50020" in low or "aadsts50034" in low or "does not exist in tenant" in low:
+        return ("That account does not exist in the chosen tenant (a guest account must sign in to the tenant it was invited to). "
+                "Enter the right tenant in the 'Tenant' box, or leave it empty.")
+    if "aadsts90002" in low or "aadsts900023" in low or "aadsts700016" in low or ("tenant" in low and ("not found" in low or "invalid" in low or "does not exist" in low)):
+        return "The tenant was not found - check the tenant id / domain in the 'Tenant' box (or leave it empty) and try again."
+    if "aadsts70016" in low or "expired" in low or "timed out" in low or "timeout" in low:
+        return "The device code expired before you signed in (it is valid for about 15 minutes). Press 'Sign in' to get a new code."
+    if "aadsts70000" in low or "declined" in low or "cancel" in low:
+        return "The sign-in was declined or cancelled in the browser. Press 'Sign in' to try again."
+    if "no subscriptions found" in low:
+        return ("You signed in, but this account has no Azure subscription. Use another account ('Sign in with a different account') "
+                "or ask for the Reader role on a subscription.")
+    line = next((l.strip() for l in reversed(str(text or "").splitlines()) if l.strip()), "")
+    return (line[:300] if line else "the sign-in did not finish (no details from az)")
+
+
+def format_signin_box(url, code, tenant=None, minutes=15):
+    """The 'Open this URL ... enter this code ...' box for the log / command line."""
+    rows = ["To sign in to Azure:",
+            f"  1. Open this URL in a browser:  {url or '(see the output above)'}",
+            f"  2. Enter this code:             {code or '(see the output above)'}" + (f"      (tenant: {tenant})" if tenant else ""),
+            f"  The code is valid for about {minutes} minutes. Waiting for you to sign in ..."]
+    w = max(len(r) for r in rows) + 2
+    return ["+" + "-" * w + "+"] + ["| " + r.ljust(w - 1) + "|" for r in rows] + ["+" + "-" * w + "+"]
+
+
+# ---------------------------------------------------------------------------
+# Signing in.  Three methods (step 2 of the window, --signin-method on the command line):
+#   manual   (DEFAULT)  the tool SHOWS the exact commands (az login --use-device-code, ...); the user runs one in their own Command Prompt / PowerShell,
+#                       then presses 'I have signed in - Verify' (the tool only runs the read-only account list / show / expiry checks). The window also
+#                       checks every few seconds and notices the sign-in by itself. 'Open a terminal for me' starts a visible PowerShell window with the
+#                       chosen `az login` form - a LOCAL-ONLY, user-initiated exception limited to exactly `az login [--use-device-code] [--tenant T]`.
+#   captured            `az login --use-device-code` runs with its output captured; URL and code are parsed and shown in the window. When it fails or
+#                       shows no URL the window switches to the manual commands.
+#   console             the same command in its own visible console window; the tool waits and then re-checks the sign-in.
+# The tool never installs anything: the install hints for the Azure CLI are TEXT only.
+# ---------------------------------------------------------------------------
+
+MANUAL_POLL_SECONDS = 5         # manual mode: how often the window checks whether the sign-in happened
+MANUAL_POLL_CAP = 900           # ... and for how long (seconds) before it stops waiting
+NO_URL_SECONDS = 25.0           # captured mode: no URL parsed after this long -> switch to the manual commands
+MANUAL_INSTRUCTIONS = "Sign in from your own Command Prompt or PowerShell. If the Azure CLI is not installed yet, install it first, then run this command:"
+MANUAL_STEPS = ("Then: open the URL az prints (https://microsoft.com/devicelogin), enter the code, approve the sign-in (MFA), return to this window and "
+                "press 'I have signed in - Verify'.")
+AZ_INSTALL_URL = "https://learn.microsoft.com/cli/azure/install-azure-cli"
+AZ_INSTALL_WINGET = "winget install -e --id Microsoft.AzureCLI"
+AZ_MISSING_TEXT = "Azure CLI (az) not found on this computer - install it first"
+AZ_INSTALL_HINT = (f"Install it from {AZ_INSTALL_URL}  -  on Windows you can run:  {AZ_INSTALL_WINGET}  "
+                   "(then open a NEW terminal window). This tool never installs anything.")
+NO_URL_REASON = "Automatic sign-in did not show a URL. Run one of these commands in your own terminal, then press Verify."
+FAILED_REASON = "The automatic sign-in did not complete. Run one of these commands in your own terminal, then press Verify."
+TENANT_PLACEHOLDER = "<tenant-id>"
+_TERMINAL_FORMS = ("device", "device-tenant", "browser", "tenant-device")
+
+
+def manual_commands(tenant=None, account_tenant=None):
+    """The numbered commands of the manual sign-in. Each: {n, key, cmd, note}. `tenant` = the value of the Tenant box (adds the 1b variant line);
+    `account_tenant` = the tenant id of the selected account (used in command 3 when the box is empty). These are shown as TEXT; the tool itself
+    never runs them (only 'Open a terminal for me' starts the az login forms, on the user's request)."""
+    tenant = tenant if (tenant and TENANT_RE.match(tenant)) else None
+    t3 = tenant or account_tenant or TENANT_PLACEHOLDER
+    items = [{"n": "1", "key": "device", "cmd": "az login --use-device-code",
+              "note": "Device code (recommended): prints a URL and a code - open the URL on any computer, enter the code, approve."}]
+    if tenant:
+        items.append({"n": "1b", "key": "device-tenant", "cmd": f"az login --use-device-code --tenant {tenant}",
+                      "note": "Same, for the tenant in the Tenant box."})
+    items += [{"n": "2", "key": "browser", "cmd": "az login", "note": "Normal flow: opens your browser by itself."},
+              {"n": "3", "key": "tenant-device", "cmd": f"az login --tenant {t3} --use-device-code",
+               "note": "For a specific tenant (e.g. a guest account or several organisations)" + ("." if t3 != TENANT_PLACEHOLDER else " - replace <tenant-id> with your tenant id or domain.")},
+              {"n": "4a", "key": "list", "cmd": "az account list --output table", "note": "Verify / see your subscriptions after signing in."},
+              {"n": "4b", "key": "show", "cmd": "az account show", "note": "Shows who you are signed in as."}]
+    return items
+
+
+_AZ_VERSION = {}       # exe path -> first line of `az --version` (only successful reads are remembered)
+
+
+def az_cli_line():
+    """('Azure CLI installed ...' text, found): PATH lookup only (no process); the version is read separately by az_version()."""
+    exe = shutil.which("az")
+    if not exe:
+        return AZ_MISSING_TEXT, False
+    ver = _AZ_VERSION.get(exe)
+    return (f"Azure CLI installed: {ver}" if ver else f"Azure CLI installed ({exe})"), True
+
+
+def az_version(timeout=60):
+    """First line of `az --version` (e.g. 'azure-cli 2.60.0'), or None. The only information command the tool runs (assert_local_info)."""
+    exe = shutil.which("az")
+    if not exe:
+        return None
+    if exe in _AZ_VERSION:
+        return _AZ_VERSION[exe]
+    cmd = [exe, "--version"]
+    try:
+        assert_local_info(cmd)
+    except ReadOnlyViolation as v:
+        GUARD.block("az", cmd, str(v))
+        return None
+    GUARD.read()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, env=_az_env())
+    except Exception:
+        return None
+    first = next((" ".join(l.split()) for l in str(getattr(proc, "stdout", "") or "").splitlines() if l.strip()), "")
+    if getattr(proc, "returncode", 1) != 0 or not first:
+        return None
+    _AZ_VERSION[exe] = first[:120]
+    return _AZ_VERSION[exe]
+
+
+def manual_signin_block(tenant=None, account_tenant=None, reason=None, az_missing=None):
+    """The numbered command block as text lines (command line; same content as the window's manual panel, incl. the install hint when az is missing)."""
+    if az_missing is None:
+        az_missing = not shutil.which("az")
+    rows = []
+    if reason:
+        rows += [reason, ""]
+    rows += [MANUAL_INSTRUCTIONS, ""]
+    if az_missing:
+        rows += [AZ_MISSING_TEXT, "  Install it from " + AZ_INSTALL_URL, "  On Windows you can run:  " + AZ_INSTALL_WINGET,
+                 "  (then open a NEW terminal window; this tool never installs anything)", ""]
+    for item in manual_commands(tenant, account_tenant):
+        rows += [f"  {item['n']}. {item['cmd']}", f"        {item['note']}"]
+    rows += ["", MANUAL_STEPS.replace("press 'I have signed in - Verify'.", "press Enter here.")]
+    width = max(len(r) for r in rows) + 2
+    return ["+" + "-" * width + "+"] + ["| " + r.ljust(width - 1) + "|" for r in rows] + ["+" + "-" * width + "+"]
+
+
+def verify_signin(account=None):
+    """The 'Verify' check (read-only: az account show, the expiry check via get-access-token --query expiresOn, az account list).
+    Returns login_status()'s dict; on success it also has "n_subs" and "tok". A failed one has "state": "not_signed_in" and the reason in "detail"
+    ("expired": True when the credentials are expired, "no_subs": True when the account sees no subscription)."""
+    st = login_status(account)
+    if st["state"] != "ok":
+        return st
+    tok = check_account_token(None, None)
+    st = dict(st, tok=tok)
+    if tok["state"] == "expired":
+        return dict(st, state="not_signed_in", expired=True, detail=tok.get("detail") or "the credentials have expired",
+                    hint="Run one of the commands shown in step 2 again.")
+    rows, err = load_accounts()
+    st["n_subs"] = len(rows)
+    if not rows:
+        return dict(st, state="not_signed_in", no_subs=True, detail="No subscriptions found" + (f" ({_first_line(err, 120)})" if err else ""),
+                    hint="Sign in with an account that has an Azure subscription.")
+    return st
+
+
+def signin_failure_help(res, tenant=None, account_tenant=None):
+    """The exact error and which command to try next, after a failed verification. `res` = the dict of verify_signin() (or just the error text)."""
+    res = res if isinstance(res, dict) else {"detail": str(res or "")}
+    detail = str(res.get("detail") or "unknown error")
+    cmds = {i["key"]: i["cmd"] for i in manual_commands(tenant, account_tenant)}
+    low = detail.lower()
+    if res.get("state") == "no_cli":
+        nxt = (f"{AZ_MISSING_TEXT}. Install it from {AZ_INSTALL_URL} (Windows: {AZ_INSTALL_WINGET}), open a NEW terminal window and run: {cmds['device']}")
+    elif res.get("no_subs") or "no subscriptions found" in low:
+        nxt = (f"You signed in, but this account has no Azure subscription. Sign in with another account or tenant ({cmds['tenant-device']}), "
+               "or ask for the Reader role on a subscription.")
+    elif res.get("expired") or is_expired_error(detail):
+        nxt = f"The sign-in expired or was not completed. Run: {cmds['device']}"
+    elif re.search(r"aadsts\d+", low) or "tenant" in low:
+        why = explain_signin_error(detail)
+        nxt = f"{why} Then run: {cmds['device']}" + (f"   or, for a specific tenant: {cmds['tenant-device']}" if re.search(r"aadsts(50020|50034|90002|900023|700016)|tenant", low) else "")
+    else:
+        nxt = f"You are not signed in yet. Run: {cmds['device']}   (or: {cmds['browser']})"
+    return f"Verification failed: {_first_line(detail, 200)}\nNext: {nxt}   Then press 'I have signed in - Verify' again."
+
+
+def terminal_signin_plan(form, tenant=None):
+    """(Popen args, displayed command, None) or (None, None, reason): the PowerShell window of 'Open a terminal for me'. User-initiated LOCAL-ONLY
+    exception: only `az login [--use-device-code] [--tenant T]`, checked by the same strict guard as every other sign-in command."""
+    if form not in _TERMINAL_FORMS:
+        return None, None, f"'{form}' is not one of the sign-in commands"
+    flags = {"device": ["--use-device-code"], "device-tenant": ["--use-device-code", "--tenant", tenant or ""], "browser": [],
+             "tenant-device": ["--tenant", tenant or "", "--use-device-code"]}[form]
+    if "--tenant" in flags and (not tenant or not TENANT_RE.match(tenant)):
+        return None, None, "Type a tenant id or domain in the 'Tenant' box first (command 3 needs a real tenant)."
+    if not shutil.which("az"):
+        return None, None, AZ_MISSING_TEXT + ". " + AZ_INSTALL_HINT
+    cmd = ["az", "login", *flags]
+    try:
+        assert_local_only_command(cmd)
+    except ReadOnlyViolation as v:
+        GUARD.block("local", cmd, str(v))
+        return None, None, str(v)
+    line = " ".join(cmd)
+    shell = shutil.which("powershell") or shutil.which("pwsh") or "powershell"
+    return [shell, "-NoExit", "-Command", line], line, None
+
+
+def open_terminal_signin(form, tenant=None, popen=None):
+    """Start a visible PowerShell window that runs the chosen `az login` form and stays open (CREATE_NEW_CONSOLE). The tool does not wait for it.
+    Returns (ok, command text or reason)."""
+    args, line, why = terminal_signin_plan(form, tenant)
+    if why:
+        return False, why
+    if os.name != "nt":
+        return False, "Opening a terminal is only done on Windows - copy the command and run it in your own terminal."
+    GUARD.local_only()
+    try:
+        (popen or subprocess.Popen)(args, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10), env=_az_env())
+    except Exception as exc:
+        return False, f"could not open a terminal: {exc}"
+    return True, line
+
+
+def _use_manual_signin():
+    """Command line: the default sign-in method shows the commands and waits for the user (the window has its own manual panel)."""
+    return (LOGIN_OPTS.get("signin") or "manual") == "manual" and not LOGIN_OPTS["gui"]
+
+
+def manual_signin_cli(emit=print, reason=None, input_fn=None, status_fn=None):
+    """Command line, manual method: print the numbered command block, wait for Enter, verify (read-only), repeat on failure.
+    Returns True when signed in; False on Ctrl+C / no input (stdin is not interactive)."""
+    tenant = LOGIN_OPTS.get("tenant")
+    for line in manual_signin_block(tenant, None, reason):
+        emit(line)
+    ask = input_fn or input
+    while True:
+        try:
+            ask("Press Enter after you have signed in, or Ctrl+C to stop: ")
+        except (KeyboardInterrupt, EOFError):
+            emit("")
+            emit("Stopped waiting - no sign-in was verified. Run one of the commands above in your terminal, then run this tool again.")
+            return False
+        st = (status_fn or verify_signin)()
+        if st.get("state") == "ok":
+            n = st.get("n_subs")
+            emit(f"Signed in as {st.get('who') or '?'}" + (f" (tenant {st['tenant']})" if st.get("tenant") else "")
+                 + (f" - {n} subscription{'s' if n != 1 else ''}" if n is not None else ""))
+            return True
+        for line in signin_failure_help(st, tenant, st.get("tenant_id")).splitlines():
+            emit(line)
+
+
+def signin_command(device_code=None, tenant=None):
+    """The one sign-in command line: az login [--use-device-code] [--tenant T] -o none  (-o none keeps the subscription JSON out of the output;
+    --only-show-errors is NOT added because it can hide the device-code message)."""
+    dc = LOGIN_OPTS["device_code"] if device_code is None else device_code
+    tn = LOGIN_OPTS.get("tenant") if tenant is None else tenant
+    cmd = [shutil.which("az") or "az", "login"]
+    if dc:
+        cmd.append("--use-device-code")
+    if tn:
+        cmd += ["--tenant", tn]
+    return cmd + ["-o", "none"]
+
+
+def _kill_process(proc):
+    """Stop the sign-in process (and on Windows its child processes: az.cmd starts python)."""
+    pid = getattr(proc, "pid", None)
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    if os.name == "nt" and isinstance(pid, int) and pid > 4:
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=10)
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def run_signin(cmd, emit, on_event=None, cancel=None, expiry=DEVICE_CODE_EXPIRY_SECONDS + 10, poll=0.2):
+    """Run the interactive sign-in (`az login ...`, the LOCAL-ONLY exception of the read-only guard) with its output CAPTURED and streamed
+    line by line (no separate console window). The verification URL and user code are parsed out of az's text and handed to
+    on_event({"kind": "code", "url", "code", "expires_at"}); every output line goes to on_event({"kind": "line", "line"}) and emit().
+    cancel = threading.Event: setting it terminates the process. Waits until it finishes.
+    Returns {"status": "ok" | "failed" | "cancelled" | "expired" | "error", "rc", "url", "code", "lines", "error"}."""
+    res = {"status": "error", "rc": None, "url": None, "code": None, "lines": [], "error": "", "started": time.time()}
+    ev = on_event or (lambda e: None)
     try:
         assert_local_only_command(cmd)
     except ReadOnlyViolation as v:
         GUARD.block("local", cmd, str(v))
         emit("ERROR: " + str(v))
-        return None
+        res["error"] = str(v)
+        return res
     GUARD.local_only()
     emit("Running: " + " ".join([os.path.splitext(os.path.basename(cmd[0]))[0], *cmd[1:]]))
-    kwargs = {"env": _az_env()}
-    if LOGIN_OPTS["gui"] and os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-        emit("A console window opens for the sign-in - complete it there (browser / device code). This continues when it closes.")
+    env = _az_env()
+    env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL, "env": env,
+              "text": True, "encoding": "utf-8", "errors": "replace", "bufsize": 1}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        return subprocess.run(cmd, **kwargs).returncode
+        proc = subprocess.Popen(cmd, **kwargs)
     except Exception as exc:
-        emit(f"ERROR: could not start {cmd[0]}: {exc}")
-        return None
+        res["error"] = f"could not start {cmd[0]}: {exc}"
+        emit("ERROR: " + res["error"])
+        return res
+    q = queue.Queue()
+
+    def reader():
+        try:
+            for ln in iter(proc.stdout.readline, ""):
+                q.put(ln)
+        except Exception:
+            pass
+        q.put(None)
+    threading.Thread(target=reader, daemon=True).start()
+    buf, hidden, code_at = "", 0, None
+    while True:
+        try:
+            raw = q.get(timeout=poll)
+        except queue.Empty:
+            raw = ""
+        if raw is None:
+            break
+        line = raw.strip()
+        if line:
+            if _JSONISH_RE.match(line):
+                hidden += 1                                    # the JSON subscription list az may print at the end of a login: not shown
+            else:
+                shown = line if len(line) <= 300 else line[:300] + " ..."
+                if len(res["lines"]) < SIGNIN_KEEP_LINES:
+                    res["lines"].append(shown)
+                ev({"kind": "line", "line": shown})
+                emit("  az: " + shown)
+                buf += " " + line
+                if code_at is None:
+                    url, code = parse_device_code(buf)
+                    res["url"], res["code"] = url or res["url"], code or res["code"]
+                    if res["code"] and res["url"]:
+                        code_at = time.time()
+                        for bl in format_signin_box(res["url"], res["code"], LOGIN_OPTS.get("tenant")):
+                            emit(bl)
+                        ev({"kind": "code", "url": res["url"], "code": res["code"], "expires_at": code_at + DEVICE_CODE_EXPIRY_SECONDS})
+        if cancel is not None and cancel.is_set():
+            _kill_process(proc)
+            res["status"] = "cancelled"
+            emit("Sign-in cancelled.")
+            return res
+        if code_at is not None and time.time() - code_at > expiry:
+            _kill_process(proc)
+            res["status"] = "expired"
+            res["error"] = explain_signin_error("expired")
+            emit("Sign-in stopped: " + res["error"])
+            return res
+    try:
+        res["rc"] = proc.wait(timeout=15)
+    except Exception:
+        _kill_process(proc)
+        res["rc"] = proc.poll()
+    if hidden:
+        emit(f"  (az's subscription list - {hidden} line(s) - is not shown here)")
+    if res["rc"] == 0:
+        res["status"] = "ok"
+    else:
+        res["status"] = "failed"
+        res["error"] = explain_signin_error("\n".join(res["lines"]))
+    return res
+
+
+def run_signin_console(cmd, emit, cancel=None, expiry=DEVICE_CODE_EXPIRY_SECONDS + 60, poll=0.3):
+    """The 'console' sign-in method: the same `az login ...` (LOCAL-ONLY exception of the read-only guard) in its OWN visible console window; this
+    function only waits for the process to end. Returns {"status": "ok" | "failed" | "cancelled" | "expired" | "error", "rc", "url", "code", "lines", "error"}."""
+    res = {"status": "error", "rc": None, "url": None, "code": None, "lines": [], "error": "", "started": time.time()}
+    try:
+        assert_local_only_command(cmd)
+    except ReadOnlyViolation as v:
+        GUARD.block("local", cmd, str(v))
+        emit("ERROR: " + str(v))
+        res["error"] = str(v)
+        return res
+    GUARD.local_only()
+    emit("Running in its own console window: " + " ".join([os.path.splitext(os.path.basename(cmd[0]))[0], *cmd[1:]]))
+    kwargs = {"env": _az_env()}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10)
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    except Exception as exc:
+        res["error"] = f"could not start {cmd[0]}: {exc}"
+        emit("ERROR: " + res["error"])
+        return res
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        if cancel is not None and cancel.is_set():
+            _kill_process(proc)
+            res["status"] = "cancelled"
+            emit("Sign-in cancelled.")
+            return res
+        if time.time() - res["started"] > expiry:
+            _kill_process(proc)
+            res["status"] = "expired"
+            res["error"] = explain_signin_error("expired")
+            emit("Sign-in stopped: " + res["error"])
+            return res
+        time.sleep(poll)
+    res["rc"] = rc
+    if rc == 0:
+        res["status"] = "ok"
+    else:
+        res["status"] = "failed"
+        res["error"] = f"the sign-in console window ended with exit code {rc} - nothing was signed in"
+    return res
 
 
 def _run_captured(cmd, timeout=120):
@@ -862,42 +1333,76 @@ def list_selected_clusters(emit=print):
 
 def login_status(account=None):
     """Read-only sign-in check for the window (`az account show`; nothing is changed, no sign-in is started).
-    Returns {"state": "ok" | "not_signed_in" | "no_cli", "who", "detail", "hint"}."""
+    Returns {"state": "ok" | "not_signed_in" | "no_cli", "who", "tenant", "detail", "hint"}."""
     if not shutil.which("az"):
-        return {"state": "no_cli", "who": None, "detail": "The Azure CLI (az) is not installed (it was not found on PATH).",
-                "hint": "Install it from https://aka.ms/installazurecli, then press 'Check status'."}
+        return {"state": "no_cli", "who": None, "tenant": None, "detail": "The Azure CLI (az) is not installed (it was not found on PATH).",
+                "hint": f"Install it from {AZ_INSTALL_URL} (Windows: {AZ_INSTALL_WINGET}), then press 'Check status'."}
     acct, err = az_cli(["account", "show"], None, 30, subscription=False)
     if err:
-        return {"state": "not_signed_in", "who": None, "detail": _first_line(err, 160),
-                "hint": "Press 'Sign in' (runs: az login) and complete the sign-in in the console window / browser that opens."}
+        return {"state": "not_signed_in", "who": None, "tenant": None, "detail": _first_line(err, 160),
+                "hint": ("Run 'az login --use-device-code' in your own terminal (the commands are shown in step 2), then press 'I have signed in - Verify'."
+                         if (LOGIN_OPTS.get("signin") or "manual") == "manual" else "Press 'Sign in' (runs: az login --use-device-code); the URL and code are shown in step 2.")}
     who = str(((acct or {}).get("user") or {}).get("name") or "?") if isinstance(acct, dict) else "?"
-    return {"state": "ok", "who": who, "detail": "", "hint": ""}
+    tenant = (acct or {}).get("tenantDisplayName") or (acct or {}).get("tenantId") if isinstance(acct, dict) else None
+    return {"state": "ok", "who": who, "tenant": tenant, "tenant_id": (acct or {}).get("tenantId") if isinstance(acct, dict) else None,
+            "detail": "", "hint": ""}
 
 
-def cli_sign_in(emit, account=None):
-    """The interactive sign-in of the window's 'Sign in' button (az login, honouring the device-code option)."""
-    return cli_ensure_az(emit)
+def cli_sign_in_detailed(emit, on_event=None, cancel=None, tenant=None, device_code=None, console=None):
+    """The automatic sign-in (methods 'captured' and 'console'): az login [--use-device-code] [--tenant T] -o none, output captured (see run_signin)
+    or in its own console window (console=True; default: LOGIN_OPTS['signin'] == 'console'). Returns the run_signin result dict."""
+    if not shutil.which("az"):
+        emit(f"Azure CLI (az) was not found on PATH - install it first: {AZ_INSTALL_URL}   (Windows: {AZ_INSTALL_WINGET}), then run: az login --use-device-code")
+        return {"status": "error", "rc": None, "url": None, "code": None, "lines": [], "error": "The Azure CLI (az) is not installed (not found on PATH)."}
+    if console is None:
+        console = (LOGIN_OPTS.get("signin") == "console")
+    if console:
+        return run_signin_console(signin_command(device_code, tenant), emit, cancel)
+    return run_signin(signin_command(device_code, tenant), emit, on_event, cancel)
+
+
+def cli_sign_in_any(emit, reason=None):
+    """Command-line sign-in with the chosen method: manual (default: print the commands, wait for Enter, verify) or captured / console (az login is run).
+    Returns a run_signin-style dict (status 'ok' / 'failed' / 'cancelled' ...)."""
+    if _use_manual_signin():
+        ok = manual_signin_cli(emit, reason=reason)
+        return {"status": "ok" if ok else "cancelled", "rc": 0 if ok else None, "url": None, "code": None, "lines": [],
+                "error": "" if ok else "no sign-in was verified (manual sign-in stopped)"}
+    return cli_sign_in_detailed(emit)
+
+
+def cli_sign_in(emit, account=None, **kw):
+    """True when the sign-in finished OK (see cli_sign_in_detailed)."""
+    return cli_sign_in_detailed(emit, **kw)["status"] == "ok"
 
 
 def cli_ensure_az(emit):
-    """True when the Azure CLI is installed and logged in (`az account show`). If not, runs `az login`
-    interactively (device-code with --device-code) and checks again."""
+    """True when the Azure CLI is installed and logged in (`az account show`). If not, runs `az login --use-device-code` (device-code is the
+    default; --no-device-code = browser flow), prints the URL / code box, and checks again."""
     exe = shutil.which("az")
     if not exe:
-        emit("Azure CLI (az) was not found on PATH - install it (https://aka.ms/installazurecli), then run: az login")
+        if _use_manual_signin():          # the default: print the commands (with the install hint), wait for Enter, verify
+            return manual_signin_cli(emit, reason=f"{AZ_MISSING_TEXT}.")
+        emit(f"Azure CLI (az) was not found on PATH - install it first: {AZ_INSTALL_URL}   (Windows: {AZ_INSTALL_WINGET}), then run: az login --use-device-code")
         return False
 
     def who(acct):
         return str(((acct or {}).get("user") or {}).get("name") or "?") if isinstance(acct, dict) else "?"
     acct, err = az_cli(["account", "show"], None, 30, subscription=False)
     if not err:
-        emit(f"Azure CLI is signed in as {who(acct)}")
-        return True
-    emit(f"Azure CLI is not logged in: {_first_line(err, 110)}")
-    cmd = [exe, "login"] + (["--use-device-code"] if LOGIN_OPTS["device_code"] else [])
-    rc = _run_interactive(cmd, emit)
-    if rc != 0:
-        emit("az login failed or was cancelled" + (f" (exit code {rc})" if rc else "") + ".")
+        tok = check_account_token(None, None)
+        if tok["state"] != "expired":
+            emit(f"Azure CLI is signed in as {who(acct)}")
+            return True
+        set_account_status(who(acct), "expired", None, tok["detail"])
+        emit(f"Credentials for {who(acct)} expired - sign in again." + ("" if _use_manual_signin() else " Starting the device-code sign-in ..."))
+        why = f"Credentials for {who(acct)} expired. Sign in again."
+    else:
+        emit(f"Azure CLI is not logged in: {_first_line(err, 110)}")
+        why = "Azure CLI is not logged in."
+    res = cli_sign_in_any(emit, why)
+    if res["status"] != "ok":
+        emit("az login failed or was cancelled" + (f" (exit code {res['rc']})" if res.get("rc") else "") + (": " + res["error"] if res.get("error") else "") + ".")
         return False
     acct, err = az_cli(["account", "show"], None, 30, subscription=False)
     if err:
@@ -912,14 +1417,269 @@ def load_accounts():
     subs, err = _az_subscriptions()
     rows = [{"id": sid, "name": i.get("name") or sid, "code": sid,
              "info": " ".join(x for x in ((i.get("state") or ""), ("[default]" if i.get("default") else "")) if x),
-             "usable": i.get("state") in (None, "Enabled")} for sid, i in subs.items()]
+             "usable": i.get("state") in (None, "Enabled"), "user": i.get("user"), "tenant": i.get("tenant"), "kind": i.get("kind"),
+             "tenant_name": i.get("tenant_name")} for sid, i in subs.items()]
     return sorted(rows, key=lambda a: (a["name"].lower(), a["id"])), err
+
+
+# ---------------------------------------------------------------------------
+# Accounts known to the Azure CLI and whether their credentials are still valid (read-only)
+# ---------------------------------------------------------------------------
+
+EXPIRING_SOON_SECONDS = 30 * 60       # under 30 minutes left = 'Expiring soon'
+ACCOUNT_CHECK_WORKERS = 4             # accounts checked at the same time
+CRED_EXPIRED_PATTERNS = ("aadsts70043", "aadsts700082", "aadsts50173", "aadsts70008", "aadsts50132", "refresh token has expired",
+                         "refresh token is expired", "please run 'az login'", 'please run "az login"', "interactive authentication is needed",
+                         "failed to refresh", "token has expired", "credentials have expired", "credentials expired", "session has expired",
+                         "authentication token has expired", "az login' to setup account", "run az login")
+_TOKENISH_RE = re.compile(r"eyJ[A-Za-z0-9_\-]{8,}(?:\.[A-Za-z0-9_\-]+){0,2}|[A-Za-z0-9_\-+/=]{80,}")
+_EXPIRES_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?")
+# status -> (label shown on the chip, colour kind of the window)
+ACCOUNT_STATES = {"active": "Active", "expiring": "Expiring soon", "expired": "Expired", "none": "Not signed in", "unknown": "Unknown"}
+
+CRED = {"owner": {}, "status": {}, "events": 0, "hook": None, "current": None, "lock": threading.Lock()}
+# owner: subscription id (lower) -> account (user name); status: account -> {"state", "left", "detail", "checked"}
+
+
+def scrub_secrets(text):
+    """Remove anything that looks like a token (JWT / long base64 string) from text before it is shown or logged."""
+    return _TOKENISH_RE.sub("<hidden>", str(text or ""))
+
+
+def is_expired_error(text):
+    """True when an az / kubelogin error means the sign-in (refresh token / session) expired: the user has to sign in again."""
+    low = " ".join(str(text or "").lower().split())
+    return any(p in low for p in CRED_EXPIRED_PATTERNS)
+
+
+def parse_expires_on(text, now=None):
+    """Seconds left until the `expiresOn` value az printed (local time, e.g. '2026-10-04 15:03:12.000000'); None when it is not a time."""
+    m = _EXPIRES_RE.search(str(text or ""))
+    if not m:
+        return None
+    try:
+        dt = datetime(*[int(x) for x in m.groups()[:6]])
+    except ValueError:
+        return None
+    return (dt - (now or datetime.now())).total_seconds()
+
+
+def token_expiry_args(subscription=None, tenant=None):
+    """The ONE shape of `az account get-access-token` that is allowed: only the expiry time is queried, so the token itself never reaches this tool."""
+    args = ["account", "get-access-token", "--query", "expiresOn", "-o", "tsv"]
+    if tenant:
+        args += ["--tenant", tenant]
+    if subscription:
+        args += ["--subscription", subscription]
+    return args
+
+
+def _assert_token_expiry_args(args):
+    """Guard for `account get-access-token`: exactly --query expiresOn -o tsv [--tenant T] [--subscription S] [--only-show-errors]; any variant
+    that could print the token (no --query, --query accessToken, -o json, --resource / --scope ...) raises ReadOnlyViolation."""
+    rest = list(args[2:])
+    seen_q = seen_o = False
+    j = 0
+    while j < len(rest):
+        a = rest[j]
+        if a == "--query" and j + 1 < len(rest) and rest[j + 1] == "expiresOn" and not seen_q:
+            seen_q, j = True, j + 2
+        elif a in ("-o", "--output") and j + 1 < len(rest) and rest[j + 1].lower() == "tsv" and not seen_o:
+            seen_o, j = True, j + 2
+        elif a in ("--tenant", "--subscription") and j + 1 < len(rest) and TENANT_RE.match(rest[j + 1]):
+            j += 2
+        elif a == "--only-show-errors":
+            j += 1
+        else:
+            raise ReadOnlyViolation(_blocked_message("account get-access-token " + a + " (the token must never be printed)"))
+    if not (seen_q and seen_o):
+        raise ReadOnlyViolation(_blocked_message("account get-access-token without --query expiresOn -o tsv (the token must never be printed)"))
+    return "read"
+
+
+def set_account_status(user, state, left=None, detail=""):
+    with CRED["lock"]:
+        CRED["status"][user] = {"state": state, "left": left, "detail": scrub_secrets(detail)[:300], "checked": time.time()}
+
+
+def status_text(st):
+    """'Active (42 min left)', 'Expiring soon (12 min left)', 'Credentials expired - sign in again', 'Not signed in', 'Unknown: reason'."""
+    if not st:
+        return "Not checked yet"
+    s, left = st.get("state"), st.get("left")
+    mins = (lambda x: f"{int(x // 3600)} h {int(x % 3600 // 60)} min" if x >= 3600 else f"{max(1, int(x // 60))} min")
+    if s == "active":
+        return "Active" + (f" ({mins(left)} left)" if left else "")
+    if s == "expiring":
+        return "Expiring soon" + (f" ({mins(left)} left)" if left else "")
+    if s == "expired":
+        return "Credentials expired - sign in again"
+    if s == "none":
+        return "Not signed in"
+    return "Unknown" + (f": {st.get('detail')}" if st.get("detail") else "")
+
+
+def check_account_token(subscription=None, tenant=None, timeout=60, now=None):
+    """Read-only check of one account's credentials: `az account get-access-token --query expiresOn -o tsv [--tenant T] [--subscription S]`
+    (only the expiry time is printed). Returns {"state": active | expiring | expired | none | unknown, "left": seconds or None, "detail"}."""
+    args = token_expiry_args(subscription, tenant)
+    try:
+        assert_read_only_cloud("az", args)
+    except ReadOnlyViolation as v:
+        GUARD.block("az", ["az", *args], str(v))
+        return {"state": "unknown", "left": None, "detail": str(v)}
+    exe = shutil.which("az")
+    if not exe:
+        return {"state": "none", "left": None, "detail": "Azure CLI (az) was not found on PATH"}
+    GUARD.read()
+    try:
+        proc = subprocess.run([exe, *args, "--only-show-errors"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, env=_az_env())
+    except subprocess.TimeoutExpired:
+        return {"state": "unknown", "left": None, "detail": f"timed out after {timeout}s"}
+    except Exception as exc:
+        return {"state": "unknown", "left": None, "detail": scrub_secrets(exc)[:160]}
+    if proc.returncode != 0:
+        err = scrub_secrets(proc.stderr or proc.stdout)
+        if is_expired_error(err):
+            return {"state": "expired", "left": None, "detail": _first_line(err, 160)}
+        return {"state": "unknown", "left": None, "detail": _first_line(err, 160)}
+    left = parse_expires_on(proc.stdout, now)          # the output is only parsed, never kept or shown
+    if left is None:
+        return {"state": "unknown", "left": None, "detail": "az printed no expiry time"}
+    if left <= 0:
+        return {"state": "expired", "left": None, "detail": "the access token has expired"}
+    return {"state": "expiring" if left < EXPIRING_SOON_SECONDS else "active", "left": left, "detail": ""}
+
+
+def build_accounts(rows):
+    """The accounts known to the CLI from the subscription rows (`az account list`): one per user / service principal / managed identity:
+    [{"key", "user", "kind", "tenants": [(id, name)], "n", "sub_ids", "check_sub", "check_tenant", "label"}], sorted by name."""
+    by = {}
+    for r in rows:
+        u = r.get("user") or "?"
+        a = by.setdefault(u, {"key": u, "user": u, "kind": r.get("kind") or "user", "tenants": {}, "sub_ids": [], "usable": []})
+        a["tenants"].setdefault(r.get("tenant") or "?", r.get("tenant_name") or r.get("tenant") or "?")
+        a["sub_ids"].append(r["id"])
+        if r.get("usable", True):
+            a["usable"].append(r["id"])
+    out = []
+    for u in sorted(by, key=str.lower):
+        a = by[u]
+        kind = {"user": "user", "serviceprincipal": "service principal"}.get(str(a["kind"]).lower(), str(a["kind"]))
+        if u.lower() in ("systemassignedidentity", "userassignedidentity") or "identity" in u.lower() and kind != "user":
+            kind = "managed identity"
+        ts = sorted(a["tenants"].items(), key=lambda kv: str(kv[1]).lower())
+        tl = ts[0][1] + (f" (+{len(ts) - 1} more)" if len(ts) > 1 else "")
+        n = len(a["sub_ids"])
+        out.append({"key": u, "user": u, "kind": kind, "tenants": ts, "n": n, "sub_ids": a["sub_ids"],
+                    "check_sub": (a["usable"] or a["sub_ids"] or [None])[0], "check_tenant": ts[0][0] if len(ts) == 1 and ts[0][0] != "?" else None,
+                    "label": f"{u}" + ("" if kind == "user" else f"  [{kind}]") + f"  |  {tl}  |  {n} subscription{'s' if n != 1 else ''}"})
+    return out
+
+
+def check_accounts(accounts, on_result=None, cancel=None, workers=ACCOUNT_CHECK_WORKERS):
+    """Check several accounts' credentials, at most `workers` at the same time. Updates CRED['status']; on_result(account, status) per account."""
+    def one(a):
+        if cancel is not None and cancel.is_set():
+            return a, None
+        st = check_account_token(a.get("check_sub"), a.get("check_tenant"))
+        set_account_status(a["key"], st["state"], st["left"], st["detail"])
+        if on_result:
+            on_result(a, st)
+        return a, st
+    if not accounts:
+        return []
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(accounts)))) as ex:
+        return list(ex.map(one, accounts))
+
+
+def register_account_owners(rows):
+    """Remember which account each subscription belongs to (for 'whose credentials expired?' when a call fails)."""
+    with CRED["lock"]:
+        CRED["owner"] = {r["id"].lower(): (r.get("user") or "?") for r in rows if r.get("id")}
+
+
+def _note_expired(args, target, err):
+    """Called when an az call failed with an expired-credentials error: marks the owning account Expired and tells the window (CRED['hook'])."""
+    sub = ((target or {}).get("subscription") or "").lower()
+    if not sub:
+        a = list(args) if isinstance(args, (list, tuple)) else []
+        for k, tok in enumerate(a):
+            if tok in ("--subscription", "--subscriptions") and k + 1 < len(a):
+                sub = a[k + 1].lower()
+    user = CRED["owner"].get(sub) or CRED.get("current")
+    if not user and len(set(CRED["owner"].values())) == 1:
+        user = next(iter(CRED["owner"].values()))
+    user = user or "?"
+    with CRED["lock"]:
+        CRED["events"] += 1
+    set_account_status(user, "expired", None, _first_line(scrub_secrets(err), 160))
+    hook = CRED.get("hook")
+    if hook:
+        try:
+            hook(user, scrub_secrets(err))
+        except Exception:
+            pass
+    return user
+
+
+def account_of_cluster(number):
+    """The account (user name) that owns the subscription of cluster `number` (from the CLI listing), or None."""
+    tgt = CLI_TARGETS.get(str(number)) or {}
+    return CRED["owner"].get((tgt.get("subscription") or tgt.get("account") or "").lower())
+
+
+def list_accounts_cli(emit=print, sign_in=True):
+    """`--list-accounts`: print every account the CLI knows with the state of its credentials; an expired one is reported clearly and (with
+    sign_in) the device-code sign-in is started. Returns 0 when nothing is expired / the sign-in worked, else 1."""
+    if not shutil.which("az"):
+        emit(f"Azure CLI (az) was not found on PATH - install it first: {AZ_INSTALL_URL}   (Windows: {AZ_INSTALL_WINGET}), then run: az login --use-device-code")
+        return 1
+    rows, err = load_accounts()
+    if not rows:
+        emit("No Azure accounts found" + (f" ({_first_line(err, 120)})" if err else "") + " - not signed in. " +
+             (("Starting the sign-in ..." if not _use_manual_signin() else "") if sign_in else "Run: az login --use-device-code"))
+        if sign_in:
+            return 0 if cli_sign_in_any(emit, "No Azure account is signed in.")["status"] == "ok" else 1
+        return 1
+    register_account_owners(rows)
+
+    def show():
+        accts = build_accounts(rows)
+        check_accounts(accts)
+        emit("Accounts known to the Azure CLI:")
+        for a in accts:
+            emit(f"  {a['label']}")
+            emit(f"      status: {status_text(CRED['status'].get(a['key']))}")
+        return accts
+    accts = show()
+    bad = [a for a in accts if (CRED["status"].get(a["key"]) or {}).get("state") == "expired"]
+    if not bad:
+        return 0
+    for a in bad:
+        emit(f"Credentials for {a['user']} expired - sign in again.")
+    if not sign_in:
+        return 1
+    if not _use_manual_signin():
+        emit("Starting the device-code sign-in ...")
+    res = cli_sign_in_any(emit, "Credentials expired. Sign in again.")
+    if res["status"] != "ok":
+        emit("Sign-in " + {"cancelled": "was cancelled", "expired": "timed out"}.get(res["status"], "failed") + ": " + (res.get("error") or "no details"))
+        return 1
+    rows, _e = load_accounts()
+    register_account_owners(rows)
+    show()
+    return 0
 
 
 GRAPH_QUERY = ("Resources | where type =~ 'microsoft.containerservice/managedclusters' "
                "| project id, name, resourceGroup, location, subscriptionId, aad = isnotnull(properties.aadProfile)")
 LIST_WORKERS = 8             # parallel `az aks list` calls
 GRAPH_MIN_SUBS = 5           # from this many subscriptions on, one Resource Graph query replaces one call per subscription
+BIG_SCOPE = 20               # more subscriptions than this: the window asks before searching them
+COLLECT_HINT = "Select one or more subscriptions above, then press 'Collect clusters from the selected subscriptions'."
+SCAN_SCOPE = {"value": None}  # command line: None = the current / default subscription only, "all", or a list of ids / names (--subscription a,b,c | all)
 GRAPH_CHUNK = 150            # subscriptions per Resource Graph query (keeps the command line under the 8191 characters cmd.exe allows)
 
 
@@ -1109,6 +1869,52 @@ def describe_cluster(number):
             + (f" | akslogin menu #{t['exe_number']}" if t.get("exe_number") else ""))
 
 
+def parse_subscription_scope(text):
+    """--subscription value -> None (not given), "all", or a list of ids / names (comma separated)."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.lower() == "all":
+        return "all"
+    parts = [x.strip() for x in t.split(",") if x.strip()]
+    return parts or None
+
+
+def resolve_scan_scope(emit=print):
+    """The subscriptions the command line searches for clusters: --subscription a,b,c (ids or names) / --subscription all; with no scope only the
+    current (default) subscription. Says clearly what is searched. Returns [{id, name}]."""
+    scope = SCAN_SCOPE["value"]
+    if scope is None and AZ_OPTS.get("subscription"):
+        scope = [AZ_OPTS["subscription"]]
+    subs = list_az_subscriptions()
+    enabled = {sid: i for sid, i in subs.items() if i.get("state") in (None, "Enabled")}
+    if scope == "all":
+        accounts = [{"id": sid, "name": i.get("name")} for sid, i in enabled.items()]
+        emit(f"Scope: ALL {count_word(len(accounts), 'subscription')} (--subscription all). This can take several minutes.")
+        return accounts or [{"id": None, "name": None}]
+    if scope:
+        accounts, unknown = [], []
+        for tok in scope:
+            hit = next((sid for sid, i in subs.items() if sid.lower() == tok.lower()), None) or next((sid for sid, i in subs.items() if (i.get("name") or "").lower() == tok.lower()), None)
+            if hit:
+                if hit not in [a["id"] for a in accounts]:
+                    accounts.append({"id": hit, "name": subs[hit].get("name")})
+            elif re.fullmatch(r"[0-9a-fA-F-]{36}", tok):
+                accounts.append({"id": tok, "name": None})
+            else:
+                unknown.append(tok)
+        for tok in unknown:
+            emit(f"  WARNING: subscription '{tok}' was not found among the subscriptions az can see - skipped.")
+        emit("Scope: " + count_word(len(accounts), "subscription") + " (--subscription): " + ", ".join(a["name"] or a["id"] for a in accounts[:10]) + (" ..." if len(accounts) > 10 else ""))
+        return accounts
+    default = next(((sid, i) for sid, i in enabled.items() if i.get("default")), None)
+    if default:
+        emit(f"Scope: the current (default) subscription only: {default[1].get('name') or default[0]}. Use --subscription a,b,c or --subscription all to search more.")
+        return [{"id": default[0], "name": default[1].get("name")}]
+    emit("Scope: the current (default) subscription of az only. Use --subscription a,b,c or --subscription all to search more.")
+    return [{"id": None, "name": None}]
+
+
 def list_clusters_cli(emit=print, accounts=None, progress=None, cancel=None, on_batch=None, all_subs=False, menu=None):
     """{'1': 'name (location/resource-group)', ...} from the Azure CLI (read-only), numbered in the listed order: the chosen
     subscription, or EVERY enabled subscription when none is chosen or all_subs is set (no limit; parallel, see scan_clusters; one
@@ -1122,15 +1928,7 @@ def list_clusters_cli(emit=print, accounts=None, progress=None, cancel=None, on_
                 emit("The Azure CLI is not available / not signed in - showing only the clusters from the akslogin menu.")
                 return dict(menu)
             return {}
-        wanted = None if all_subs else AZ_OPTS.get("subscription")
-        if wanted:
-            accounts = [{"id": wanted, "name": (list_az_subscriptions().get(wanted) or {}).get("name")}]
-        else:
-            accounts = [{"id": sid, "name": i.get("name")} for sid, i in list_az_subscriptions().items() if i.get("state") in (None, "Enabled")]
-            if len(accounts) > 20:
-                emit(f"Searching {len(accounts)} subscriptions for AKS clusters (use --subscription to choose one) ...")
-            if not accounts:
-                accounts = [{"id": None, "name": None}]           # nothing listed: let az use its default subscription
+        accounts = resolve_scan_scope(emit)
     found, failed = scan_clusters(accounts, emit, progress, cancel, on_batch)
     emit(scan_summary(found))
     rows = merge_menu(found, menu) if menu is not None else found
@@ -1669,7 +2467,10 @@ def az_cli(args, target=None, timeout=90, subscription=True):
     except Exception as exc:
         return None, str(exc)
     if proc.returncode != 0:
-        return None, (proc.stderr or proc.stdout).strip()
+        err = (proc.stderr or proc.stdout).strip()
+        if is_expired_error(err) and list(args[:2]) not in (["account", "show"], ["account", "list"]):     # 'not signed in' is not 'expired'
+            _note_expired(args, target, err)          # the sign-in expired: mark the account, the window shows the banner
+        return None, err
     try:
         return (json.loads(proc.stdout) if proc.stdout.strip() else {}), None
     except json.JSONDecodeError:
@@ -1687,8 +2488,15 @@ def _az_subscriptions():
     data, err = az_cli(["account", "list", "--all"], None, 120, subscription=False)
     if err or not isinstance(data, list):
         return {}, (err or "unexpected output from az account list")
-    return {s["id"]: {"name": s.get("name"), "state": s.get("state"), "default": bool(s.get("isDefault")),
-                      "user": (s.get("user") or {}).get("name"), "tenant": s.get("tenantId")} for s in data if s.get("id")}, None
+    subs = {s["id"]: {"name": s.get("name"), "state": s.get("state"), "default": bool(s.get("isDefault")),
+                      "user": (s.get("user") or {}).get("name"), "tenant": s.get("tenantId"), "domain": s.get("tenantDefaultDomain"),
+                      "kind": (s.get("user") or {}).get("type") or "user", "tenant_name": s.get("tenantDisplayName") or s.get("tenantDefaultDomain")}
+            for s in data if s.get("id")}
+    want = (LOGIN_OPTS.get("tenant") or "").lower()
+    if want and not LOGIN_OPTS.get("gui"):                   # command line --tenant: only that tenant's subscriptions (when there are any)
+        kept = {k: v for k, v in subs.items() if want in ((v.get("tenant") or "").lower(), (v.get("domain") or "").lower())}
+        subs = kept or subs
+    return subs, None
 
 
 def list_az_subscriptions():
@@ -7388,8 +8196,15 @@ def run_clusters(selected, minutes, emit, skip_login=False, context=None, progre
         emit("#" * 78)
         emit(f"# CLUSTER {i} of {n}: {label}  (#{number})")
         emit("#" * 78)
+        owner = account_of_cluster(number) if LOGIN_OPTS["method"] == "cli" or CLI_TARGETS else None
+        if owner and (CRED["status"].get(owner) or {}).get("state") == "expired":
+            entry.update(status="credentials expired", error=f"Credentials for {owner} expired - sign in again (step 2), then run this cluster again.")
+            emit(f"SKIPPED cluster {label}: credentials for {owner} expired - sign in again. Continuing with the next cluster.")
+            notify(i, n, label, entry["status"], entry)
+            continue
         notify(i, n, label, "running", entry)
         t0 = time.time()
+        events0 = CRED["events"]
         finding_cb = on_finding
         if on_finding and n > 1:
             finding_cb = lambda sev, text, _l=label: on_finding(sev, f"[{_l}] {text}")
@@ -7403,6 +8218,11 @@ def run_clusters(selected, minutes, emit, skip_login=False, context=None, progre
         except Exception as exc:
             entry.update(status="failed", error=str(exc))
             emit(f"ERROR on cluster {label}: {exc}")
+            if is_expired_error(str(exc)) or CRED["events"] > events0:
+                who_ = owner or CRED.get("current") or "the signed-in account"
+                set_account_status(who_, "expired", None, str(exc))
+                entry.update(status="credentials expired", error=f"Credentials for {who_} expired - sign in again (step 2), then run this cluster again.")
+                emit(f"Credentials for {who_} expired - sign in again. Continuing with the next cluster.")
         entry["secs"] = time.time() - t0
         notify(i, n, label, entry["status"], entry)
 
@@ -7489,12 +8309,944 @@ def render_index_html(entries, minutes):
 
 
 # ---------------------------------------------------------------------------
+# PRIVILEGED ROLES (PIM) - the ONE opt-in exception to "this tool only reads".
+#
+# The 4th tab of the window (and --pim-list / --pim-activate-all) shows the roles and groups the signed-in user holds through Privileged
+# Identity Management (active now / eligible) and can submit SELF-ACTIVATION requests for the eligible ones - ONLY after the user
+# confirms in a dialog. It never runs during a report, never assigns anything to anyone and never creates, changes or deletes assignments,
+# policies, groups or users. Enforced HERE by assert_pim_get() / assert_pim_write() (allow-lists); everything else is refused with
+# "blocked: read-only mode". All calls go through `az rest` (az owns the sign-in; the token never reaches this tool):
+#   1. Azure resource roles ......... ARM PIM API (management.azure.com, api-version 2020-10-01, SelfActivate)
+#   2. Microsoft Entra roles and
+#      Privileged access groups ..... the PIM service API behind the portal's own PIM blade (api.azrbac.mspim.azure.com, az rest --resource
+#                                     01fc33a7-78ba-4d2f-a4b7-768e336e890e) - no Microsoft Graph consent needed
+#   3. fallback ..................... if (2) is blocked: the exact error is shown and the portal PIM page can be opened
+# ---------------------------------------------------------------------------
+
+PIM_NOTE = "Reports only read. The Privileged roles tab can activate your own eligible roles when you confirm."
+PIM_EXCEPTION_STATEMENT = ("Opt-in exception: the Privileged roles (PIM) tab can submit SELF-ACTIVATION requests for your own, already eligible roles and groups, "
+                           "only after you confirm in a dialog. It never assigns access to anyone and never creates, changes or deletes assignments, policies, groups or users.")
+PIM_ARM_HOST = "management.azure.com"
+PIM_MSPIM_HOST = "api.azrbac.mspim.azure.com"
+PIM_MSPIM_RESOURCE = "01fc33a7-78ba-4d2f-a4b7-768e336e890e"
+PIM_MSPIM_PREFIX = "/api/v2/privilegedAccess/"
+PIM_ARM_API = "2020-10-01"
+PIM_WORKERS = 4                    # activation requests that run at the same time
+PIM_THROTTLE_WAITS = (2, 5, 10)    # seconds to wait before each retry after HTTP 429
+PIM_MAX_PAGES = 20
+PIM_FAMILIES = ("arm", "entra", "group")
+PIM_TYPE = {"arm": "Azure resource role", "entra": "Microsoft Entra role", "group": "Privileged access group"}
+PIM_FAMILY_NAME = {"arm": "Azure resource roles", "entra": "Microsoft Entra roles", "group": "Privileged access groups"}
+PIM_PORTAL_URLS = {"entra": "https://portal.azure.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadmigratedroles",
+                   "group": "https://portal.azure.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadgroup"}
+PIM_SCRIPT_HINT = "activate_pim_roles_ui.py (your existing browser-automation script, next to this tool; not run or imported by it)"
+PIM_UNKNOWN_MAX_MINUTES = 60       # when the policy cannot be read and no hours were typed: ask for 1 hour only
+PIM_COLUMN_HELP = {
+    "Role or group name": "The name of the role (Azure resource role or Microsoft Entra role) or of the privileged access group.",
+    "Type": "Azure resource role = a role on a subscription / resource group / resource; Microsoft Entra role = a directory role of your tenant; Privileged access group = membership or ownership of a group.",
+    "Scope": "Where the role applies: the subscription / resource group / management group, the whole directory, or the group membership kind (member / owner).",
+    "Status": "Active = usable right now. Eligible = you may activate it. Pending approval = you asked and an approver must decide. Expired soon = active but less than 30 minutes left.",
+    "Expires at (time left)": "When the activation ends (your local time) and how long is left. Eligible roles show until when you stay eligible.",
+    "Maximum duration allowed": "The longest activation the role policy allows. The tool never asks for more than this.",
+    "Requires": "What the policy asks at activation: justification, ticket, approval, multi-factor authentication, authentication context. Empty = could not be read or nothing.",
+}
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
+_PIM_SCOPE_RE = re.compile(r"^(?:/(?:subscriptions|providers)(?:/[A-Za-z0-9._()\-]+)+)?$")
+_PIM_DUR_RE = re.compile(r"^PT(?:\d{1,4}H)?(?:\d{1,5}M)?$")
+_PIM_QUERY_CHARS = re.compile(r"^[A-Za-z0-9 _/()',.:=\-$&%+~@]*$")
+_PIM_THROTTLE_RE = re.compile(r"429|TooManyRequests|Too Many Requests|throttl", re.I)
+_PIM_ARM_ROOT_RE = re.compile(r"^/providers/Microsoft\.Authorization/(roleEligibilityScheduleInstances|roleAssignmentScheduleInstances|roleAssignmentScheduleRequests)$")
+_PIM_ARM_SCOPED_RE = re.compile(r"^(?P<scope>(?:/[A-Za-z0-9._()\-]+)*)/providers/Microsoft\.Authorization/"
+                                r"(?P<kind>roleManagementPolicyAssignments|roleManagementPolicies/[0-9a-fA-F\-]{36}|roleDefinitions/[0-9a-fA-F\-]{36})$")
+_PIM_MSPIM_GET_RE = re.compile(r"^" + re.escape(PIM_MSPIM_PREFIX) + r"(aadroles|aadGroups)/(roleAssignments|roleSettingsV2|resources)$")
+_PIM_MSPIM_POST_RE = re.compile(r"^" + re.escape(PIM_MSPIM_PREFIX) + r"(aadroles|aadGroups)/roleAssignmentRequests$")
+PIM_STATE = {"me": None, "variant": {}, "pending": set(), "lock": threading.Lock()}     # remembered while the program runs (never written to a file)
+
+
+def _pim_block(what, tool="pim"):
+    msg = _blocked_message(what)
+    GUARD.block(tool, what, msg)
+    raise ReadOnlyViolation(msg)
+
+
+def _pim_url(url):
+    from urllib.parse import urlsplit, parse_qsl
+    if not isinstance(url, str) or not url or any(ord(c) < 32 for c in url):
+        _pim_block("(malformed PIM address)")
+    u = urlsplit(url)
+    if u.scheme != "https" or u.username or u.fragment or u.port not in (None, 443):
+        _pim_block("PIM address " + url[:80])
+    if not _PIM_QUERY_CHARS.match(u.query):
+        _pim_block("PIM query " + u.query[:80])
+    return u, dict(parse_qsl(u.query, keep_blank_values=True))
+
+
+def assert_pim_get(url, resource=None):
+    """Allow-list for the PIM list calls (GET only): ARM role (eligibility / assignment) schedule instances and requests of the signed-in user, role
+    policies and role definitions; the PIM service's roleAssignments / roleSettingsV2 / resources. Raises ReadOnlyViolation otherwise. Returns "read"."""
+    u, q = _pim_url(url)
+    host, path = u.hostname.lower(), u.path
+    if host == PIM_ARM_HOST:
+        if resource not in (None, ""):
+            _pim_block("GET " + path + " (unexpected --resource)")
+        if _PIM_ARM_ROOT_RE.match(path):
+            if q.get("api-version") != PIM_ARM_API or q.get("$filter") != "asTarget()" or set(q) - {"api-version", "$filter", "$skiptoken"}:
+                _pim_block("GET " + path + " with these parameters")
+            return "read"
+        m = _PIM_ARM_SCOPED_RE.match(path)
+        if m and _PIM_SCOPE_RE.match(m.group("scope")) and ".." not in path:
+            kind = m.group("kind")
+            if kind == "roleManagementPolicyAssignments":
+                f = q.get("$filter", "")
+                if q.get("api-version") == PIM_ARM_API and set(q) <= {"api-version", "$filter", "$skiptoken"} and re.match(r"^roleDefinitionId eq '/[A-Za-z0-9._()/\-]+'$", f):
+                    return "read"
+            elif kind.startswith("roleManagementPolicies/"):
+                if q.get("api-version") == PIM_ARM_API and set(q) == {"api-version"}:
+                    return "read"
+            elif kind.startswith("roleDefinitions/"):
+                if q.get("api-version") in ("2022-04-01", "2018-01-01-preview") and set(q) == {"api-version"}:
+                    return "read"
+        _pim_block("GET " + path)
+    if host == PIM_MSPIM_HOST:
+        if resource != PIM_MSPIM_RESOURCE:
+            _pim_block("GET " + path + " (wrong --resource)")
+        if _PIM_MSPIM_GET_RE.match(path) and set(q) <= {"$expand", "$filter", "$count", "$orderby", "$top", "$skiptoken", "$select"}:
+            return "read"
+        _pim_block("GET " + path)
+    _pim_block("GET " + host + path)
+
+
+def _pim_iso_minutes(text):
+    """'PT8H' / 'PT30M' / 'P1D' / 'PT1H30M' -> minutes (None when it is not a duration)."""
+    m = re.match(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$", str(text or ""))
+    if not m or not any(m.groups()):
+        return None
+    d, h, mi, s = (int(x) if x else 0 for x in m.groups())
+    return d * 1440 + h * 60 + mi + (1 if s else 0)
+
+
+def pim_duration_text(minutes):
+    minutes = max(1, int(minutes))
+    h, m = divmod(minutes, 60)
+    return "PT" + (f"{h}H" if h else "") + (f"{m}M" if m or not h else "")
+
+
+def _same_id(a, b):
+    return isinstance(a, str) and isinstance(b, str) and a.strip().lower() == b.strip().lower() and bool(a.strip())
+
+
+def _pim_check_ticket(t):
+    return isinstance(t, dict) and set(t) == {"ticketNumber", "ticketSystem"} and all(isinstance(v, str) and len(v) <= 200 for v in t.values())
+
+
+def assert_pim_write(method, url, body, me_oid, max_minutes=None):
+    """Allow-list for the ONLY writes of the tool - self-activation of your OWN eligible role / group (three exact shapes):
+       ARM    PUT  {scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/{guid}?api-version=2020-10-01   {properties:{requestType:SelfActivate,...}}
+       PIM    POST .../aadroles/roleAssignmentRequests   and   .../aadGroups/roleAssignmentRequests   {type:UserAdd, assignmentState:Active, subjectId = you, ...}
+    Everything else (other request types, other principals, deletes, policy / setting updates, groups, users ...) raises ReadOnlyViolation. Returns "pim-activate"."""
+    from datetime import datetime as _dt
+    if not isinstance(me_oid, str) or not _GUID_RE.match(me_oid):
+        _pim_block("PIM activation (the signed-in user's object id is unknown)")
+    u, q = _pim_url(url)
+    host, path, meth = u.hostname.lower(), u.path, str(method).upper()
+    if not isinstance(body, dict):
+        _pim_block(f"{meth} {path} (no request body)")
+    if host == PIM_ARM_HOST:
+        m = re.match(r"^(?P<scope>(?:/[A-Za-z0-9._()\-]+)*)/providers/Microsoft\.Authorization/roleAssignmentScheduleRequests/(?P<id>[0-9a-fA-F\-]{36})$", path)
+        if meth != "PUT" or not m or not _GUID_RE.match(m.group("id")) or not _PIM_SCOPE_RE.match(m.group("scope")) or ".." in path \
+                or q != {"api-version": PIM_ARM_API}:
+            _pim_block(f"{meth} {path}")
+        if set(body) != {"properties"} or not isinstance(body["properties"], dict):
+            _pim_block(f"PUT {path} (body shape)")
+        p = body["properties"]
+        need = {"principalId", "roleDefinitionId", "requestType", "justification", "scheduleInfo"}
+        if not need <= set(p) or set(p) - need - {"linkedRoleEligibilityScheduleId", "ticketInfo"}:
+            _pim_block(f"PUT {path} (properties other than the self-activation fields)")
+        if p["requestType"] != "SelfActivate":
+            _pim_block(f"requestType {p['requestType']}")
+        if not _same_id(p["principalId"], me_oid):
+            _pim_block("activation for another principal")
+        if not isinstance(p["justification"], str) or not p["justification"].strip():
+            _pim_block("activation without a justification")
+        if not isinstance(p["roleDefinitionId"], str) or not re.search(r"/providers/Microsoft\.Authorization/roleDefinitions/[0-9a-fA-F\-]{36}$", p["roleDefinitionId"]):
+            _pim_block("roleDefinitionId " + str(p["roleDefinitionId"])[:60])
+        if "linkedRoleEligibilityScheduleId" in p and not isinstance(p["linkedRoleEligibilityScheduleId"], str):
+            _pim_block("linkedRoleEligibilityScheduleId")
+        if "ticketInfo" in p and not _pim_check_ticket(p["ticketInfo"]):
+            _pim_block("ticketInfo")
+        s = p["scheduleInfo"]
+        if not isinstance(s, dict) or set(s) != {"startDateTime", "expiration"} or not isinstance(s["expiration"], dict) \
+                or set(s["expiration"]) != {"type", "duration"} or s["expiration"]["type"] != "AfterDuration" \
+                or not isinstance(s["expiration"]["duration"], str) or not _PIM_DUR_RE.match(s["expiration"]["duration"]):
+            _pim_block("scheduleInfo")
+        mins = _pim_iso_minutes(s["expiration"]["duration"])
+        if not mins or (max_minutes and mins > max_minutes):
+            _pim_block(f"duration {s['expiration']['duration']} (over the policy maximum)")
+        return "pim-activate"
+    if host == PIM_MSPIM_HOST:
+        if meth != "POST" or not _PIM_MSPIM_POST_RE.match(path) or q:
+            _pim_block(f"{meth} {path}")
+        need = {"roleDefinitionId", "resourceId", "subjectId", "assignmentState", "type", "reason", "schedule", "linkedEligibleRoleAssignmentId"}
+        if not need <= set(body) or set(body) - need - {"ticketNumber", "ticketSystem"}:
+            _pim_block(f"POST {path} (fields other than the self-activation fields)")
+        if body["type"] != "UserAdd":
+            _pim_block(f"request type {body['type']}")
+        if body["assignmentState"] != "Active":
+            _pim_block(f"assignmentState {body['assignmentState']}")
+        if not _same_id(body["subjectId"], me_oid):
+            _pim_block("activation for another subject")
+        if not isinstance(body["reason"], str) or not body["reason"].strip():
+            _pim_block("activation without a justification")
+        for k in ("roleDefinitionId", "resourceId", "linkedEligibleRoleAssignmentId"):
+            if not isinstance(body[k], str) or not body[k].strip() or len(body[k]) > 200:
+                _pim_block(f"{k} missing")
+        if not _GUID_RE.match(body["resourceId"]):
+            _pim_block("resourceId")
+        for k in ("ticketNumber", "ticketSystem"):
+            if k in body and not isinstance(body[k], str):
+                _pim_block(k)
+        s = body["schedule"]
+        if not isinstance(s, dict) or set(s) != {"type", "startDateTime", "endDateTime"} or s["type"] != "Once":
+            _pim_block("schedule")
+        try:
+            t0 = _dt.fromisoformat(str(s["startDateTime"]).replace("Z", "+00:00"))
+            t1 = _dt.fromisoformat(str(s["endDateTime"]).replace("Z", "+00:00"))
+        except ValueError:
+            _pim_block("schedule dates")
+        mins = (t1 - t0).total_seconds() / 60
+        if mins <= 0 or mins > 30 * 1440 or (max_minutes and mins > max_minutes + 1):
+            _pim_block("schedule length (over the policy maximum)")
+        return "pim-activate"
+    _pim_block(f"{meth} {host}{path}")
+
+
+# --- transport: `az rest` (az signs the request; the token never reaches this program) ----------------------------------------
+
+def _cmd_safe_json(body):
+    """JSON text for the command line: every character cmd.exe could treat as an operator is written as a \\u escape (still valid JSON)."""
+    text = json.dumps(body, separators=(",", ":"), ensure_ascii=True)
+    return "".join("\\u%04x" % ord(c) if c in "&|<>^%()!" else c for c in text)
+
+
+def _win_quote(arg):
+    """Quote an argument for a cmd.exe command line (always quoted, so & | ( ) in a URL stay literal)."""
+    bs = chr(92)
+    q = re.sub("(" + re.escape(bs) + "*)\"", lambda m: m.group(1) * 2 + bs + "\"", arg)
+    q = re.sub("(" + re.escape(bs) + "+)$", lambda m: m.group(1) * 2, q)
+    return '"' + q + '"'
+
+
+def _pim_exec(cmd, timeout=90):
+    run = cmd
+    if os.name == "nt" and str(cmd[0]).lower().endswith((".cmd", ".bat")):
+        run = " ".join(_win_quote(str(a)) for a in cmd)
+    return subprocess.run(run, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=_az_env())
+
+
+_pim_sleep = time.sleep
+
+
+def pim_error_text(err, n=700):
+    """The real error, trimmed: HTTP status name + the response body (tokens scrubbed)."""
+    text = scrub_secrets(str(err or "").strip())
+    text = re.sub(r"^ERROR:\s*", "", text)
+    return text if len(text) <= n else text[:n] + " ..."
+
+
+def pim_error_status(err):
+    text = str(err or "")
+    names = (("Bad Request", 400), ("Unauthorized", 401), ("Forbidden", 403), ("Not Found", 404), ("Conflict", 409), ("Too Many Requests", 429),
+             ("Internal Server Error", 500), ("Bad Gateway", 502), ("Service Unavailable", 503))
+    for name, code in names:
+        if name.lower() in text.lower():
+            return code
+    m = re.search(r"\b(?:HTTP|status)[ :]*(\d{3})\b", text)
+    if m:
+        return int(m.group(1))
+    if "aadsts" in text.lower():
+        return 401
+    return None
+
+
+def _pim_call(method, url, body=None, resource=None, timeout=90):
+    """Run ONE az rest call (already allow-list checked by the caller). Returns (json, None) or (None, error text). HTTP 429 is retried with back-off."""
+    exe = shutil.which("az")
+    if not exe:
+        return None, "Azure CLI (az) was not found on PATH"
+    cmd = [exe, "rest", "--method", method.lower(), "--url", url]
+    if resource:
+        cmd += ["--resource", resource]
+    if body is not None:
+        cmd += ["--body", _cmd_safe_json(body)]
+    cmd += ["--only-show-errors", "-o", "json"]
+    err = None
+    for attempt in range(len(PIM_THROTTLE_WAITS) + 1):
+        try:
+            proc = _pim_exec(cmd, timeout)
+        except subprocess.TimeoutExpired:
+            return None, f"timed out after {timeout}s"
+        except Exception as exc:
+            return None, str(exc)
+        if proc.returncode == 0:
+            try:
+                return (json.loads(proc.stdout) if proc.stdout.strip() else {}), None
+            except json.JSONDecodeError:
+                return proc.stdout.strip(), None
+        err = (proc.stderr or proc.stdout or "").strip() or f"az rest failed (exit {proc.returncode})"
+        if _PIM_THROTTLE_RE.search(err) and attempt < len(PIM_THROTTLE_WAITS):
+            _pim_sleep(PIM_THROTTLE_WAITS[attempt])
+            continue
+        break
+    if is_expired_error(err):
+        _note_expired(["rest"], None, err)
+    return None, err
+
+
+def pim_read(url, resource=None):
+    """GET through the PIM allow-list. (json, None) or (None, error)."""
+    try:
+        assert_pim_get(url, resource)
+    except ReadOnlyViolation as v:
+        return None, str(v)
+    return _pim_call("GET", url, None, resource)
+
+
+def pim_write(method, url, body, resource=None, me_oid=None, max_minutes=None):
+    """THE ONLY WRITE of the tool: a self-activation request, checked by assert_pim_write() first. Report runs never call this function."""
+    try:
+        assert_pim_write(method, url, body, me_oid, max_minutes)
+    except ReadOnlyViolation as v:
+        return None, str(v)
+    if urlsplit_host(url) == PIM_MSPIM_HOST and resource != PIM_MSPIM_RESOURCE:
+        return None, _blocked_message("POST (wrong --resource)")
+    return _pim_call(method, url, body, resource)
+
+
+def urlsplit_host(url):
+    from urllib.parse import urlsplit
+    return (urlsplit(url).hostname or "").lower()
+
+
+# --- who am I ------------------------------------------------------------------------------------------------------------
+
+def pim_identity(force=False):
+    """{"ok", "upn", "tenant", "oid", "kind": user|guest|servicePrincipal|managedIdentity, "error", "notice"} from `az account show` and `az ad signed-in-user show`."""
+    with PIM_STATE["lock"]:
+        if PIM_STATE["me"] and not force and PIM_STATE["me"].get("ok"):
+            return dict(PIM_STATE["me"])
+    me = {"ok": False, "upn": None, "tenant": None, "oid": None, "kind": "user", "error": None, "notice": None}
+    show, err = az_cli(["account", "show"], None, 60, subscription=False)
+    if err or not isinstance(show, dict):
+        me["error"] = "Not signed in to the Azure CLI (" + _first_line(err or "no answer from az account show") + "). Sign in on tab 1 first."
+        return me
+    user = show.get("user") or {}
+    me.update(upn=user.get("name"), tenant=show.get("tenantId"))
+    utype = (user.get("type") or "user").lower()
+    if utype != "user":
+        me["kind"] = "managedIdentity" if "managed" in utype or utype == "systemassigned" or utype == "userassigned" else "servicePrincipal"
+        me["error"] = "PIM is not available for a service principal / managed identity (" + str(me["upn"]) + "): it is for people. Sign in with your own account."
+        return me
+    if "#ext#" in str(me["upn"]).lower():
+        me["kind"] = "guest"
+        me["notice"] = "This looks like a guest account (" + str(me["upn"]) + "). PIM is usually not available for guests of another tenant; if nothing is listed, sign in with your organisation account."
+    oid, err2 = az_cli(["ad", "signed-in-user", "show", "--query", "id"], None, 60, subscription=False)
+    if isinstance(oid, str) and _GUID_RE.match(oid.strip().strip('"')):
+        me["oid"] = oid.strip().strip('"')
+    me["ok"] = True
+    me["oid_error"] = None if me["oid"] else _first_line(err2 or "az ad signed-in-user show returned no id")
+    with PIM_STATE["lock"]:
+        PIM_STATE["me"] = dict(me)
+    return me
+
+
+# --- parsing -------------------------------------------------------------------------------------------------------------
+
+def _pim_dt(value):
+    if not value:
+        return None
+    s = str(value).strip().replace("Z", "+00:00")
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def pim_left_text(end, now=None):
+    if end is None:
+        return "no end date"
+    now = now or datetime.now(timezone.utc)
+    secs = int((end - now).total_seconds())
+    if secs <= 0:
+        return "expired"
+    d, rem = divmod(secs, 86400)
+    h, m = divmod(rem // 60, 60)
+    return (f"{d} d " if d else "") + (f"{h} h " if h else "") + (f"{m} min" if (m or not (d or h)) else "")
+
+
+def pim_expiry_text(end, active, now=None):
+    if end is None:
+        return "Permanent" if active else "No end date"
+    local = end.astimezone()
+    stamp = local.strftime("%Y-%m-%d %H:%M")
+    return f"{stamp}  ({pim_left_text(end, now)} left)" if active else f"until {stamp}"
+
+
+def pim_max_text(minutes):
+    if not minutes:
+        return "unknown (1 h is requested)"
+    h, m = divmod(int(minutes), 60)
+    return f"{h} h" + (f" {m} min" if m else "") if h else f"{m} min"
+
+
+def _json_setting(v):
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except ValueError:
+            return {}
+    return v if isinstance(v, dict) else {}
+
+
+def pim_arm_policy(rules):
+    """Maximum activation minutes and what an ARM role policy asks, from its rules (roleManagementPolicyAssignment effectiveRules / policy rules)."""
+    by = {r.get("id"): r for r in (rules or []) if isinstance(r, dict)}
+    mx = _pim_iso_minutes((by.get("Expiration_EndUser_Assignment") or {}).get("maximumDuration"))
+    need = []
+    en = (by.get("Enablement_EndUser_Assignment") or {}).get("enabledRules") or []
+    if "Justification" in en:
+        need.append("justification")
+    if "Ticketing" in en:
+        need.append("ticket")
+    if (((by.get("Approval_EndUser_Assignment") or {}).get("setting")) or {}).get("isApprovalRequired"):
+        need.append("approval")
+    if "MultiFactorAuthentication" in en:
+        need.append("multi-factor authentication")
+    if (by.get("AuthenticationContext_EndUser_Assignment") or {}).get("isEnabled"):
+        need.append("authentication context")
+    return {"max_minutes": mx, "requires": need}
+
+
+def pim_mspim_policy(settings):
+    """Same for the PIM service's roleSettingsV2 (userMemberSettings: ExpirationRule, JustificationRule, TicketingRule, MfaRule, ApprovalRule, AcrsRule)."""
+    mx, need = None, []
+    for r in settings or []:
+        rid, s = r.get("ruleIdentifier"), _json_setting(r.get("setting"))
+        if rid == "ExpirationRule":
+            v = s.get("maximumGrantPeriodInMinutes")
+            if v is None and s.get("maximumGrantPeriod"):
+                v = _pim_iso_minutes(s.get("maximumGrantPeriod"))
+            mx = int(v) if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()) else mx
+        elif rid == "JustificationRule" and s.get("required"):
+            need.append("justification")
+        elif rid == "TicketingRule" and s.get("ticketingRequired"):
+            need.append("ticket")
+        elif rid == "ApprovalRule" and (s.get("enabled") or s.get("isApprovalRequired") or s.get("approvers") or s.get("Approvers")):
+            need.append("approval")
+        elif rid == "MfaRule" and s.get("mfaRequired"):
+            need.append("multi-factor authentication")
+        elif rid == "AcrsRule" and (s.get("acrsRequired") or s.get("enabled")):
+            need.append("authentication context")
+    return {"max_minutes": mx, "requires": need}
+
+
+def _arm_scope_text(scope_id, ep_scope):
+    names = {"subscription": "Subscription", "resourcegroup": "Resource group", "managementgroup": "Management group"}
+    sid = scope_id or "/"
+    last = sid.rstrip("/").split("/")[-1] or "/"
+    kind = (ep_scope or {}).get("type") or ""
+    if not kind:
+        kind = "subscription" if re.fullmatch(r"/subscriptions/[^/]+", sid) else "resourcegroup" if re.fullmatch(r"/subscriptions/[^/]+/resourceGroups/[^/]+", sid) \
+            else "managementgroup" if "/managementGroups/" in sid else ""
+    name = (ep_scope or {}).get("displayName") or last
+    label = names.get(kind.lower(), "Resource" if kind else "")
+    return f"{label}: {name}" if label else name
+
+
+def _row_base(family, key, name, scope_text, scope_id, status, end, active):
+    return {"key": key, "family": family, "type": PIM_TYPE[family], "name": name, "scope": scope_text, "scope_id": scope_id, "status": status, "end": end,
+            "expires": pim_expiry_text(end, active), "max_minutes": None, "max": "", "requires": [], "requires_text": "", "role_def_id": None, "resource_id": None,
+            "link_id": None, "access_id": None, "assignment": None}
+
+
+def pim_arm_rows(items, active, now=None):
+    now = now or datetime.now(timezone.utc)
+    rows = []
+    for it in items or []:
+        p = it.get("properties") or {}
+        ep = p.get("expandedProperties") or {}
+        sid = p.get("scope") or (ep.get("scope") or {}).get("id") or "/"
+        rd = p.get("roleDefinitionId") or (ep.get("roleDefinition") or {}).get("id") or ""
+        guid = rd.rstrip("/").split("/")[-1].lower()
+        name = (ep.get("roleDefinition") or {}).get("displayName") or ""
+        end = _pim_dt(p.get("endDateTime"))
+        status = "Active" if active else "Eligible"
+        if active and end is not None and (end - now).total_seconds() < EXPIRING_SOON_SECONDS and p.get("assignmentType") != "Assigned":
+            status = "Expired soon"
+        r = _row_base("arm", f"arm|{sid.lower()}|{guid}", name or guid, _arm_scope_text(sid, ep.get("scope")), sid, status, end, active)
+        r.update(role_def_id=rd, principal_id=p.get("principalId"), assignment=p.get("assignmentType") or ("Eligible" if not active else None),
+                 link_id=p.get("linkedRoleEligibilityScheduleId") or p.get("roleEligibilityScheduleId"),
+                 needs_name=not name)
+        if active and p.get("assignmentType") == "Assigned" and end is None:
+            r["expires"] = "Permanent (not activated through PIM)"
+        rows.append(r)
+    return rows
+
+
+def pim_mspim_rows(kind, items, active, now=None):
+    """Rows for the PIM service's roleAssignments (aadroles = Entra roles, aadGroups = privileged access groups)."""
+    now = now or datetime.now(timezone.utc)
+    fam = "entra" if kind == "entra" else "group"
+    rows = []
+    for it in items or []:
+        rdef = it.get("roleDefinition") or {}
+        res = rdef.get("resource") or it.get("resource") or {}
+        rd_id = it.get("roleDefinitionId") or rdef.get("id") or ""
+        res_id = it.get("resourceId") or rdef.get("resourceId") or res.get("id") or ""
+        end = _pim_dt(it.get("endDateTime"))
+        status = "Active" if active else "Eligible"
+        if active and end is not None and (end - now).total_seconds() < EXPIRING_SOON_SECONDS:
+            status = "Expired soon"
+        if fam == "entra":
+            scoped = it.get("scopedResource") or {}
+            sc_id = it.get("scopedResourceId") or ""
+            scope_text = f"{scoped.get('displayName') or sc_id}  (administrative scope)" if sc_id and sc_id.lower() != res_id.lower() else "Directory (whole tenant)"
+            name = rdef.get("displayName") or rd_id
+            key = f"entra|{rd_id.lower()}|{sc_id.lower()}"
+        else:
+            access = (rdef.get("displayName") or rdef.get("externalId") or "member").strip()
+            name = res.get("displayName") or res_id
+            scope_text = ("Owner of the group" if access.lower().startswith("owner") else "Member of the group")
+            key = f"group|{res_id.lower()}|{access.lower()}"
+        r = _row_base(fam, key, name, scope_text, res_id, status, end, active)
+        r.update(role_def_id=rd_id, resource_id=res_id, link_id=it.get("linkedEligibleRoleAssignmentId") if active else it.get("id"),
+                 assignment=it.get("memberType") or ("Eligible" if not active else None), eligible_id=it.get("id"),
+                 access_id="owner" if fam == "group" and access.lower().startswith("owner") else ("member" if fam == "group" else None))
+        rows.append(r)
+    return rows
+
+
+def pim_merge(active_rows, eligible_rows, pending_keys=()):
+    """(active, eligible): eligible roles that are already active are dropped from the eligible list (nothing to request); eligible roles with a
+    request waiting for approval are marked 'Pending approval'."""
+    act_keys = {r["key"] for r in active_rows}
+    out = []
+    for r in eligible_rows:
+        if r["key"] in act_keys:
+            continue
+        if r["key"] in pending_keys:
+            r = dict(r, status="Pending approval")
+        out.append(r)
+    return active_rows, out
+
+
+def _pim_pages(url, resource=None):
+    items, err = [], None
+    for _ in range(PIM_MAX_PAGES):
+        data, err = pim_read(url, resource)
+        if err:
+            return items, err
+        if isinstance(data, dict):
+            items += [x for x in (data.get("value") or []) if isinstance(x, dict)]
+            url = data.get("nextLink") or data.get("odata.nextLink") or data.get("@odata.nextLink")
+        else:
+            url = None
+        if not url:
+            break
+    return items, None
+
+
+def _pim_arm_list_url(name):
+    return f"https://{PIM_ARM_HOST}/providers/Microsoft.Authorization/{name}?api-version={PIM_ARM_API}&$filter=asTarget()"
+
+
+def pim_arm_policy_for(row):
+    """Read the policy of one eligible Azure role (one GET): returns {"max_minutes", "requires"} or None."""
+    sid = row["scope_id"] if row["scope_id"] != "/" else ""
+    url = (f"https://{PIM_ARM_HOST}{sid}/providers/Microsoft.Authorization/roleManagementPolicyAssignments?api-version={PIM_ARM_API}"
+           f"&$filter=roleDefinitionId eq '{row['role_def_id']}'")
+    data, err = pim_read(url)
+    if err or not isinstance(data, dict):
+        return None
+    vals = [v for v in (data.get("value") or []) if isinstance(v, dict)]
+    best = next((v for v in vals if str((v.get("properties") or {}).get("scope", "")).lower() == (row["scope_id"] or "").lower()), vals[0] if vals else None)
+    if not best:
+        return None
+    props = best.get("properties") or {}
+    rules = props.get("effectiveRules")
+    if not rules and props.get("policyId"):
+        pol, err = pim_read(f"https://{PIM_ARM_HOST}{props['policyId']}?api-version={PIM_ARM_API}")
+        rules = ((pol or {}).get("properties") or {}).get("effectiveRules") or ((pol or {}).get("properties") or {}).get("rules") if isinstance(pol, dict) else None
+    return pim_arm_policy(rules) if rules else None
+
+
+def pim_mspim_policy_for(row):
+    res = "aadroles" if row["family"] == "entra" else "aadGroups"
+    url = (f"https://{PIM_MSPIM_HOST}{PIM_MSPIM_PREFIX}{res}/roleSettingsV2?$filter=(resource/id eq '{row['resource_id']}') and "
+           f"(roleDefinition/id eq '{row['role_def_id']}')")
+    data, err = pim_read(url, PIM_MSPIM_RESOURCE)
+    if err or not isinstance(data, dict):
+        return None
+    vals = [v for v in (data.get("value") or []) if isinstance(v, dict)]
+    if not vals:
+        return None
+    return pim_mspim_policy(vals[0].get("userMemberSettings") or vals[0].get("userMemberSetting") or [])
+
+
+def pim_enrich(rows, workers=PIM_WORKERS):
+    """Fill the maximum duration and 'Requires' of the eligible rows (one policy read per row, 4 at a time). A failed read leaves them empty."""
+    def one(r):
+        try:
+            pol = pim_arm_policy_for(r) if r["family"] == "arm" else pim_mspim_policy_for(r)
+        except Exception:
+            pol = None
+        if pol:
+            r["max_minutes"], r["requires"] = pol["max_minutes"], pol["requires"]
+        r["max"] = pim_max_text(r["max_minutes"])
+        r["requires_text"] = ", ".join(r["requires"]) if r["requires"] else ("" if pol else "not readable")
+    if rows:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            list(ex.map(one, rows))
+    return rows
+
+
+def _pim_fix_arm_names(rows):
+    for r in rows:
+        if r.pop("needs_name", False):
+            sid = r["scope_id"] if r["scope_id"] != "/" else ""
+            data, err = pim_read(f"https://{PIM_ARM_HOST}{sid}/providers/Microsoft.Authorization/roleDefinitions/{r['name']}?api-version=2022-04-01")
+            nm = (((data or {}).get("properties") or {}).get("roleName")) if isinstance(data, dict) else None
+            if nm:
+                r["name"] = nm
+
+
+def pim_load_arm(me):
+    out = {"state": "ok", "error": None, "active": [], "eligible": [], "pending": set(), "note": ""}
+    elig, err = _pim_pages(_pim_arm_list_url("roleEligibilityScheduleInstances"))
+    if err:
+        out.update(state="error", error=pim_error_text(err))
+    act, err2 = _pim_pages(_pim_arm_list_url("roleAssignmentScheduleInstances"))
+    if err2:
+        out.update(state="error", error=pim_error_text(err2) if not err else out["error"])
+    reqs, _e = _pim_pages(_pim_arm_list_url("roleAssignmentScheduleRequests"))
+    for it in reqs:
+        p = it.get("properties") or {}
+        if str(p.get("status", "")).lower().startswith("pendingapproval") and str(p.get("requestType", "SelfActivate")).lower() == "selfactivate":
+            guid = str(p.get("roleDefinitionId", "")).rstrip("/").split("/")[-1].lower()
+            out["pending"].add(f"arm|{str(p.get('scope', '')).lower()}|{guid}")
+    out["active"] = pim_arm_rows(act, True)
+    out["eligible"] = pim_arm_rows(elig, False)
+    for it in (elig + act):                       # the object id for the other families, when az ad signed-in-user could not give it
+        pid = (it.get("properties") or {}).get("principalId")
+        if pid and _GUID_RE.match(str(pid)):
+            out["principal_id"] = pid
+            break
+    _pim_fix_arm_names(out["active"] + out["eligible"])
+    return out
+
+
+def _mspim_variants(oid, state):
+    f = f"(subject/id eq '{oid}') and (assignmentState eq '{state}')"
+    return ["$expand=linkedEligibleRoleAssignment,subject,scopedResource,roleDefinition($expand=resource)&$filter=" + f,
+            "$expand=roleDefinition($expand=resource)&$filter=" + f,
+            "$filter=" + f]
+
+
+def pim_load_mspim(kind, me):
+    res = "aadroles" if kind == "entra" else "aadGroups"
+    out = {"state": "ok", "error": None, "active": [], "eligible": [], "pending": set(), "note": ""}
+    base = f"https://{PIM_MSPIM_HOST}{PIM_MSPIM_PREFIX}{res}/roleAssignments"
+    lists = {}
+    for st in ("Eligible", "Active"):
+        vs = _mspim_variants(me["oid"], st)
+        first = PIM_STATE["variant"].get(kind)
+        order = ([first] if first is not None else []) + [i for i in range(len(vs)) if i != first]
+        err = None
+        for i in order:
+            items, err = _pim_pages(base + "?" + vs[i], PIM_MSPIM_RESOURCE)
+            if not err:
+                PIM_STATE["variant"][kind] = i                  # the working method is remembered
+                lists[st] = items
+                break
+            if pim_error_status(err) in (401, 403):             # a different query will not help: the service itself refuses
+                break
+        if err:
+            out.update(state="error", error=pim_error_text(err))
+            return out
+    out["active"] = pim_mspim_rows(kind, lists["Active"], True)
+    out["eligible"] = pim_mspim_rows(kind, [x for x in lists["Eligible"]], False)
+    return out
+
+
+def pim_collect(me, emit=None):
+    """Read-only: the three families side by side. -> {"active": [...], "eligible": [...], "families": {fam: {state, text, error}}, "me": me}."""
+    say = emit or (lambda _l: None)
+    me = dict(me)
+    res = {}
+    if not me.get("oid"):                      # no object id from az ad signed-in-user: the ARM answer carries it
+        res["arm"] = pim_load_arm(me)
+        me["oid"] = res["arm"].get("principal_id")
+        if me["oid"]:
+            with PIM_STATE["lock"]:
+                if PIM_STATE["me"]:
+                    PIM_STATE["me"]["oid"] = me["oid"]
+    tasks = {}
+    if "arm" not in res:
+        tasks["arm"] = lambda: pim_load_arm(me)
+    for fam in ("entra", "group"):
+        tasks[fam] = (lambda f=fam: pim_load_mspim(f, me)) if me.get("oid") else (
+            lambda f=fam: {"state": "error", "error": "Your object id could not be read (az ad signed-in-user show failed: " + str(me.get("oid_error")) + ")",
+                           "active": [], "eligible": [], "pending": set()})
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {ex.submit(fn): fam for fam, fn in tasks.items()}
+        for f in as_completed(futs):
+            try:
+                res[futs[f]] = f.result()
+            except Exception as exc:
+                res[futs[f]] = {"state": "error", "error": str(exc), "active": [], "eligible": [], "pending": set()}
+    pending = set(PIM_STATE["pending"])
+    for r in res.values():
+        pending |= r.get("pending", set())
+    active, eligible, fams = [], [], {}
+    for fam in PIM_FAMILIES:
+        r = res[fam]
+        a, e = pim_merge(r["active"], r["eligible"], pending)
+        active += a
+        eligible += e
+        if r["state"] == "ok":
+            pend = len([x for x in e if x["status"] == "Pending approval"])
+            fams[fam] = {"state": "ok", "text": f"OK ({len(a)} active, {len(e) - pend} eligible" + (f", {pend} pending approval" if pend else "") + ")", "error": None}
+        else:
+            fams[fam] = {"state": "error", "text": "Failed - see the message", "error": r["error"]}
+        say(f"PIM {PIM_FAMILY_NAME[fam]}: " + (fams[fam]["text"] if r["state"] == "ok" else "FAILED: " + str(r["error"])))
+    pim_enrich([r for r in eligible if r["status"] == "Eligible"])
+    order = {"arm": 0, "entra": 1, "group": 2}
+    active.sort(key=lambda r: (order[r["family"]], r["name"].lower()))
+    eligible.sort(key=lambda r: (order[r["family"]], r["name"].lower()))
+    return {"active": active, "eligible": eligible, "families": fams, "me": me}
+
+
+def pim_no_eligible_text(result):
+    """Plain explanation for 'nothing eligible' (shown only when no family listed any eligible role)."""
+    ok = [f for f, v in result["families"].items() if v["state"] == "ok"]
+    if result["eligible"] or not ok:
+        return ""
+    return ("No eligible roles were found for " + str(result["me"].get("upn")) + ". Likely causes: you are not eligible for anything through PIM, you are signed in to a different tenant "
+            "than the one that holds your eligibility, PIM is not enabled for your roles, or the account lacks permission to read them. Check with `az account show`.")
+
+
+# --- activation ----------------------------------------------------------------------------------------------------------
+
+def pim_effective_minutes(max_minutes, hours):
+    """Minutes to request: the policy maximum, or the hours typed - never more than the maximum. Unknown maximum and no hours typed: 1 hour."""
+    typed = None if hours in (None, "") else max(1, int(round(float(hours) * 60)))
+    if max_minutes:
+        return min(typed, max_minutes) if typed else max_minutes
+    return typed or PIM_UNKNOWN_MAX_MINUTES
+
+
+def pim_build_request(row, me, justification, hours=None, ticket_number="", ticket_system="", now=None, request_id=None):
+    """-> (method, url, body, resource, minutes) for ONE eligible row. Pure: nothing is sent."""
+    now = now or datetime.now(timezone.utc)
+    mins = pim_effective_minutes(row.get("max_minutes"), hours)
+    ticket_number, ticket_system = (ticket_number or "").strip(), (ticket_system or "").strip()
+    if row["family"] == "arm":
+        sid = row["scope_id"] if row["scope_id"] != "/" else ""
+        props = {"principalId": me["oid"], "roleDefinitionId": row["role_def_id"], "requestType": "SelfActivate", "justification": justification,
+                 "scheduleInfo": {"startDateTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "expiration": {"type": "AfterDuration", "duration": pim_duration_text(mins)}}}
+        if row.get("link_id"):
+            props["linkedRoleEligibilityScheduleId"] = row["link_id"]
+        if ticket_number or ticket_system:
+            props["ticketInfo"] = {"ticketNumber": ticket_number, "ticketSystem": ticket_system}
+        url = f"https://{PIM_ARM_HOST}{sid}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/{request_id or uuid.uuid4()}?api-version={PIM_ARM_API}"
+        return "PUT", url, {"properties": props}, None, mins
+    res = "aadroles" if row["family"] == "entra" else "aadGroups"
+    body = {"roleDefinitionId": row["role_def_id"], "resourceId": row["resource_id"], "subjectId": me["oid"], "assignmentState": "Active", "type": "UserAdd",
+            "reason": justification, "ticketNumber": ticket_number, "ticketSystem": ticket_system,
+            "schedule": {"type": "Once", "startDateTime": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                         "endDateTime": (now + timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%S.000Z")},
+            "linkedEligibleRoleAssignmentId": row.get("link_id") or row.get("eligible_id") or ""}
+    return "POST", f"https://{PIM_MSPIM_HOST}{PIM_MSPIM_PREFIX}{res}/roleAssignmentRequests", body, PIM_MSPIM_RESOURCE, mins
+
+
+def pim_classify_error(err):
+    """(outcome, reason) for a failed request: Already active / Pending approval / Denied + the service's reason."""
+    text = pim_error_text(err, 400)
+    low = text.lower()
+    if "roleassignmentexists" in low or "already exists" in low or "already active" in low or "activeduration" in low:
+        return "Already active", "RoleAssignmentExists - the role is already active"
+    if _PIM_THROTTLE_RE.search(text):
+        return "Denied", "Throttled by the service (HTTP 429) after 3 retries - wait a minute and press Refresh, then activate again. " + text
+    if any(x in low for x in ("multifactorauthenticationrule", "mfarule", "multi-factor", "multifactor", "aadsts50076", "aadsts50079", "aadsts50158", "authenticationcontext",
+                              "acrsrule", "claims challenge", "interaction_required", "aadsts53003")):
+        return "Denied", "Authentication context / multi-factor authentication required - complete it in the Azure portal, then try again. " + text
+    if "justificationrule" in low or "justification" in low and "required" in low:
+        return "Denied", "The role policy requires a justification. " + text
+    if "ticketingrule" in low or "ticket" in low and "required" in low:
+        return "Denied", "The role policy requires a ticket number and system. " + text
+    if "expirationrule" in low or "maximum" in low and "duration" in low or "exceeds" in low:
+        return "Denied", "Policy limit: the duration is longer than the role policy allows. " + text
+    if "pendingapproval" in low:
+        return "Pending approval", "An approver must approve the request."
+    if any(x in low for x in ("forbidden", "unauthorized", "authorizationfailed", "aadsts", "401", "403")):
+        return "Denied", "Access denied - " + text
+    return "Denied", text
+
+
+def pim_classify_response(data):
+    """(outcome, reason) for an accepted request, from the status the service returns."""
+    status = None
+    if isinstance(data, dict):
+        p = data.get("properties") if isinstance(data.get("properties"), dict) else data
+        st = p.get("status")
+        status = (st.get("status") or st.get("subStatus")) if isinstance(st, dict) else st
+        detail = st.get("statusDetails") if isinstance(st, dict) else None
+    else:
+        detail = None
+    low = str(status or "").lower()
+    if low.startswith("pendingapproval") or low in ("pendingadmindecision", "pendingevaluation") and "approval" in json.dumps(data).lower():
+        return "Pending approval", "Waiting for an approver (status " + str(status) + ")"
+    if low in ("denied", "failed", "canceled", "cancelled", "revoked", "admindenied", "timedout", "invalid", "failedasresourceisinlocked"):
+        return "Denied", f"The service answered status {status}" + (f": {json.dumps(detail)[:200]}" if detail else "")
+    return "Activated", "" if not low else f"status {status}"
+
+
+def pim_activate_one(row, me, justification, hours=None, ticket_number="", ticket_system="", now=None):
+    """Send ONE self-activation request. Returns the result dict."""
+    res = {"key": row["key"], "type": row["type"], "name": row["name"], "scope": row["scope"], "outcome": None, "reason": "", "minutes": None}
+    try:
+        method, url, body, resource, mins = pim_build_request(row, me, justification, hours, ticket_number, ticket_system, now)
+    except Exception as exc:
+        res.update(outcome="Denied", reason=f"could not build the request: {exc}")
+        return res
+    res["minutes"] = mins
+    data, err = pim_write(method, url, body, resource, me.get("oid"), row.get("max_minutes"))
+    if err and err.startswith("blocked: read-only mode"):
+        res.update(outcome="Denied", reason=err)
+        return res
+    GUARD.pim_record({"time": datetime.now(timezone.utc).strftime("%H:%M:%S"), "type": row["type"], "name": row["name"], "scope": row["scope"], "minutes": mins})
+    if err:
+        res["outcome"], res["reason"] = pim_classify_error(err)
+    else:
+        res["outcome"], res["reason"] = pim_classify_response(data)
+    if res["outcome"] == "Pending approval":
+        with PIM_STATE["lock"]:
+            PIM_STATE["pending"].add(row["key"])
+    return res
+
+
+def pim_activate_many(rows, me, justification, hours=None, ticket_number="", ticket_system="", on_start=None, on_result=None, cancel=None, emit=None, workers=PIM_WORKERS):
+    """Self-activate the eligible rows: 4 at a time. Rows that are already active or waiting for approval are skipped (no request is sent).
+    Raises ValueError without a justification. Returns the list of result dicts in the order of `rows`."""
+    if not (justification or "").strip():
+        raise ValueError("a justification is required")
+    say = emit or (lambda _l: None)
+    results = [None] * len(rows)
+    todo = []
+    for i, r in enumerate(rows):
+        if r["status"] in ("Active", "Expired soon"):
+            results[i] = {"key": r["key"], "type": r["type"], "name": r["name"], "scope": r["scope"], "outcome": "Already active", "reason": "already active - skipped, no request sent", "minutes": None}
+            say(f"PIM skipped '{r['name']}' ({r['type']}): already active")
+            if on_result:
+                on_result(results[i])
+        elif r["status"] == "Pending approval":
+            results[i] = {"key": r["key"], "type": r["type"], "name": r["name"], "scope": r["scope"], "outcome": "Pending approval", "reason": "a request is already waiting for approval - skipped", "minutes": None}
+            if on_result:
+                on_result(results[i])
+        else:
+            todo.append(i)
+
+    def work(i):
+        r = rows[i]
+        if cancel is not None and cancel.is_set():
+            return i, {"key": r["key"], "type": r["type"], "name": r["name"], "scope": r["scope"], "outcome": "Denied", "reason": "stopped before this request was sent", "minutes": None}
+        if on_start:
+            on_start(r)
+        say(f"PIM requesting activation of '{r['name']}' ({r['type']}, {r['scope']}) ...")
+        res = pim_activate_one(r, me, justification, hours, ticket_number, ticket_system)
+        say(f"PIM {r['name']} ({r['type']}): {res['outcome']}" + (f" - {res['reason']}" if res["reason"] else ""))
+        return i, res
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, PIM_WORKERS))) as ex:
+        for f in as_completed([ex.submit(work, i) for i in todo]):
+            i, res = f.result()
+            results[i] = res
+            if on_result:
+                on_result(res)
+    return results
+
+
+def pim_summary(results):
+    c = Counter(r["outcome"] for r in results)
+    return ", ".join(f"{c[k]} {k.lower()}" for k in ("Activated", "Already active", "Pending approval", "Denied") if c.get(k)) or "nothing requested"
+
+
+def pim_confirm_text(n):
+    return f"This submits {n} self-activation request{'' if n == 1 else 's'} for roles you are already eligible for. It does not grant new access."
+
+
+# --- command line ---------------------------------------------------------------------------------------------------------
+
+def pim_table_text(rows, title):
+    lines = [title]
+    if not rows:
+        return lines + ["  (none)"]
+    for r in rows:
+        lines.append(f"  [{r['type']}] {r['name']}  |  {r['scope']}  |  {r['status']}  |  {r['expires']}  |  max {r['max'] or '-'}"
+                     + (f"  |  requires: {r['requires_text']}" if r.get("requires_text") else ""))
+    return lines
+
+
+def pim_cli(args):
+    """--pim-list / --pim-activate-all. Returns the exit code."""
+    out = lambda l: print(l, flush=True)
+    me = pim_identity(force=True)
+    if not me["ok"]:
+        print(me["error"], file=sys.stderr)
+        return 1
+    if me.get("notice"):
+        out("NOTE: " + me["notice"])
+    out(f"Privileged roles for {me['upn']} (tenant {me['tenant']})")
+    res = pim_collect(me, lambda l: out("  " + l))
+    for fam in PIM_FAMILIES:
+        f = res["families"][fam]
+        out(f"  {PIM_FAMILY_NAME[fam]}: {f['text']}" + (f"  {f['error']}" if f["error"] else ""))
+    for line in pim_table_text(res["active"], f"ACTIVE now ({len(res['active'])})") + pim_table_text(res["eligible"], f"ELIGIBLE, not active ({len(res['eligible'])})"):
+        out(line)
+    why = pim_no_eligible_text(res)
+    if why:
+        out(why)
+    for fam in ("entra", "group"):
+        if res["families"][fam]["state"] == "error":
+            out(f"{PIM_FAMILY_NAME[fam]} could not be read automatically. Open {PIM_PORTAL_URLS[fam]} in your browser, or use {PIM_SCRIPT_HINT}.")
+    if not args.pim_activate_all:
+        return 0
+    todo = [r for r in res["eligible"] if r["status"] == "Eligible"]
+    if not todo:
+        out("Nothing to activate.")
+        return 0
+    out("")
+    out(pim_confirm_text(len(todo)))
+    for r in todo:
+        out(f"  would request: {r['name']} ({r['type']}, {r['scope']}) for {pim_max_text(pim_effective_minutes(r['max_minutes'], args.hours))}")
+    if not args.yes:
+        out("Nothing was submitted. Add --yes to submit these requests.")
+        return 0
+    results = pim_activate_many(todo, me, args.justification, args.hours, args.ticket_number or "", args.ticket_system or "", emit=lambda l: out("  " + l))
+    out("")
+    out("RESULT: " + pim_summary(results))
+    for r in results:
+        out(f"  {r['outcome']:<16} {r['name']} ({r['type']})" + (f" - {r['reason']}" if r["reason"] else ""))
+    return 1 if any(r["outcome"] == "Denied" for r in results) else 0
+
+
+# ---------------------------------------------------------------------------
 # GUI: live, interactive collection
 # ---------------------------------------------------------------------------
 
 _GUI = {}   # widgets of the running window (used by the tests)
 PREFS_FILE = os.path.join(_HERE, "aks_debug_gui.json")     # the section choice and the worker count are remembered here (and for the session)
-_SESSION = {"sections": None, "workers": None}
+_SESSION = {"sections": None, "workers": None, "signin": None, "subs": None}      # remembered while the program runs: sections, workers, sign-in method, chosen subscriptions
 
 
 def _load_prefs():
@@ -7568,6 +9320,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
     state = {"busy": False, "cancel": None, "html": None, "t0": None, "finished": 0, "total": 1,
              "counts": Counter(), "clusters": {}, "reports": {}, "n": 1,
              "auth": {"state": "unchecked"}, "checking": False, "signing": False, "auth_for": None, "recheck": None,
+             "signin": None, "tick": None, "acct_all": [], "accts": [], "acct_map": {}, "sel_acct": None, "checking_accts": False, "chips": {},
              "accounts": [], "acct_by_id": {}, "acct_chosen": set(), "acct_loading": False, "accounts_loaded": False,
              "acct_locked": False, "cl_locked": False, "pre": False,
              "crows": [], "by_key": {}, "cchosen": set(), "listing": False, "list_cancel": None, "listed": set(),
@@ -7613,6 +9366,8 @@ def run_gui(default_minutes, skip_login=False, context=None):
     style.map("TButton", background=[("disabled", "#EEF2F6"), ("pressed", BRAND_DARK), ("active", "#CBE3F8")], foreground=[("disabled", "#9AA7B4"), ("pressed", "white")])
     style.configure("Accent.TButton", background=BRAND_PRIMARY, foreground="white", font=("Segoe UI", 10, "bold"), padding=(14, 6), bordercolor=BRAND_DARK)
     style.map("Accent.TButton", background=[("disabled", "#A9CBEA"), ("pressed", BRAND_DARK), ("active", BRAND_DARK)], foreground=[("disabled", "white"), ("!disabled", "white")])
+    style.configure("Alert.TButton", background="#C00000", foreground="white", font=("Segoe UI", 10, "bold"), padding=(14, 6), bordercolor="#8B0000")
+    style.map("Alert.TButton", background=[("disabled", "#E6A5A5"), ("pressed", "#8B0000"), ("active", "#8B0000")], foreground=[("disabled", "white"), ("!disabled", "white")])
     style.configure("Stop.TButton", background="#FDE7E7", foreground="#B42318", bordercolor="#F3A6A0", padding=(12, 6))
     style.map("Stop.TButton", background=[("disabled", "#EEF2F6"), ("active", "#F9C9C9")], foreground=[("disabled", "#9AA7B4")])
     style.configure("Treeview", background="white", fieldbackground="white", rowheight=24, bordercolor=LINE)
@@ -7623,6 +9378,24 @@ def run_gui(default_minutes, skip_login=False, context=None):
         style.configure(w_, fieldbackground="white", bordercolor=LINE)
     style.configure("Horizontal.TProgressbar", troughcolor="#DCE9F6", background=BRAND_PRIMARY, bordercolor=LINE, lightcolor=BRAND_PRIMARY, darkcolor=BRAND_PRIMARY)
     style.configure("TPanedwindow", background=BG)
+
+    style.configure("Footer.TLabel", background=BG)
+    style.configure("Note.TLabel", foreground="#6B7685")
+    style.configure("Desc.TLabel", foreground="#6B7685", font=("Segoe UI", 9))
+    style.configure("TNotebook", background=BG, bordercolor=LINE)
+    style.configure("TNotebook.Tab", padding=(14, 6), font=("Segoe UI", 10, "bold"), background=BRAND_PALE, foreground=BRAND_DARK)
+    style.map("TNotebook.Tab", background=[("selected", "white")], foreground=[("selected", BRAND_PRIMARY)])
+
+    def card(parent, text, stripe=None, padding=6, **pack):
+        """A card: a labelled frame with a coloured stripe on its left edge (same helper as in the EKS / GKE windows). Returns the labelled
+        frame; `pack` places the whole card."""
+        outer = tk.Frame(parent, bg=BG)
+        tk.Frame(outer, width=4, bg=stripe or BRAND_ACCENT).pack(side="left", fill="y")
+        lf = ttk.LabelFrame(outer, text=text, padding=padding)
+        lf.pack(side="left", fill="both", expand=True)
+        outer.pack(**pack)
+        lf.outer = outer
+        return lf
 
     banner = tk.Canvas(root, height=78, highlightthickness=0, bd=0, bg=BRAND_PRIMARY)
     banner.pack(side="top", fill="x")
@@ -7673,10 +9446,39 @@ def run_gui(default_minutes, skip_login=False, context=None):
     elapsed = tk.StringVar(value="")
     tk.Label(footer, textvariable=status, bg=BRAND_DARK, fg="white", anchor="w", padx=10, pady=4, font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
     tk.Label(footer, textvariable=elapsed, bg=BRAND_DARK, fg="#BFE6FF", padx=8).pack(side="right")
-    tk.Label(footer, text="Read-only: nothing is installed, created, changed or deleted", bg=BRAND_DARK, fg="#BFE6FF", padx=8, font=("Segoe UI", 9)).pack(side="right")
+    tk.Label(footer, text=PIM_NOTE, bg=BRAND_DARK, fg="#BFE6FF", padx=8, font=("Segoe UI", 9)).pack(side="right")
     tk.Label(footer, textvariable=tasks_var, bg=BRAND_DARK, fg=BRAND_ACCENT, padx=8, font=("Segoe UI", 10, "bold")).pack(side="right")
 
-    host = tk.Frame(root, bg=BG)
+    # ---- action bar (always visible), then the three tabs (same layout and names as the EKS / GKE windows)
+    top = ttk.Frame(root, padding=(10, 8, 10, 4))
+    top.pack(side="top", fill="x")
+    ttk.Label(top, text="Last (minutes):").pack(side="left")
+    minutes_var = tk.StringVar(value=str(default_minutes))
+    ttk.Spinbox(top, from_=1, to=1440, width=6, textvariable=minutes_var).pack(side="left", padx=(4, 0))
+    az_var = tk.BooleanVar(value=AZ_OPTS["enabled"])
+    logs_var = tk.BooleanVar(value=True)
+    open_var = tk.BooleanVar(value=True)
+    alllogs_var = tk.BooleanVar(value=False)
+    ns_var = tk.StringVar(value="")
+    sec_count = tk.StringVar(value="")
+    run_btn = ttk.Button(top, text=f"{icon('run')} Login & Debug selected cluster(s)", style="Accent.TButton")
+    run_btn.pack(side="left", padx=(16, 4))
+    stop_btn = ttk.Button(top, text=f"{icon('stop')} Stop", state="disabled", style="Stop.TButton")
+    stop_btn.pack(side="left")
+    sec_chip = tk.Label(top, textvariable=sec_count, bg=BRAND_PALE, fg=BRAND_DARK, padx=10, pady=2, font=("Segoe UI", 9, "bold"), relief="flat")
+    sec_chip.pack(side="right", padx=(0, 8))
+    nb = ttk.Notebook(root)
+    nb.pack(side="top", fill="both", expand=True, padx=8, pady=(2, 0))
+    tab_clusters = ttk.Frame(nb, padding=(2, 6, 2, 2))
+    tab_collect = ttk.Frame(nb, padding=(2, 6, 2, 2))
+    tab_run = ttk.Frame(nb, padding=(2, 6, 2, 2))
+    tab_pim = ttk.Frame(nb, padding=(2, 6, 2, 2))
+    nb.add(tab_clusters, text=f"{icon('key')} 1  Sign in and choose clusters")
+    nb.add(tab_collect, text=f"{icon('list')} 2  What to collect")
+    nb.add(tab_run, text=f"{icon('run')} 3  Run and results")
+    nb.add(tab_pim, text=f"{icon('shield')} 4  Privileged roles (PIM)")
+
+    host = tk.Frame(tab_clusters, bg=BG)
     host.pack(side="top", fill="both", expand=True)
     page_scroll = ttk.Scrollbar(host, orient="vertical")
     page_scroll.pack(side="right", fill="y")
@@ -7695,7 +9497,8 @@ def run_gui(default_minutes, skip_login=False, context=None):
     def on_wheel(ev):
         if str(ev.widget.winfo_class()) in ("Treeview", "Text", "TCombobox", "Listbox", "TSpinbox"):
             return
-        page_canvas.yview_scroll(-1 if ev.delta > 0 else 1, "units")
+        target = state.get("pim_canvas") if str(nb.select()) == str(tab_pim) and state.get("pim_canvas") is not None else page_canvas
+        target.yview_scroll(-1 if ev.delta > 0 else 1, "units")
     root.bind_all("<MouseWheel>", on_wheel)
 
     def stripe(tree):
@@ -7711,23 +9514,23 @@ def run_gui(default_minutes, skip_login=False, context=None):
     guide.pack(fill="x")
     row12 = ttk.Frame(guide)
     row12.pack(fill="x")
-    s1 = ttk.LabelFrame(row12, text=f"{icon('gear')} Step 1 - Login method", padding=6)
-    s1.pack(side="left", fill="y")
+    s1 = card(row12, f"{icon('gear')} Step 1 - Login method", side="left", fill="y")
     method_combo = ttk.Combobox(s1, width=30, state="readonly", values=[LOGIN_LABELS["exe"], LOGIN_LABELS["cli"]])
     method_combo.set(LOGIN_LABELS[LOGIN_OPTS["method"]])
     method_combo.pack(anchor="w")
     method_info = tk.StringVar(value="")
     ttk.Label(s1, textvariable=method_info, wraplength=340, justify="left").pack(anchor="w", pady=(4, 0))
-    ttk.Label(s1, text="Read-only: this tool only checks. It installs nothing and changes nothing on the cluster or in the cloud account.",
-              wraplength=340, justify="left", foreground=COLORS["dim"]).pack(anchor="w", pady=(2, 0))
-    src_var = tk.StringVar(value="all" if shutil.which("az") else "menu")     # which clusters the list (step 4) shows
+    ro_note = ttk.Label(s1, text="Read-only guarantee: reports only read - they never install, create, change or delete anything on the cluster or in the cloud account. "
+                             "Opt-in exception: the Privileged roles (PIM) tab can activate your own eligible roles, only when you confirm.",
+                        wraplength=340, justify="left", foreground=COLORS["ok"], font=("Segoe UI", 9, "bold"))
+    ro_note.pack(anchor="w", pady=(6, 0))
+    src_var = tk.StringVar(value="menu")     # which clusters the list (step 4) shows: the akslogin menu (instant, default) or az on demand
     ttk.Label(s1, text="Cluster list:").pack(anchor="w", pady=(6, 0))
-    src_all_rb = ttk.Radiobutton(s1, text="All clusters I can access (via az)", value="all", variable=src_var)
+    src_all_rb = ttk.Radiobutton(s1, text="Collect clusters with az from selected subscriptions (on demand)", value="all", variable=src_var)
     src_all_rb.pack(anchor="w")
-    src_menu_rb = ttk.Radiobutton(s1, text="Only the clusters from akslogin menu", value="menu", variable=src_var)
+    src_menu_rb = ttk.Radiobutton(s1, text="Clusters from the akslogin menu (instant)", value="menu", variable=src_var)
     src_menu_rb.pack(anchor="w")
-    s2 = ttk.LabelFrame(row12, text=f"{icon('key')} Step 2 - Sign in", padding=6)
-    s2.pack(side="left", fill="both", expand=True, padx=(8, 0))
+    s2 = card(row12, f"{icon('key')} Step 2 - Sign in", stripe=BRAND_PRIMARY, side="left", fill="both", expand=True, padx=(8, 0))
     s2a = ttk.Frame(s2)
     s2a.pack(fill="x")
     ttk.Label(s2a, text="Status:").pack(side="left")
@@ -7740,10 +9543,128 @@ def run_gui(default_minutes, skip_login=False, context=None):
     check_btn = ttk.Button(s2a, text=f"{icon('search')} Check status")
     check_btn.pack(side="left")
     device_var = tk.BooleanVar(value=LOGIN_OPTS["device_code"])
-    device_chk = ttk.Checkbutton(s2a, text="device-code login (az login --use-device-code)", variable=device_var)
+    device_chk = ttk.Checkbutton(s2a, text="Use device code (default)", variable=device_var)
     device_chk.pack(side="left", padx=(12, 0))
+    who_var = tk.StringVar(value="Signed in as: -")
+    ttk.Label(s2a, textvariable=who_var, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(14, 0))
+    s2m = ttk.Frame(s2)
+    s2m.pack(fill="x", pady=(4, 0))
+    ttk.Label(s2m, text="Sign-in method:").pack(side="left")
+    SIGNIN_KEYS = {v: k for k, v in SIGNIN_METHOD_LABELS.items()}
+    LOGIN_OPTS["signin"] = _SESSION.get("signin") or LOGIN_OPTS.get("signin") or "manual"          # remembered for the session; default: manual
+    signin_var = tk.StringVar(value=SIGNIN_METHOD_LABELS[LOGIN_OPTS["signin"]])
+    signin_combo = ttk.Combobox(s2m, textvariable=signin_var, width=44, state="readonly", values=list(SIGNIN_METHOD_LABELS.values()))
+    signin_combo.pack(side="left", padx=6)
+    # accounts known to the Azure CLI: dropdown (type to search) + status chip, re-check buttons, one chip per account
+    s2c = ttk.Frame(s2)
+    s2c.pack(fill="x", pady=(6, 0))
+    ttk.Label(s2c, text="Account:").pack(side="left")
+    acct_combo = ttk.Combobox(s2c, width=62, state="normal")
+    acct_combo.pack(side="left", padx=(6, 6))
+    acct_chip = tk.Label(s2c, text="Not checked", fg="white", bg=COLORS["dim"], padx=8, pady=2, font=("Segoe UI", 9, "bold"))
+    acct_chip.pack(side="left")
+    recheck_btn = ttk.Button(s2c, text="Re-check")
+    recheck_btn.pack(side="left", padx=(8, 0))
+    check_all_btn = ttk.Button(s2c, text="Check all accounts")
+    check_all_btn.pack(side="left", padx=(4, 0))
+    chips_row = ttk.Frame(s2)
+    chips_row.pack(fill="x", pady=(4, 0))
+    s2d = ttk.Frame(s2)
+    s2d.pack(fill="x", pady=(6, 0))
+    ttk.Label(s2d, text="Tenant (optional):").pack(side="left")
+    tenant_var = tk.StringVar(value=LOGIN_OPTS.get("tenant") or "")
+    tenant_entry = ttk.Entry(s2d, textvariable=tenant_var, width=40)
+    tenant_entry.pack(side="left", padx=(6, 8))
+    switch_btn = ttk.Button(s2d, text=f"{icon('key')} Sign in with a different account")
+    switch_btn.pack(side="left")
     auth_msg = tk.StringVar(value="")
-    ttk.Label(s2, textvariable=auth_msg, wraplength=820, justify="left").pack(fill="x", pady=(4, 0))
+    auth_msg_lbl = ttk.Label(s2, textvariable=auth_msg, wraplength=820, justify="left")
+    auth_msg_lbl.pack(fill="x", pady=(4, 0))
+    # ---- manual sign-in (the DEFAULT): the exact commands, each with a Copy button; the window waits and notices the sign-in by itself
+    man_panel = ttk.LabelFrame(s2, text="Sign in - run a command yourself", padding=8)
+    man = state["man"] = {"shown": False, "active": False, "t0": None, "after": None, "probing": False, "expect": None, "different": False}
+    man_form = tk.StringVar(value="device")
+    man_instr_var = tk.StringVar(value=MANUAL_INSTRUCTIONS)
+    ttk.Label(man_panel, textvariable=man_instr_var, wraplength=820, justify="left", font=("Segoe UI", 10, "bold")).pack(fill="x")
+    man_cli_var = tk.StringVar(value="")
+    man_cli_lbl = tk.Label(man_panel, textvariable=man_cli_var, anchor="w", justify="left", font=("Segoe UI", 10, "bold"), fg=COLORS["ok"], bg=BG)
+    man_cli_lbl.pack(fill="x", pady=(4, 0))
+    man_inst = tk.Label(man_panel, text="Install the Azure CLI first: " + AZ_INSTALL_HINT, anchor="w", justify="left", wraplength=820, fg=COLORS["err"], bg=BG,
+                        font=("Segoe UI", 9))
+    man_msg_var = tk.StringVar(value="")
+    man_msg_lbl = tk.Label(man_panel, textvariable=man_msg_var, anchor="w", justify="left", wraplength=820, font=("Segoe UI", 10, "bold"), fg=COLORS["warn"], bg=BG)
+    man_msg_lbl.pack(fill="x", pady=(2, 0))
+    man_cmd_vars, man_copy_btns, man_entries, man_rows = {}, {}, {}, {}
+    for _it in manual_commands("tenant"):
+        _row = ttk.Frame(man_panel)
+        man_rows[_it["key"]] = _row
+        if _it["key"] != "device-tenant":                       # the 1b variant line is shown only when the Tenant box has a value
+            _row.pack(fill="x", pady=(4, 0))
+        _top = ttk.Frame(_row)
+        _top.pack(fill="x")
+        if _it["key"] in _TERMINAL_FORMS:
+            ttk.Radiobutton(_top, text=f"{_it['n']}.", variable=man_form, value=_it["key"], width=4).pack(side="left")
+        else:
+            ttk.Label(_top, text=f"{_it['n']}.", width=5).pack(side="left", padx=(18, 0))
+        ttk.Label(_top, text=_it["note"], style="Desc.TLabel", wraplength=760, justify="left").pack(side="left", fill="x", expand=True)
+        _line = ttk.Frame(_row)
+        _line.pack(fill="x", padx=(40, 0))
+        man_cmd_vars[_it["key"]] = tk.StringVar(value=_it["cmd"])
+        man_entries[_it["key"]] = ttk.Entry(_line, textvariable=man_cmd_vars[_it["key"]], state="readonly",
+                                            font=("Consolas", 12, "bold") if _it["key"] == "device" else ("Consolas", 10))
+        man_entries[_it["key"]].pack(side="left", fill="x", expand=True)
+        man_copy_btns[_it["key"]] = ttk.Button(_line, text="Copy", style="Accent.TButton" if _it["key"] == "device" else "TButton")
+        man_copy_btns[_it["key"]].pack(side="left", padx=(6, 0))
+    ttk.Label(man_panel, text=MANUAL_STEPS, wraplength=820, justify="left", font=("Segoe UI", 10)).pack(fill="x", pady=(8, 0))
+    ttk.Label(man_panel, text="The round button in front of 1 - 3 chooses which command 'Open a terminal for me' runs. Commands 4a / 4b are only shown here as text. "
+                              "This tool never installs anything and never runs these commands itself.", style="Desc.TLabel", wraplength=820, justify="left").pack(fill="x", pady=(4, 0))
+    man_act = ttk.Frame(man_panel)
+    man_act.pack(fill="x", pady=(6, 0))
+    man_chip = tk.Label(man_act, text="Waiting for you", fg="white", bg=COLORS["dim"], padx=10, pady=2, font=("Segoe UI", 9, "bold"))
+    man_chip.pack(side="left")
+    man_status_var = tk.StringVar(value="")
+    ttk.Label(man_act, textvariable=man_status_var, font=("Segoe UI", 10)).pack(side="left", padx=8)
+    man_stop_btn = ttk.Button(man_act, text="Stop waiting", state="disabled")
+    man_stop_btn.pack(side="right")
+    man_verify_btn = ttk.Button(man_act, text="I have signed in - Verify", style="Accent.TButton")
+    man_verify_btn.pack(side="right", padx=(0, 6))
+    man_term_btn = ttk.Button(man_act, text="Open a terminal for me")
+    man_term_btn.pack(side="right", padx=(0, 6))
+    man_result_var = tk.StringVar(value="")
+    man_result_lbl = tk.Label(man_panel, textvariable=man_result_var, anchor="w", justify="left", wraplength=820, font=("Segoe UI", 10, "bold"), fg=COLORS["info"], bg=BG)
+    man_result_lbl.pack(fill="x", pady=(4, 0))
+    # ---- Sign-in details panel (device-code URL + code, countdown, status, cancel): shown while / after a sign-in attempt
+    sp = ttk.LabelFrame(s2, text="Sign-in details", padding=6)
+    sp_url_row = ttk.Frame(sp)
+    sp_url_row.pack(fill="x")
+    ttk.Label(sp_url_row, text="Open this URL:").pack(side="left")
+    sp_url = tk.Label(sp_url_row, text="", fg="#0b5cad", cursor="hand2", font=("Segoe UI", 10, "underline"), anchor="w")
+    sp_url.pack(side="left", padx=(6, 10))
+    sp_open_btn = ttk.Button(sp_url_row, text="Open in browser")
+    sp_open_btn.pack(side="left")
+    sp_copy_url_btn = ttk.Button(sp_url_row, text="Copy URL")
+    sp_copy_url_btn.pack(side="left", padx=(4, 0))
+    sp_code_row = ttk.Frame(sp)
+    sp_code_row.pack(fill="x", pady=(4, 0))
+    ttk.Label(sp_code_row, text="Enter this code:").pack(side="left")
+    sp_code = tk.Label(sp_code_row, text="", font=("Consolas", 22, "bold"), fg=BRAND_DARK, padx=10)
+    sp_code.pack(side="left")
+    sp_copy_code_btn = ttk.Button(sp_code_row, text="Copy code")
+    sp_copy_code_btn.pack(side="left")
+    sp_cancel_btn = ttk.Button(sp_code_row, text="Cancel sign-in", style="Stop.TButton")
+    sp_cancel_btn.pack(side="right")
+    sp_status_row = ttk.Frame(sp)
+    sp_status_row.pack(fill="x", pady=(4, 0))
+    sp_chip = tk.Label(sp_status_row, text="", fg="white", bg=COLORS["dim"], padx=8, pady=2, font=("Segoe UI", 9, "bold"))
+    sp_chip.pack(side="left")
+    sp_countdown = tk.StringVar(value="")
+    ttk.Label(sp_status_row, textvariable=sp_countdown, font=("Segoe UI", 10, "bold")).pack(side="left", padx=(8, 0))
+    sp_account = tk.StringVar(value="")
+    ttk.Label(sp, textvariable=sp_account, foreground=COLORS["dim"]).pack(anchor="w", pady=(2, 0))
+    sp_detail = tk.StringVar(value="")
+    ttk.Label(sp, textvariable=sp_detail, wraplength=800, justify="left").pack(anchor="w", pady=(2, 0))
+    sp_raw = tk.StringVar(value="")
+    ttk.Label(sp, textvariable=sp_raw, wraplength=800, justify="left", foreground=COLORS["dim"], font=("Consolas", 8)).pack(anchor="w")
     LOGIN_OPTS["gui"] = True        # no console of our own: interactive logins get a window
 
     guide_msg = tk.Label(guide, text="", anchor="w", justify="left", font=("Segoe UI", 10, "bold"), padx=8, pady=4,
@@ -7772,20 +9693,18 @@ def run_gui(default_minutes, skip_login=False, context=None):
     row34 = ttk.Frame(guide)
     row34.pack(fill="x", pady=(6, 0))
     # ---- step 3: the subscriptions (searchable list)
-    s3 = ttk.LabelFrame(row34, text=f"{icon('cloud')} Step 3 - Choose subscription", padding=6)
-    s3.pack(side="left", fill="both", expand=True)
+    s3 = card(row34, f"{icon('cloud')} Step 3 - Choose subscription(s)  (Ctrl/Shift-click for several)", stripe=BRAND_ACCENT, side="left", fill="both", expand=True)
     acct_filter = tk.StringVar(value="")
     box3, acct_search, acct_search_x = search_box(s3, acct_filter)
     box3.pack(fill="x")
     acct_count = tk.StringVar(value="")
     ttk.Label(s3, textvariable=acct_count).pack(anchor="w")
-    scope_var = tk.StringVar(value="all")
-    scope_row = ttk.Frame(s3)
-    scope_row.pack(fill="x")
+    scope_var = tk.StringVar(value="sel")                  # kept for the tests / sync_login_opts: the scope is always 'the selected subscriptions'
+    scope_row = ttk.Frame(s3)                               # (not shown: nothing is searched unless the user selects subscriptions and presses the collect button)
     scope_all_rb = ttk.Radiobutton(scope_row, text="", value="all", variable=scope_var)
-    scope_all_rb.pack(side="left")
     scope_sel_rb = ttk.Radiobutton(scope_row, text="", value="sel", variable=scope_var)
-    scope_sel_rb.pack(side="left", padx=(12, 0))
+    acct_sel_count = tk.StringVar(value="")
+    ttk.Label(s3, textvariable=acct_sel_count, font=("Segoe UI", 10, "bold"), foreground=BRAND_PRIMARY).pack(anchor="w")
     a_wrap = ttk.Frame(s3)
     a_wrap.pack(fill="both", expand=True)
     acct_tree = ttk.Treeview(a_wrap, columns=("code", "info"), show="tree headings", selectmode="extended", height=7)
@@ -7813,8 +9732,13 @@ def run_gui(default_minutes, skip_login=False, context=None):
     ttk.Label(s3, textvariable=acct_status, wraplength=640, justify="left").pack(anchor="w", pady=(4, 0))
 
     # ---- step 4: the clusters (searchable multi-select list)
-    s4 = ttk.LabelFrame(row34, text=f"{icon('helm')} Step 4 - Choose clusters  (click one, Ctrl/Shift-click for several; they run one after another)", padding=6)
-    s4.pack(side="left", fill="both", expand=True, padx=(8, 0))
+    s4 = card(row34, f"{icon('helm')} Step 4 - Choose clusters  (click one, Ctrl/Shift-click for several; they run one after another)", stripe=BRAND_PRIMARY, side="left", fill="both", expand=True, padx=(8, 0))
+    collect_row = ttk.Frame(s4)
+    collect_row.pack(fill="x", pady=(0, 4))
+    collect_btn = ttk.Button(collect_row, text="Collect clusters from selected subscriptions", style="Accent.TButton")
+    collect_btn.pack(side="left")
+    collect_stop_btn = ttk.Button(collect_row, text="Stop", style="Stop.TButton", state="disabled")
+    collect_stop_btn.pack(side="left", padx=(6, 0))
     filter_var = tk.StringVar(value="")
     box4, cl_search, cl_search_x = search_box(s4, filter_var)
     box4.pack(fill="x")
@@ -7841,7 +9765,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
     select_all_btn.pack(side="left")
     clear_btn = ttk.Button(c_btns, text="Clear")
     clear_btn.pack(side="left", padx=4)
-    refresh_btn = ttk.Button(c_btns, text=f"{icon('reload')} Reload clusters")
+    refresh_btn = ttk.Button(c_btns, text=f"{icon('reload')} Refresh selected")
     refresh_btn.pack(side="left")
     manual_var = tk.StringVar(value="")
     ttk.Label(c_btns, text="  or type numbers:").pack(side="left")
@@ -7857,49 +9781,21 @@ def run_gui(default_minutes, skip_login=False, context=None):
     acct_widgets = [acct_search, acct_search_x, scope_all_rb, scope_sel_rb, acct_all_btn, acct_clear_btn]
     cl_widgets = [cl_search, cl_search_x, select_all_btn, clear_btn, manual_entry]
 
-    # ---- top bar: window, actions
-    top = ttk.Frame(page, padding=(8, 8, 8, 4))
-    top.pack(fill="x")
-    ttk.Label(top, text="Last (minutes):").pack(side="left")
-    minutes_var = tk.StringVar(value=str(default_minutes))
-    ttk.Spinbox(top, from_=1, to=1440, width=6, textvariable=minutes_var).pack(side="left", padx=(4, 0))
-    az_var = tk.BooleanVar(value=AZ_OPTS["enabled"])
-    logs_var = tk.BooleanVar(value=True)
-    open_var = tk.BooleanVar(value=True)
-    alllogs_var = tk.BooleanVar(value=False)
-    ns_var = tk.StringVar(value="")
-    run_btn = ttk.Button(top, text=f"{icon('run')} Login & Debug selected cluster(s)", style="Accent.TButton")
-    run_btn.pack(side="left", padx=(16, 4))
-    stop_btn = ttk.Button(top, text=f"{icon('stop')} Stop", state="disabled", style="Stop.TButton")
-    stop_btn.pack(side="left")
-
-    top2 = ttk.Frame(page, padding=(8, 0, 8, 4))
-    top2.pack(fill="x")
-    az_chk = ttk.Checkbutton(top2, text=f"{icon('cloud')} Azure details (az)", variable=az_var)
-    az_chk.pack(side="left")
-    _Tip(az_chk, "Off = no Azure CLI call is made at all. (To leave only the Azure section out of the report, untick it under 'What to collect'.)")
-    ttk.Checkbutton(top2, text=f"{icon('log')} Pod logs", variable=logs_var).pack(side="left", padx=(10, 0))
-    ttk.Checkbutton(top2, text="Logs of ALL pods", variable=alllogs_var).pack(side="left", padx=(10, 0))
-    ttk.Label(top2, text="only namespaces (comma separated, blank = all):").pack(side="left", padx=(10, 2))
-    ttk.Entry(top2, textvariable=ns_var, width=26).pack(side="left")
-    ttk.Checkbutton(top2, text="Open report when done", variable=open_var).pack(side="left", padx=(16, 0))
+    # ---- tab 2: what to collect - one box per report section (the SECTIONS registry drives them), quick presets, a counter
     saved_prefs = _load_prefs()
-    workers_var = tk.StringVar(value=str(_SESSION["workers"] or saved_prefs["workers"] or PARALLEL_WORKERS))
-    workers_spin = ttk.Spinbox(top2, from_=1, to=16, width=4, textvariable=workers_var)
-    workers_spin.pack(side="right")
-    ttk.Label(top2, text=f"{icon('speed')} Parallel workers:").pack(side="right", padx=(10, 4))
-    _Tip(workers_spin, "How many collection tasks run at the same time after the login (1 = one after another).")
-
-    # ---- what to collect: one check box per report section (the SECTIONS registry)
-    sections_card = ttk.LabelFrame(page, text=f"{icon('list')} What to collect  (untick what you do not need: it is not collected at all)", padding=(8, 4))
-    sections_card.pack(fill="x", padx=8, pady=(0, 6))
-    sec_grid = ttk.Frame(sections_card)
-    sec_grid.pack(fill="x")
     sec_vars, sec_checks = {}, {}
     start_sel = _SESSION["sections"] or saved_prefs["sections"] or (INITIAL_SECTIONS if INITIAL_SECTIONS is not None else SECTIONS_ORDER)
-    sec_count = tk.StringVar(value="")
     sec_note = tk.StringVar(value="")
-    SEC_ROWS = 5
+    sections_card = card(tab_collect, f"{icon('list')} What to collect  (untick what you do not need: it is not collected at all)", fill="both", expand=True)
+    sec_head = ttk.Frame(sections_card)
+    sec_head.pack(fill="x")
+    ttk.Label(sec_head, textvariable=sec_count, font=("Segoe UI", 11, "bold"), foreground=BRAND_PRIMARY).pack(side="left")
+    sec_btns = sec_head
+    ttk.Label(sections_card, text="Tick what the report should contain. Unticked sections are never collected: no command is run for them. "
+                                  "Sections that need another section's data read it silently (see the note below).", style="Note.TLabel",
+              wraplength=900, justify="left").pack(fill="x", pady=(6, 4))
+    sec_grid = ttk.Frame(sections_card)
+    sec_grid.pack(fill="both", expand=True)
 
     def selected_sections():
         return [s["id"] for s in SECTIONS if sec_vars[s["id"]].get()]
@@ -7916,45 +9812,79 @@ def run_gui(default_minutes, skip_login=False, context=None):
         sec_note.set(("Collected quietly, not shown in the report: " + "; ".join(notes) + ".") if notes else "")
         _SESSION["sections"] = list(picked)
 
+    SEC_ROWS = (len(SECTIONS) + 1) // 2
+    sec_grid.columnconfigure(0, weight=1, uniform="sec")
+    sec_grid.columnconfigure(1, weight=1, uniform="sec")
     for i, s in enumerate(SECTIONS):
         v = logs_var if s["id"] == "logs" else tk.BooleanVar()
         v.set(s["id"] in start_sel or bool(s.get("locked")))
         sec_vars[s["id"]] = v
-        cb = ttk.Checkbutton(sec_grid, text=f"{icon(s['icon'])} {s['title']}", variable=v, command=update_sections_info)
+        cell = ttk.Frame(sec_grid, padding=(4, 2, 12, 5))
+        cell.grid(row=i % SEC_ROWS, column=i // SEC_ROWS, sticky="nsew")
+        cb = ttk.Checkbutton(cell, text=f"{icon(s['icon'])}  {s['title']}", variable=v, command=update_sections_info)
         if s.get("locked"):
             cb.state(["disabled"])
-        cb.grid(row=i % SEC_ROWS, column=i // SEC_ROWS, sticky="w", padx=(0, 18), pady=1)
-        _Tip(cb, s["desc"])
+        cb.pack(anchor="w")
+        desc = ttk.Label(cell, text=s["desc"], style="Desc.TLabel", justify="left", wraplength=420)
+        desc.pack(anchor="w", padx=(24, 0))
+        cell.bind("<Configure>", lambda e_, d=desc: d.configure(wraplength=max(200, e_.width - 48)))
         sec_checks[s["id"]] = cb
-    for c_ in range(3):
-        sec_grid.columnconfigure(c_, weight=1)
-    sec_btns = ttk.Frame(sections_card)
-    sec_btns.pack(fill="x", pady=(4, 0))
 
     def set_sections(ids):
         for sid, var in sec_vars.items():
             var.set(sid in ids or bool(SECTION_BY_ID[sid].get("locked")))
         update_sections_info()
     preset_btns = {}
-    for key, label_, ids in (("all", "Select all", SECTION_PRESETS["all"]), ("none", "Clear all", []),
+    for key, label_, ids in (("no_net", "Everything except networking", SECTION_PRESETS["no_networking"]),
                              ("only_net", f"{icon('net')} Only networking", SECTION_PRESETS["only_networking"]),
-                             ("no_net", "Everything except networking", SECTION_PRESETS["no_networking"])):
-        b_ = ttk.Button(sec_btns, text=label_, command=lambda ids=ids: set_sections(ids))
-        b_.pack(side="left", padx=(0, 6))
+                             ("none", "Clear all", []), ("all", "Select all", SECTION_PRESETS["all"])):
+        b_ = ttk.Button(sec_head, text=label_, command=lambda ids=ids: set_sections(ids))
+        b_.pack(side="right", padx=(4, 0))
         preset_btns[key] = b_
-    ttk.Label(sec_btns, textvariable=sec_count, font=("Segoe UI", 10, "bold"), foreground=BRAND_PRIMARY).pack(side="left", padx=(10, 0))
-    sec_note_lbl = ttk.Label(sections_card, textvariable=sec_note, wraplength=1000, justify="left", foreground="#6B5B00")
-    sec_note_lbl.pack(fill="x", pady=(2, 0))
+    sec_note_lbl = ttk.Label(sections_card, textvariable=sec_note, style="Note.TLabel", wraplength=900, justify="left")
+    sec_note_lbl.pack(fill="x", pady=(4, 0))
+    logopt = ttk.Frame(sections_card)
+    logopt.pack(fill="x", pady=(8, 0))
+    az_chk = ttk.Checkbutton(logopt, text=f"{icon('cloud')} Azure details (az)", variable=az_var)
+    az_chk.pack(side="left")
+    _Tip(az_chk, "Off = no Azure CLI call is made at all. (To leave only the Azure section out of the report, untick it above.)")
+    ttk.Checkbutton(logopt, text=f"{icon('log')} Pod logs", variable=logs_var).pack(side="left", padx=(10, 0))
+    ttk.Checkbutton(logopt, text="Logs of ALL pods", variable=alllogs_var).pack(side="left", padx=(10, 0))
+    ttk.Label(logopt, text="only namespaces (comma separated, blank = all):").pack(side="left", padx=(10, 2))
+    ttk.Entry(logopt, textvariable=ns_var, width=26).pack(side="left")
+    workers_var = tk.StringVar(value=str(_SESSION["workers"] or saved_prefs["workers"] or PARALLEL_WORKERS))
+    workers_row = ttk.Frame(sections_card)
+    workers_row.pack(fill="x", pady=(6, 0))
+    ttk.Label(workers_row, text=f"{icon('speed')} Parallel workers:").pack(side="left")
+    workers_spin = ttk.Spinbox(workers_row, from_=1, to=16, width=4, textvariable=workers_var)
+    workers_spin.pack(side="left", padx=(6, 0))
+    _Tip(workers_spin, "How many collection tasks run at the same time after the login (1 = one after another).")
     az_var.trace_add("write", update_sections_info)
     update_sections_info()
+    for w_ in (workers_row, logopt, sec_note_lbl):          # the option rows keep their place at the bottom; the grid takes what is left (1100x700 stays usable)
+        w_.pack_forget()
+        w_.pack(side="bottom", fill="x", pady=(6, 0))
+    sec_grid.pack_forget()
+    sec_grid.pack(side="top", fill="both", expand=True)
+
+    # ---- tab 3: run bar (progress, options, report buttons), steps + clusters-in-run + live findings (left), live log (right)
+    run_bar = ttk.Frame(tab_run)
+    run_bar.pack(fill="x", pady=(0, 4))
+    progress_bar = ttk.Progressbar(run_bar, mode="determinate", length=340)
+    progress_bar.pack(side="left")
+    ttk.Label(run_bar, textvariable=tasks_var, font=("Segoe UI", 10, "bold"), foreground=BRAND_PRIMARY).pack(side="left", padx=10)
+    ttk.Checkbutton(run_bar, text="Open report when done", variable=open_var).pack(side="left", padx=(10, 0))
+    folder_btn = ttk.Button(run_bar, text=f"{icon('folder')} Open reports folder")
+    folder_btn.pack(side="right")
+    open_btn = ttk.Button(run_bar, text=f"{icon('report')} Open HTML report", state="disabled", style="Accent.TButton")
+    open_btn.pack(side="right", padx=6)
 
     # ---- body: steps + clusters-in-run + live findings (left), live log (right)
-    body = ttk.PanedWindow(page, orient="horizontal")
-    body.pack(fill="both", expand=True, padx=8)
+    body = ttk.PanedWindow(tab_run, orient="horizontal")
+    body.pack(fill="both", expand=True)
     left = ttk.Frame(body, width=450)
     body.add(left, weight=0)
-    steps_box = ttk.LabelFrame(left, text=f"{icon('list')} Collection steps (current cluster)", padding=4)
-    steps_box.pack(fill="x")
+    steps_box = card(left, f"{icon('list')} Collection steps (current cluster)", padding=4, fill="x")
     steps = ttk.Treeview(steps_box, columns=("status", "time"), height=8, show="tree headings", selectmode="none")
     steps.heading("#0", text="Step")
     steps.heading("status", text="Status")
@@ -7968,8 +9898,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
         steps.tag_configure(tag, foreground=color)
     steps.tag_configure("running", font=("Segoe UI", 9, "bold"))
 
-    run_box = ttk.LabelFrame(left, text=f"{icon('helm')} Clusters in this run (double-click a finished one to open its report)", padding=4)
-    run_box.pack(fill="x", pady=(6, 0))
+    run_box = card(left, f"{icon('helm')} Clusters in this run (double-click a finished one to open its report)", stripe=BRAND_PRIMARY, padding=4, fill="x", pady=(6, 0))
     run_tree = ttk.Treeview(run_box, columns=("status", "crit", "high"), height=4, show="tree headings", selectmode="browse")
     run_tree.heading("#0", text="Cluster")
     run_tree.heading("status", text="Status")
@@ -7984,8 +9913,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
     for tag, color in (("running", "#1f4e79"), ("ok", "#067647"), ("failed", "#c00000"), ("partial", "#9a7d0a"), ("notrun", "#888888")):
         run_tree.tag_configure(tag, foreground=color)
 
-    find_box = ttk.LabelFrame(left, text=f"{icon('warn')} Findings (live - updates while collecting)", padding=4)
-    find_box.pack(fill="both", expand=True, pady=(6, 0))
+    find_box = card(left, f"{icon('warn')} Findings (live - updates while collecting)", stripe="#C00000", padding=4, fill="both", expand=True, pady=(6, 0))
     counters = ttk.Frame(find_box)
     counters.pack(fill="x")
     counter_vars = {}
@@ -8013,16 +9941,6 @@ def run_gui(default_minutes, skip_login=False, context=None):
         text.tag_configure(tag, foreground=color)
     text.tag_configure("HEAD", font=("Consolas", 9, "bold"))
 
-    # ---- bottom: progress + status + actions
-    bottom = ttk.Frame(page, padding=8)
-    bottom.pack(fill="x")
-    progress_bar = ttk.Progressbar(bottom, mode="determinate", length=340)
-    progress_bar.pack(side="left")
-    ttk.Label(bottom, textvariable=tasks_var, font=("Segoe UI", 10, "bold"), foreground=BRAND_PRIMARY).pack(side="left", padx=10)
-    folder_btn = ttk.Button(bottom, text=f"{icon('folder')} Open reports folder")
-    folder_btn.pack(side="right")
-    open_btn = ttk.Button(bottom, text=f"{icon('report')} Open HTML report", state="disabled", style="Accent.TButton")
-    open_btn.pack(side="right", padx=6)
 
     def write(line):
         s = line.lstrip()
@@ -8055,6 +9973,520 @@ def run_gui(default_minutes, skip_login=False, context=None):
     def hit(hay, ts):
         return all(t in hay for t in ts)
 
+    # ---- tab 4: Privileged roles (PIM). The ONE opt-in exception to read-only: self-activation of your own eligible roles, only after the confirmation dialog.
+    PIM_ALL = "All types"
+    pim = {"active": [], "elig": [], "me": None, "busy": False, "cancel": None, "loaded": False, "q": queue.Queue(), "fams": {}, "dialog": None,
+           "results": {}, "total": 0, "done": 0, "summary": "", "errors": {}, "visited": False}
+    pim_host = tk.Frame(tab_pim, bg=BG)
+    pim_host.pack(side="top", fill="both", expand=True)
+    pim_scroll = ttk.Scrollbar(pim_host, orient="vertical")
+    pim_scroll.pack(side="right", fill="y")
+    pim_canvas = tk.Canvas(pim_host, bg=BG, highlightthickness=0, yscrollcommand=pim_scroll.set)
+    pim_canvas.pack(side="left", fill="both", expand=True)
+    pim_scroll.configure(command=pim_canvas.yview)
+    pim_page = ttk.Frame(pim_canvas)
+    pim_win = pim_canvas.create_window((0, 0), window=pim_page, anchor="nw")
+    state["pim_canvas"] = pim_canvas
+
+    def pim_fit(_e=None):
+        pim_canvas.itemconfigure(pim_win, width=max(pim_canvas.winfo_width(), 1), height=max(pim_canvas.winfo_height(), pim_page.winfo_reqheight()))
+        pim_canvas.configure(scrollregion=pim_canvas.bbox("all"))
+    pim_canvas.bind("<Configure>", pim_fit)
+    pim_page.bind("<Configure>", pim_fit)
+    pim_top = card(pim_page, f"{icon('shield')} Privileged roles (PIM) - what you hold now and what you can activate", stripe=BRAND_PRIMARY, fill="x")
+    pim_note = ttk.Label(pim_top, text=PIM_NOTE, foreground=COLORS["ok"], font=("Segoe UI", 9, "bold"), wraplength=1100, justify="left")
+    pim_note.pack(anchor="w")
+    pim_chip_row = ttk.Frame(pim_top)
+    pim_chip_row.pack(fill="x", pady=(3, 0))
+    pim_chips = {}
+    for _i, _fam in enumerate(PIM_FAMILIES):
+        pim_chips[_fam] = tk.Label(pim_chip_row, text=f"{PIM_FAMILY_NAME[_fam]}: not loaded", bg=COLORS["dim"], fg="white", padx=6, pady=2, font=("Segoe UI", 9, "bold"), anchor="w")
+        pim_chips[_fam].grid(row=0, column=_i, sticky="we", padx=(0, 6))
+        pim_chip_row.columnconfigure(_i, weight=1, uniform="pimchip")
+    pim_btn_row = ttk.Frame(pim_top)
+    pim_btn_row.pack(fill="x", pady=(4, 0))
+    pim_refresh_btn = ttk.Button(pim_btn_row, text=f"{icon('reload')} Refresh")
+    pim_refresh_btn.pack(side="left")
+    pim_sel_btn = ttk.Button(pim_btn_row, text="Activate selected", state="disabled")
+    pim_sel_btn.pack(side="left", padx=(8, 0))
+    pim_all_btn = ttk.Button(pim_btn_row, text="Activate ALL eligible roles at once", style="Accent.TButton", state="disabled")
+    pim_all_btn.pack(side="left", padx=(8, 0))
+    pim_stop_btn = ttk.Button(pim_btn_row, text=f"{icon('stop')} Stop", style="Stop.TButton", state="disabled")
+    pim_stop_btn.pack(side="left", padx=(8, 0))
+    pim_help = tk.Label(pim_btn_row, text="ⓘ Column help" if not _ICON_PLAIN[0] else "(?) Column help", fg=BRAND_PRIMARY, bg=BG, cursor="question_arrow", font=("Segoe UI", 9, "bold"))
+    pim_help.pack(side="right")
+    pim_count_var = tk.StringVar(value="")
+    ttk.Label(pim_btn_row, textvariable=pim_count_var, font=("Segoe UI", 10, "bold"), foreground=BRAND_PRIMARY).pack(side="right", padx=(0, 16))
+    _Tip(pim_help, "\n".join(f"{k}: {v}" for k, v in PIM_COLUMN_HELP.items()))
+    pim_filter_row = ttk.Frame(pim_top)
+    pim_filter_row.pack(fill="x", pady=(4, 0))
+    pim_search_var = tk.StringVar(value="")
+    pim_box, pim_search, pim_search_x = search_box(pim_filter_row, pim_search_var, 30)
+    pim_box.pack(side="left")
+    ttk.Label(pim_filter_row, text="Type:").pack(side="left", padx=(10, 2))
+    pim_type_var = tk.StringVar(value=PIM_ALL)
+    pim_type_combo = ttk.Combobox(pim_filter_row, textvariable=pim_type_var, width=24, state="readonly", values=[PIM_ALL] + [PIM_TYPE[f] for f in PIM_FAMILIES])
+    pim_type_combo.pack(side="left")
+    pim_selall_btn = ttk.Button(pim_filter_row, text="Select all eligible")
+    pim_selall_btn.pack(side="left", padx=(10, 0))
+    pim_clear_btn = ttk.Button(pim_filter_row, text="Clear")
+    pim_clear_btn.pack(side="left", padx=(4, 0))
+    pim_msg_var = tk.StringVar(value="")
+    pim_msg = tk.Label(pim_top, textvariable=pim_msg_var, anchor="w", justify="left", font=("Segoe UI", 9, "bold"), padx=6, pady=1, bg="#eef3f8", fg=COLORS["info"])
+    pim_msg.pack(fill="x", pady=(4, 0))
+    pim_msg.bind("<Configure>", lambda e: pim_msg.configure(wraplength=max(300, e.width - 20)))
+    pim_fb_slot = tk.Frame(pim_page, bg=BG)
+    pim_fb_slot.pack(fill="x")
+    pim_fb = ttk.LabelFrame(pim_fb_slot, text="This tenant blocked the automatic method", padding=6)
+    pim_fb_var = tk.StringVar(value="")
+    tk.Label(pim_fb, textvariable=pim_fb_var, anchor="w", justify="left", bg=BG, fg=COLORS["err"], font=("Consolas", 9), wraplength=1100).pack(fill="x")
+    pim_fb_help = tk.StringVar(value="")
+    tk.Label(pim_fb, textvariable=pim_fb_help, anchor="w", justify="left", bg=BG, fg=BRAND_TEXT, font=("Segoe UI", 9), wraplength=1100).pack(fill="x", pady=(4, 0))
+    pim_fb_btns = ttk.Frame(pim_fb)
+    pim_fb_btns.pack(fill="x", pady=(4, 0))
+    pim_open_entra_btn = ttk.Button(pim_fb_btns, text="Open the PIM page in your browser (Microsoft Entra roles)")
+    pim_open_entra_btn.pack(side="left")
+    pim_open_group_btn = ttk.Button(pim_fb_btns, text="Open the PIM page in your browser (groups)")
+    pim_open_group_btn.pack(side="left", padx=(6, 0))
+    pim_copy_err_btn = ttk.Button(pim_fb_btns, text="Copy the error text")
+    pim_copy_err_btn.pack(side="left", padx=(6, 0))
+
+    pim_paned = pim_page
+
+    def pane_card(title, stripe_colour, weight):
+        outer = tk.Frame(pim_page, bg=BG)
+        tk.Frame(outer, width=4, bg=stripe_colour).pack(side="left", fill="y")
+        lf = ttk.LabelFrame(outer, text=title, padding=4)
+        lf.pack(side="left", fill="both", expand=True)
+        outer.pack(fill="x", pady=(4, 0))
+        return lf
+
+    PIM_COLS = (("type", "Type", 160), ("scope", "Scope", 190), ("status", "Status", 115), ("expires", "Expires at (time left)", 185),
+                ("max", "Maximum duration allowed", 160), ("requires", "Requires", 190))
+
+    def pim_tree(parent, selectmode, height):
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill="x")
+        tv = ttk.Treeview(wrap, columns=[c[0] for c in PIM_COLS], show="tree headings", selectmode=selectmode, height=height)
+        tv.heading("#0", text="Role or group name")
+        tv.column("#0", width=210)
+        for cid, ctext, cw in PIM_COLS:
+            tv.heading(cid, text=ctext)
+            tv.column(cid, width=cw, anchor="w")
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tv.pack(side="left", fill="x", expand=True)
+        for tag, colour in (("Active", "#067647"), ("Expired soon", "#9a7d0a"), ("Eligible", "#1f4e79"), ("Pending approval", "#9a7d0a")):
+            tv.tag_configure(tag, foreground=colour)
+        return tv
+
+    pim_active_box = pane_card(f"{icon('ok')} Active roles - what you can use right now", "#067647", 1)
+    pim_active_tree = pim_tree(pim_active_box, "browse", 4)
+    ttk.Label(pim_active_box, style="Desc.TLabel", wraplength=1100, justify="left",
+              text="What this table shows: the roles and groups you hold at this moment (activated through PIM, or assigned permanently), with when each one ends. Read-only.").pack(anchor="w")
+    pim_elig_box = pane_card(f"{icon('key')} Eligible roles - allowed but not active yet (select the ones to activate)", BRAND_PRIMARY, 2)
+    pim_elig_tree = pim_tree(pim_elig_box, "extended", 7)
+    ttk.Label(pim_elig_box, style="Desc.TLabel", wraplength=1100, justify="left",
+              text="What this table shows: the roles and groups you may activate (eligible) but that are not active. Roles already active are not listed here. "
+                   "Nothing is requested until you confirm in the dialog.").pack(anchor="w")
+    pim_res_box = pane_card(f"{icon('list')} Activation results", "#9a7d0a", 1)
+    pim_res_tree = ttk.Treeview(pim_res_box, columns=("type", "result", "reason"), show="tree headings", selectmode="browse", height=5)
+    pim_res_tree.heading("#0", text="Role or group name")
+    pim_res_tree.heading("type", text="Type")
+    pim_res_tree.heading("result", text="Result")
+    pim_res_tree.heading("reason", text="Details (the service's reason)")
+    pim_res_tree.column("#0", width=230)
+    pim_res_tree.column("type", width=150)
+    pim_res_tree.column("result", width=130)
+    pim_res_tree.column("reason", width=700)
+    for _tag, _colour in (("Activated", "#067647"), ("Already active", "#1f4e79"), ("Pending approval", "#9a7d0a"), ("Denied", "#c00000"), ("Queued", "#888888"), ("Requesting", "#1f4e79")):
+        pim_res_tree.tag_configure(_tag, foreground=_colour)
+    pim_res_tree.pack(fill="x")
+    pim_res_row = ttk.Frame(pim_res_box)
+    pim_res_row.pack(fill="x", pady=(2, 0))
+    pim_progress = ttk.Progressbar(pim_res_row, mode="determinate", length=220)
+    pim_progress.pack(side="left")
+    pim_summary_var = tk.StringVar(value="No activation requested yet.")
+    ttk.Label(pim_res_row, textvariable=pim_summary_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=(10, 0))
+
+    def pim_say(text, kind="info"):
+        pim_msg_var.set(text)
+        pim_msg.configure(fg=COLORS.get(kind, COLORS["info"]))
+
+    def pim_gate():
+        """None when the tab can work, else the message (it needs the Cloud CLI (az) sign-in)."""
+        if not is_cli():
+            return ("The Privileged roles tab works with the Cloud CLI (az) sign-in. On tab 1 choose 'Cloud CLI (az)' as the login method (Step 1) and sign in "
+                    "(az login --use-device-code), then come back here and press Refresh. The custom akslogin sign-in cannot be used for PIM.")
+        if state["auth"].get("state") != "ok":
+            return "Sign in with the Azure CLI first (tab 1, Step 2: az login --use-device-code), then press Refresh."
+        return None
+
+    def pim_visible(rows):
+        ts, ty = terms(pim_search_var), pim_type_var.get()
+        return [r for r in rows if (ty == PIM_ALL or r["type"] == ty)
+                and hit(" ".join((r["name"], r["scope"], r["type"], r["status"], r.get("requires_text") or "")).lower(), ts)]
+
+    def pim_fill(tv, rows, eligible):
+        keep = set(tv.selection())
+        tv.delete(*tv.get_children())
+        for r in rows:
+            tv.insert("", "end", iid=r["key"], text=r["name"], tags=(r["status"],),
+                      values=(r["type"], r["scope"], r["status"], r["expires"], (r.get("max") or "-") if eligible else "-", (r.get("requires_text") or "-") if eligible else "-"))
+        keep = [k for k in keep if tv.exists(k)]
+        if keep:
+            tv.selection_set(keep)
+        stripe(tv)
+
+    def pim_buttons():
+        busy = pim["busy"]
+        todo = [r for r in pim["elig"] if r["status"] == "Eligible"]
+        sel = [k for k in pim_elig_tree.selection()]
+        pim_refresh_btn.state(["disabled"] if busy else ["!disabled"])
+        pim_all_btn.state(["!disabled"] if (not busy and todo and pim["me"] and pim["me"].get("oid")) else ["disabled"])
+        pim_sel_btn.state(["!disabled"] if (not busy and sel and pim["me"] and pim["me"].get("oid")) else ["disabled"])
+        pim_stop_btn.state(["!disabled"] if (busy and pim["cancel"] is not None) else ["disabled"])
+
+    def pim_render():
+        va, ve = pim_visible(pim["active"]), pim_visible(pim["elig"])
+        pim_fill(pim_active_tree, va, False)
+        pim_fill(pim_elig_tree, ve, True)
+        na, ne = len(pim["active"]), len([r for r in pim["elig"] if r["status"] == "Eligible"])
+        txt = f"{na} active, {ne} eligible" + (f"   (showing {len(va)} and {len(ve)})" if (len(va), len(ve)) != (na, len(pim["elig"])) else "")
+        pim_count_var.set(txt if pim["loaded"] else "")
+        pim_buttons()
+
+    def pim_set_chip(fam, text, kind):
+        pim_chips[fam].configure(text=f"{PIM_FAMILY_NAME[fam]}: {text}", bg=COLORS.get(kind, COLORS["dim"]))
+
+    def pim_apply(res):
+        pim.update(me=res["me"], active=res["active"], elig=res["elig"] if "elig" in res else res["eligible"], loaded=True, busy=False, fams=res["families"])
+        errors = {}
+        for fam in PIM_FAMILIES:
+            f = res["families"][fam]
+            if f["state"] == "ok":
+                pim_set_chip(fam, f["text"], "ok")
+            else:
+                st = pim_error_status(f["error"])
+                pim_set_chip(fam, "failed" + (f" (HTTP {st})" if st else "") + " - see below", "err")
+                errors[fam] = f["error"]
+        pim["errors"] = errors
+        fb = [f"{PIM_FAMILY_NAME[f]}: {errors[f]}" for f in ("entra", "group") if f in errors]
+        if fb:
+            pim_fb_var.set("\n".join(fb))
+            pim_fb_help.set("The automatic method uses the PIM service behind the portal's own PIM page (through 'az rest'), no Microsoft Graph consent. It was refused or failed (message above - "
+                            "paste it back if you need help). Options: (a) open the PIM page in your browser and activate there; (b) use " + PIM_SCRIPT_HINT + ".")
+            pim_fb.pack(fill="x")
+        else:
+            pim_fb.pack_forget()
+        if "arm" in errors:
+            pim_say(f"{PIM_FAMILY_NAME['arm']} could not be read: {errors['arm']}", "err")
+        else:
+            why = pim_no_eligible_text(res)
+            notice = res["me"].get("notice")
+            pim_say(why or notice or (f"Signed in as {res['me'].get('upn')}. Select eligible roles and press 'Activate selected', or 'Activate ALL eligible roles at once' "
+                                       f"- you confirm in a dialog first."), "warn" if (why or notice) else "info")
+        pim_render()
+
+    def pim_refresh(_e=None):
+        if pim["busy"]:
+            return
+        gate = pim_gate()
+        if gate:
+            pim_say(gate, "warn")
+            pim_buttons()
+            return
+        pim["busy"] = True
+        pim["visited"] = True
+        for fam in PIM_FAMILIES:
+            pim_set_chip(fam, "reading ...", "dim")
+        pim_say("Reading your privileged roles (read-only) ...", "info")
+        pim_buttons()
+
+        def work():
+            try:
+                me = pim_identity(force=True)
+                if not me["ok"]:
+                    pim["q"].put(("list_err", me["error"]))
+                    return
+                pim["q"].put(("list", pim_collect(me, lambda l: pim["q"].put(("log", l)))))
+            except Exception as exc:
+                pim["q"].put(("list_err", f"{type(exc).__name__}: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- the confirmation dialog: nothing is requested until Activate is pressed there
+    def pim_open_confirm(rows):
+        todo = [r for r in rows if r["status"] == "Eligible"]
+        skipped = len(rows) - len(todo)
+        if not todo:
+            pim_say("Nothing to activate: no eligible role is selected (roles that are already active or waiting for approval are skipped).", "warn")
+            return None
+        if pim["dialog"] is not None:
+            try:
+                pim["dialog"]["win"].destroy()
+            except Exception:
+                pass
+        win = tk.Toplevel(root)
+        win.title("Activate privileged roles")
+        win.configure(bg=BG)
+        win.geometry("1000x680")
+        win.transient(root)
+        d = {"win": win, "todo": todo, "rows": rows}
+        ttk.Label(win, text=f"{icon('shield')} Activate {len(todo)} role{'' if len(todo) == 1 else 's / groups'} (self-activation)", font=("Segoe UI", 13, "bold"),
+                  foreground=BRAND_PRIMARY).pack(anchor="w", padx=12, pady=(10, 2))
+        ttk.Label(win, text="These will be requested for you:", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=12)
+        lw = ttk.Frame(win)
+        lw.pack(fill="both", expand=True, padx=12, pady=(2, 6))
+        tv = ttk.Treeview(lw, columns=("type", "scope", "max", "requires"), show="tree headings", height=8, selectmode="none")
+        tv.heading("#0", text="Role or group name")
+        tv.heading("type", text="Type")
+        tv.heading("scope", text="Scope")
+        tv.heading("max", text="Maximum duration allowed")
+        tv.heading("requires", text="Requires")
+        tv.column("#0", width=290)
+        tv.column("type", width=170)
+        tv.column("scope", width=200)
+        tv.column("max", width=170)
+        tv.column("requires", width=150)
+        sb = ttk.Scrollbar(lw, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tv.pack(side="left", fill="both", expand=True)
+        for r in todo:
+            tv.insert("", "end", iid=r["key"], text=r["name"], values=(r["type"], r["scope"], r.get("max") or "-", r.get("requires_text") or "-"))
+        stripe(tv)
+        d["tree"] = tv
+        if skipped:
+            ttk.Label(win, text=f"{skipped} selected item{'' if skipped == 1 else 's'} skipped (already active or waiting for approval).", style="Desc.TLabel").pack(anchor="w", padx=12)
+        form = ttk.Frame(win)
+        form.pack(fill="x", padx=12, pady=(4, 0))
+        d["just_var"] = tk.StringVar(value=_SESSION.get("pim_just") or "")
+        d["hours_var"] = tk.StringVar(value="")
+        d["tno_var"] = tk.StringVar(value="")
+        d["tsys_var"] = tk.StringVar(value="")
+        ttk.Label(form, text="Justification (required):").grid(row=0, column=0, sticky="w")
+        d["just_entry"] = ttk.Entry(form, textvariable=d["just_var"], width=80)
+        d["just_entry"].grid(row=0, column=1, sticky="we", padx=(6, 0), pady=2)
+        ttk.Label(form, text="Duration in hours (optional):").grid(row=1, column=0, sticky="w")
+        hrow = ttk.Frame(form)
+        hrow.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=2)
+        d["hours_entry"] = ttk.Entry(hrow, textvariable=d["hours_var"], width=8)
+        d["hours_entry"].pack(side="left")
+        ttk.Label(hrow, text="empty = each role's policy maximum; a number = that long, never more than a role allows", style="Desc.TLabel").pack(side="left", padx=8)
+        ttk.Label(form, text="Ticket number (optional):").grid(row=2, column=0, sticky="w")
+        trow = ttk.Frame(form)
+        trow.grid(row=2, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Entry(trow, textvariable=d["tno_var"], width=22).pack(side="left")
+        ttk.Label(trow, text="Ticket system:").pack(side="left", padx=(10, 4))
+        ttk.Entry(trow, textvariable=d["tsys_var"], width=22).pack(side="left")
+        form.columnconfigure(1, weight=1)
+        d["notice_var"] = tk.StringVar(value=pim_confirm_text(len(todo)))
+        tk.Label(win, textvariable=d["notice_var"], anchor="w", justify="left", bg="#FFF8E1", fg=BRAND_TEXT, font=("Segoe UI", 10, "bold"), padx=8, pady=6,
+                 wraplength=940).pack(fill="x", padx=12, pady=(8, 0))
+        d["err_var"] = tk.StringVar(value="")
+        tk.Label(win, textvariable=d["err_var"], anchor="w", bg=BG, fg=COLORS["err"], font=("Segoe UI", 9, "bold")).pack(fill="x", padx=12)
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=12, pady=(4, 10))
+        d["cancel_btn"] = ttk.Button(bar, text="Cancel")
+        d["cancel_btn"].pack(side="right")
+        d["go_btn"] = ttk.Button(bar, text=f"Activate {len(todo)}", style="Accent.TButton")
+        d["go_btn"].pack(side="right", padx=(0, 8))
+
+        def valid(*_a):
+            ok = bool(d["just_var"].get().strip())
+            d["go_btn"].state(["!disabled"] if ok else ["disabled"])
+            d["err_var"].set("" if ok else "A justification is required.")
+            return ok
+        d["just_var"].trace_add("write", valid)
+        valid()
+
+        def close():
+            pim["dialog"] = None
+            _GUI["pim_dialog"] = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def go():
+            just = d["just_var"].get().strip()
+            if not just:
+                d["err_var"].set("A justification is required.")
+                return
+            hv = d["hours_var"].get().strip()
+            hours = None
+            if hv:
+                try:
+                    hours = float(hv.replace(",", "."))
+                    if hours <= 0 or hours > 24 * 30:
+                        raise ValueError
+                except ValueError:
+                    d["err_var"].set("Duration must be a number of hours (for example 4 or 0.5), or empty.")
+                    return
+            _SESSION["pim_just"] = just            # remembered for this session only (memory, never written to a file)
+            tno, tsys = d["tno_var"].get().strip(), d["tsys_var"].get().strip()
+            close()
+            pim_run(todo, just, hours, tno, tsys)
+        d["go_btn"].configure(command=go)
+        d["cancel_btn"].configure(command=close)
+        win.protocol("WM_DELETE_WINDOW", close)
+        d["close"], d["go"] = close, go
+        pim["dialog"] = d
+        _GUI["pim_dialog"] = d
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        d["just_entry"].focus_set()
+        return d
+
+    def pim_run(rows, just, hours, tno, tsys):
+        if pim["busy"] or not pim["me"]:
+            return
+        pim["busy"] = True
+        pim["cancel"] = threading.Event()
+        pim["results"] = {}
+        pim["total"], pim["done"] = len(rows), 0
+        pim_res_tree.delete(*pim_res_tree.get_children())
+        for r in rows:
+            pim_res_tree.insert("", "end", iid="q|" + r["key"], text=r["name"], values=(r["type"], "Queued", ""), tags=("Queued",))
+        pim_progress.configure(maximum=max(1, len(rows)), value=0)
+        pim_summary_var.set(f"Requesting {len(rows)} ...")
+        pim_say(f"Submitting {len(rows)} self-activation request{'' if len(rows) == 1 else 's'} (4 at a time) ...", "info")
+        pim_buttons()
+        me, ev, q = dict(pim["me"]), pim["cancel"], pim["q"]
+
+        def work():
+            try:
+                results = pim_activate_many(rows, me, just, hours, tno, tsys, on_start=lambda r: q.put(("start", r["key"])), on_result=lambda res: q.put(("result", res)),
+                                            cancel=ev, emit=lambda l: q.put(("log", l)))
+                q.put(("adone", results))
+            except Exception as exc:
+                q.put(("adone_err", f"{type(exc).__name__}: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def pim_activate_selected(_e=None):
+        keys = list(pim_elig_tree.selection())
+        rows = [r for r in pim["elig"] if r["key"] in keys]
+        if not rows:
+            pim_say("Select one or more eligible roles first (or use 'Activate ALL eligible roles at once').", "warn")
+            return None
+        return pim_open_confirm(rows)
+
+    def pim_activate_all(_e=None):
+        return pim_open_confirm(list(pim["elig"]))
+
+    def pim_stop(_e=None):
+        if pim["cancel"] is not None:
+            pim["cancel"].set()
+            pim_say("Stopping: requests not sent yet are cancelled. A request that was already sent cannot be recalled - Refresh shows what happened.", "warn")
+
+    def pim_pump():
+        try:
+            while True:
+                try:
+                    kind, *rest = pim["q"].get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "log":
+                    write(rest[0])
+                elif kind == "list":
+                    pim_apply(rest[0])
+                elif kind == "list_err":
+                    pim["busy"] = False
+                    pim["loaded"] = False
+                    for fam in PIM_FAMILIES:
+                        pim_set_chip(fam, "not loaded", "dim")
+                    pim_say(rest[0], "err")
+                    pim_buttons()
+                elif kind == "start":
+                    iid = "q|" + rest[0]
+                    if pim_res_tree.exists(iid):
+                        pim_res_tree.item(iid, values=(pim_res_tree.set(iid, "type"), "Requesting ...", ""), tags=("Requesting",))
+                elif kind == "result":
+                    res = rest[0]
+                    iid = "q|" + res["key"]
+                    pim["done"] += 1
+                    pim["results"][res["key"]] = res
+                    vals = (res["type"], res["outcome"], res["reason"])
+                    if pim_res_tree.exists(iid):
+                        pim_res_tree.item(iid, values=vals, tags=(res["outcome"],))
+                    else:
+                        pim_res_tree.insert("", "end", iid=iid, text=res["name"], values=vals, tags=(res["outcome"],))
+                    pim_progress.configure(value=pim["done"])
+                    pim_summary_var.set(f"{pim['done']} of {pim['total']} done")
+                elif kind in ("adone", "adone_err"):
+                    pim["busy"] = False
+                    pim["cancel"] = None
+                    if kind == "adone":
+                        pim["summary"] = pim_summary(rest[0])
+                        pim_summary_var.set("Summary: " + pim["summary"])
+                        pim_say("Finished: " + pim["summary"] + ". Refreshing the active list ...", "ok" if not any(x["outcome"] == "Denied" for x in rest[0]) else "warn")
+                        write("PIM summary: " + pim["summary"])
+                    else:
+                        pim_summary_var.set("Failed: " + rest[0])
+                        pim_say("Activation failed: " + rest[0], "err")
+                    pim_buttons()
+                    root.after(300, pim_refresh)                    # auto-refresh the active list
+        except tk.TclError:
+            return
+        root.after(150, pim_pump)
+
+    def pim_open_portal(kind):
+        try:
+            webbrowser.open(PIM_PORTAL_URLS[kind])
+        except Exception:
+            pass
+        pim_say("Opened the PIM page in your browser. Activate your roles there, then come back and press Refresh.", "info")
+
+    def pim_select_all(_e=None):
+        ks = [k for k in pim_elig_tree.get_children() if "Eligible" in pim_elig_tree.item(k, "tags")]
+        if ks:
+            pim_elig_tree.selection_set(ks)
+        pim_buttons()
+
+    def pim_clear_sel(_e=None):
+        pim_elig_tree.selection_remove(pim_elig_tree.selection())
+        pim_buttons()
+
+    def pim_on_tab(_e=None):
+        try:
+            if nb.nametowidget(nb.select()) is not tab_pim:
+                return
+        except Exception:
+            return
+        if not pim["visited"] and not pim["busy"]:
+            pim["visited"] = True
+            gate = pim_gate()
+            if gate:
+                pim_say(gate, "warn")
+            else:
+                pim_refresh()
+
+    pim_refresh_btn.configure(command=pim_refresh)
+    pim_sel_btn.configure(command=pim_activate_selected)
+    pim_all_btn.configure(command=pim_activate_all)
+    pim_stop_btn.configure(command=pim_stop)
+    pim_selall_btn.configure(command=pim_select_all)
+    pim_clear_btn.configure(command=pim_clear_sel)
+    pim_open_entra_btn.configure(command=lambda: pim_open_portal("entra"))
+    pim_open_group_btn.configure(command=lambda: pim_open_portal("group"))
+    pim_copy_err_btn.configure(command=lambda: copy_text(pim_fb_var.get()))
+    pim_elig_tree.bind("<<TreeviewSelect>>", lambda _e: pim_buttons())
+    pim_search_var.trace_add("write", lambda *_a: pim_render())
+    pim_type_combo.bind("<<ComboboxSelected>>", lambda _e: pim_render())
+    nb.bind("<<NotebookTabChanged>>", pim_on_tab, add="+")
+    pim_say(pim_gate() or "Press Refresh to read your privileged roles (read-only).", "info")
+    root.after(150, pim_pump)
+    _GUI.update(tab_pim=tab_pim, pim=pim, pim_refresh=pim_refresh, pim_refresh_btn=pim_refresh_btn, pim_sel_btn=pim_sel_btn, pim_all_btn=pim_all_btn, pim_stop_btn=pim_stop_btn,
+                pim_active_tree=pim_active_tree, pim_elig_tree=pim_elig_tree, pim_res_tree=pim_res_tree, pim_chips=pim_chips, pim_msg_var=pim_msg_var,
+                pim_count_var=pim_count_var, pim_search_var=pim_search_var, pim_type_var=pim_type_var, pim_type_combo=pim_type_combo, pim_selall_btn=pim_selall_btn,
+                pim_clear_btn=pim_clear_btn, pim_fb=pim_fb, pim_fb_var=pim_fb_var, pim_open_entra_btn=pim_open_entra_btn, pim_open_group_btn=pim_open_group_btn,
+                pim_summary_var=pim_summary_var, pim_progress=pim_progress, pim_activate_selected=pim_activate_selected, pim_activate_all=pim_activate_all,
+                pim_note=pim_note, pim_gate=pim_gate, pim_open_confirm=pim_open_confirm, pim_dialog=None, pim_pump=pim_pump, pim_stop=pim_stop, pim_msg=pim_msg,
+                pim_paned=pim_paned, pim_copy_err_btn=pim_copy_err_btn, pim_fb_help=pim_fb_help)
+
     def prepare(r):
         r["hay"] = " ".join(str(x) for x in (r.get("number") or "", r.get("label") or "", r["name"], r.get("where") or "",
                                               r.get("account_name") or "", r.get("account") or "")).lower()
@@ -8064,16 +10496,16 @@ def run_gui(default_minutes, skip_login=False, context=None):
         state["by_key"] = {r["key"]: r for r in state["crows"]}
 
     def effective_accounts():
-        """The subscriptions the cluster listing covers: the selected ones, or all usable ones ('All subscriptions')."""
-        if scope_var.get() == "sel":
-            return [a for a in state["accounts"] if a["id"] in state["acct_chosen"]]
-        found = [a for a in state["accounts"] if a.get("usable", True)]
-        return found
+        """The subscriptions the cluster listing covers: ONLY the selected ones (nothing is searched unless the user asks)."""
+        return [a for a in state["accounts"] if a["id"] in state["acct_chosen"] and a.get("usable", True)]      # a disabled subscription has no reachable clusters
 
     def signin_account():
         """The account the sign-in belongs to (the AWS profile; the other clouds sign in once)."""
         chosen = [a["id"] for a in state["accounts"] if a["id"] in state["acct_chosen"]]
         return chosen[0] if scope_var.get() == "sel" and chosen else None
+
+    def update_sel_counter():
+        acct_sel_count.set(f"{len(state['acct_chosen'])} of {len(state['accounts'])} selected" if state["accounts"] and not state["acct_locked"] else "")
 
     def update_scope_labels():
         usable = len([a for a in state["accounts"] if a.get("usable", True)])
@@ -8097,6 +10529,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
             acct_tree.insert("", "end", iid=a["id"], text=a["name"], values=(a["code"], a["info"]), tags=(("odd",) if i_ % 2 else ()))
         acct_tree.selection_set([a["id"] for a in shown if a["id"] in state["acct_chosen"]])
         acct_count.set(f"Showing {len(shown)} of {len(state['accounts'])}")
+        update_sel_counter()
 
     def on_acct_select(_event=None):
         if state["acct_locked"]:
@@ -8122,11 +10555,13 @@ def run_gui(default_minutes, skip_login=False, context=None):
 
     def acct_clear():
         state["acct_chosen"] = set()
-        scope_var.set("all")
+        scope_var.set("sel")
         rebuild_account_list()
         on_scope_change()
 
     def on_scope_change():
+        _SESSION["subs"] = set(state["acct_chosen"])             # remembered for the session
+        update_sel_counter()
         update_scope_labels()
         sync_login_opts()
         rebuild_cluster_list()
@@ -8143,10 +10578,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
 
     # ---- step 4 list
     def scoped_rows():
-        rows = state["crows"]
-        if is_cli() and scope_var.get() == "sel":
-            rows = [r for r in rows if r.get("account") in state["acct_chosen"]]
-        return rows
+        return state["crows"]                    # every cluster collected so far (the cache keeps earlier subscriptions)
 
     def rebuild_cluster_list():
         cluster_tree.delete(*cluster_tree.get_children())
@@ -8156,6 +10588,11 @@ def run_gui(default_minutes, skip_login=False, context=None):
             update_selected_label()
             return
         rows = scoped_rows()
+        if not rows and not state["listing"] and not state["listed"] and (is_cli() or src_var.get() == "all"):
+            cluster_tree.insert("", "end", iid="__hint__", text=COLLECT_HINT, tags=("hint",))
+            cl_count.set("")
+            update_selected_label()
+            return
         ts = terms(filter_var)
         shown = [r for r in rows if hit(r["hay"], ts)]
         for i_, r in enumerate(shown):
@@ -8217,13 +10654,17 @@ def run_gui(default_minutes, skip_login=False, context=None):
         if state["cl_locked"]:
             cl_status.set("Sign in first (step 2).")
         elif state["listing"]:
-            cl_status.set(f"Listing clusters: {state['list_done']}/{state['list_total']} subscriptions ... ({count_of(len(state['crows']), 'cluster')} so far)")
-        elif is_cli() and not state["listed"] and not state["crows"]:
-            cl_status.set("Press 'Reload clusters' to list the clusters of the subscriptions chosen in step 3.")
-        elif is_cli():
+            el_ = int(time.time() - (state.get("list_t0") or time.time()))
+            cl_status.set(f"Listing clusters: {state['list_done']}/{state['list_total']} subscriptions ... ({count_of(len(state['crows']), 'cluster')} so far) - elapsed {el_ // 60}:{el_ % 60:02d}")
+        elif state.get("list_stopped"):
+            pass                                              # keep the 'Listing stopped' line
+        elif (is_cli() or src_var.get() == "all") and not state["listed"] and not state["crows"]:
+            n_ = len(effective_accounts())
+            cl_status.set(COLLECT_HINT if not n_ else f"{count_of(n_, 'subscription')} selected - press 'Collect clusters from selected subscriptions'.")
+        elif (is_cli() or src_var.get() == "all") and not state.get("list_stopped"):
             todo = [a for a in effective_accounts() if a["id"] not in state["listed"]]
             if todo:
-                cl_status.set(f"{len(todo)} of the chosen subscriptions are not listed yet - press 'Reload clusters'.")
+                cl_status.set(f"{len(todo)} of the selected subscriptions are not collected yet - press 'Collect clusters from selected subscriptions'.")
 
     # ---- sign-in state: badge, message, what is unlocked
     def update_controls():
@@ -8235,6 +10676,12 @@ def run_gui(default_minutes, skip_login=False, context=None):
         set_state(signin_btn, cli and idle)
         set_state(check_btn, cli and idle)
         set_state(device_chk, cli and not working)
+        set_state(switch_btn, cli and idle)
+        set_state(tenant_entry, cli and not working)
+        set_state(sp_cancel_btn, bool(state["signin"]) and state["signin"].get("state") == "running" and state["signing"])
+        acct_combo.configure(state="normal" if (cli and auth_ok and idle) else "disabled")
+        set_state(recheck_btn, cli and auth_ok and idle and not state["checking_accts"])
+        set_state(check_all_btn, cli and auth_ok and idle and not state["checking_accts"])
         set_state(src_all_rb, not cli and not busy and not listing)
         set_state(src_menu_rb, not cli and not busy and not listing)
         state["acct_locked"] = cli and NEED_SIGNIN and not auth_ok
@@ -8245,12 +10692,15 @@ def run_gui(default_minutes, skip_login=False, context=None):
             set_state(w, not state["cl_locked"])
         set_state(acct_all_btn, not state["acct_locked"])
         set_state(acct_reload_btn, not state["acct_locked"] and not busy and not state["acct_loading"])
-        set_state(refresh_btn, not state["cl_locked"] and not busy and not listing)
+        set_state(refresh_btn, not state["cl_locked"] and not busy and not listing and (cli or src_var.get() == "all"))
+        set_state(collect_btn, not state["cl_locked"] and not busy and not listing and (cli or src_var.get() == "all"))
+        set_state(collect_stop_btn, listing)
         set_state(select_all_btn, not state["cl_locked"])
         set_state(clear_btn, not state["cl_locked"])
         acct_tree.configure(selectmode="none" if state["acct_locked"] else "extended")
         cluster_tree.configure(selectmode="none" if state["cl_locked"] else "extended")
         method_combo.configure(state="disabled" if (busy or listing or working) else "readonly")
+        signin_combo.configure(state="disabled" if (busy or listing or working) else "readonly")
         run_btn.state(["disabled"] if (busy or listing) else ["!disabled"])
         stop_btn.state(["!disabled"] if (busy or listing) else ["disabled"])
         for sid_, cb_ in sec_checks.items():            # the 'What to collect' panel is frozen while a run is active
@@ -8259,7 +10709,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
             b_.state(["disabled"] if busy else ["!disabled"])
         workers_spin.state(["disabled"] if busy else ["!disabled"])
         update_banner()
-        s3.configure(text=f"{icon('cloud')} Step 3 - Choose subscription" + ("   [locked - sign in first]" if state["acct_locked"] else
+        s3.configure(text=f"{icon('cloud')} Step 3 - Choose subscription(s)  (Ctrl/Shift-click for several)" + ("   [locked - sign in first]" if state["acct_locked"] else
                                                        (f"   [{len(state['accounts'])} loaded]" if state["accounts"] else "")))
         s4.configure(text=f"{icon('helm')} Step 4 - Choose clusters  (click one, Ctrl/Shift-click for several; they run one after another)"
                           + ("   [locked - sign in first]" if state["cl_locked"] else ""))
@@ -8277,6 +10727,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
                             "(read with az; clusters that are not in the akslogin menu are logged in with az aks get-credentials) or only the akslogin menu.")
         update_scope_labels()
         if not is_cli():
+            man_hide()
             state["auth"] = {"state": "unchecked"}
             set_badge("Handled by akslogin", "dim")
             auth_msg.set("Uses akslogin.exe - it signs in when you press Run. The sign-in buttons are only used with the Cloud CLI method.")
@@ -8287,19 +10738,47 @@ def run_gui(default_minutes, skip_login=False, context=None):
             auth_msg.set("")
 
     def apply_auth(res, source):
+        if source == "manual_auto":            # the background check of the manual panel: only a success matters
+            man["probing"] = False
+            if res["state"] != "ok" or not man["active"]:
+                return
+            if man.get("expect") and res.get("who") != man["expect"]:        # opened for an expired account: wait until THAT account is valid again
+                return
+            source = "manual_verify"
         state["checking"] = state["signing"] = False
         if not is_cli():                      # the method was switched while this was running
             update_controls()
             return
         was_ok = state["auth"]["state"] == "ok"
-        state["auth"] = res
+        prev_who = state["auth"].get("who") if was_ok else None
+        if not (source == "manual_verify" and res["state"] != "ok" and res.get("expired") and was_ok):      # expired credentials: the account stays selected
+            state["auth"] = res
         st = res["state"]
+        who_var.set("Signed in as: " + (f"{res.get('who') or '?'}" + (f"  (tenant {res['tenant']})" if res.get("tenant") else "") if st == "ok" else "-"))
         if st == "ok":
+            CRED["current"] = res.get("who") or CRED.get("current")
             who = res.get("who") or "?"
-            set_badge(f"Signed in as {who}", "ok")
+            n_subs = res.get("n_subs")
+            if source == "manual_verify":
+                tok = res.get("tok") or {}
+                set_account_status(who, tok.get("state") if tok.get("state") in ("active", "expiring") else "active", tok.get("left"), "")
+                if (not was_ok) or man.get("different") or man.get("expect") or (prev_who and prev_who != who):
+                    state.update(accounts_loaded=False, listed=set(), crows=[], by_key={}, cchosen=set(), clusters={})        # a new / renewed sign-in: read everything again
+                if man.get("different"):
+                    state["sel_acct"] = who
+                man.update(different=False, expect=None)
+            set_badge(f"Signed in as {who}" + (f" - {count_of(n_subs, 'subscription')}" if source == "manual_verify" and n_subs is not None else ""), "ok")
             auth_msg.set("You are signed in. Next: step 3 and step 4.")
-            lead = {"signin_ok": "Login OK - ", "already": "Already signed in - "}.get(source, "")
+            lead = {"signin_ok": "Login OK - ", "manual_verify": "Login OK - ", "already": "Already signed in - "}.get(source, "")
+            if man["shown"] and (man["active"] or source == "manual_verify"):
+                man_signed_in(res)
             say(f"{lead}signed in as {who}. Next: choose the subscription in step 3 (or keep 'All subscriptions') and the clusters in step 4.", "ok")
+        elif source == "manual_verify":
+            hint = signin_failure_help(res, man_tenant(), man_account_tenant())
+            set_badge("az not installed" if st == "no_cli" else ("Credentials expired" if res.get("expired") else "Not signed in"), "err")
+            auth_msg.set(hint)
+            say(hint.replace("\n", "  "), "err")
+            man_failed(hint)
         elif st == "no_cli":
             set_badge("az not installed", "err")
             auth_msg.set(res.get("detail") or "")
@@ -8312,16 +10791,19 @@ def run_gui(default_minutes, skip_login=False, context=None):
                     "terminal and then press 'Check status'.", "err")
             else:
                 say("Not signed in. " + (res.get("hint") or ""), "err")
+        if st != "ok" and source == "check" and LOGIN_OPTS.get("signin") == "manual":
+            man_open()                                  # the default method: show the commands right away (also when az is not installed)
         if st == "ok" and state["accounts_loaded"] and not state["accounts"]:
             say(acct_status.get(), "warn")
         update_controls()
-        if st == "ok" and (not was_ok or source in ("signin_ok", "already")):
+        refresh_expiry_banner()
+        if st == "ok" and (not was_ok or source in ("signin_ok", "already", "manual_verify")):
             if not state["accounts_loaded"] or not state["accounts"]:
                 load_accounts_async()
             else:
                 maybe_auto_list()
 
-    def check_status(_event=None):
+    def check_status(_event=None, source="check"):
         if not is_cli() or state["checking"] or state["signing"] or state["busy"] or state["listing"]:
             return
         sync_login_opts()
@@ -8334,17 +10816,250 @@ def run_gui(default_minutes, skip_login=False, context=None):
 
         def work():
             try:
-                res = login_status(acct)
+                res = verify_signin(acct) if source == "manual_verify" else login_status(acct)
             except Exception as exc:
                 res = {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": "Press 'Sign in'."}
-            msgs.put(("auth", res, "check"))
+            msgs.put(("auth", res, source))
         threading.Thread(target=work, daemon=True).start()
 
-    def sign_in(_event=None):
+    # ---- the account dropdown, chips and the credentials state
+    ACCT_KIND = {"active": "ok", "expiring": "warn", "expired": "err", "none": "dim", "unknown": "dim"}
+
+    def selected_account_key():
+        return state["sel_acct"] or (state["auth"].get("who") if state["auth"].get("state") == "ok" else None)
+
+    def account_status_of(key):
+        return CRED["status"].get(key)
+
+    def acct_expired():
+        """The account in use (selected one, else the signed-in one) whose credentials are expired, or None."""
+        key = selected_account_key()
+        return key if key and (account_status_of(key) or {}).get("state") == "expired" else None
+
+    def chip_text(st):
+        return status_text(st) if st else "Not checked"
+
+    def render_accounts():
+        """Dropdown values (type to search), the chip of the selected account and one chip per account."""
+        accts = state["accts"]
+        state["acct_map"] = {}
+        values = ["All accounts"]
+        for a_ in accts:
+            st = account_status_of(a_["key"])
+            txt = f"[{ACCOUNT_STATES.get((st or {}).get('state'), 'Not checked')}]  {a_['label']}"
+            state["acct_map"][txt] = a_["key"]
+            values.append(txt)
+        state["acct_values"] = values
+        typed = acct_combo.get()
+        cur = next((t for t, k in state["acct_map"].items() if k == state["sel_acct"]), "All accounts")
+        flt = [v for v in values if typed.lower() in v.lower()] if (typed and typed != cur and typed not in values) else values
+        acct_combo.configure(values=flt or values)
+        if not (typed and typed != cur and typed not in values):
+            acct_combo.set(cur)
+        key = selected_account_key()
+        st = account_status_of(key) if key else None
+        acct_chip.configure(text=chip_text(st) if key else "-", bg=COLORS[ACCT_KIND.get((st or {}).get("state"), "dim")])
+        for w in chips_row.winfo_children():
+            w.destroy()
+        state["chips"] = {}
+        for a_ in accts[:8]:
+            st = account_status_of(a_["key"])
+            kind = ACCT_KIND.get((st or {}).get("state"), "dim")
+            lbl = tk.Label(chips_row, text=f"{a_['user']}: {ACCOUNT_STATES.get((st or {}).get('state'), 'Not checked')}", fg="white", bg=COLORS[kind],
+                           padx=6, pady=1, font=("Segoe UI", 8, "bold"), cursor="hand2")
+            lbl.pack(side="left", padx=(0, 4))
+            lbl.bind("<Button-1>", lambda _e, k=a_["key"]: choose_account(k))
+            state["chips"][a_["key"]] = lbl
+        if len(accts) > 8:
+            tk.Label(chips_row, text=f"+{len(accts) - 8} more (use the dropdown)", fg=COLORS["dim"]).pack(side="left")
+
+    def refresh_expiry_banner():
+        """Expired credentials of the account in use: red badge + message ('Credentials for X expired. Press Sign in to renew.') and a highlighted button."""
+        if not is_cli() or state["signing"]:
+            return
+        key = acct_expired()
+        if key:
+            set_badge("Credentials expired", "err")
+            msg = f"Credentials for {key} expired. Press Sign in to renew."
+            auth_msg.set(msg)
+            say(msg, "err")
+            signin_btn.configure(text=f"{icon('key')} Sign in again", style="Alert.TButton")
+            if LOGIN_OPTS.get("signin") == "manual":
+                man_open(reason=None, force=True, quiet=True)       # the commands right under the message: renew without leaving this window
+        else:
+            signin_btn.configure(text=f"{icon('key')} Sign in", style="Accent.TButton")
+        render_accounts()
+
+    def check_accounts_async(accts):
+        accts = [a_ for a_ in accts if a_.get("check_sub") or a_.get("check_tenant") or len(accts) == 1]
+        if not accts:
+            return
+        state["checking_accts"] = True
+        update_controls()
+
+        def work():
+            try:
+                check_accounts(accts, lambda a_, st: msgs.put(("acctstat", a_["key"])))
+            finally:
+                msgs.put(("acctdone",))
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_account_scope():
+        """Step 3 shows only the chosen account's subscriptions (its tenant); the clusters are listed again."""
+        sel = state["sel_acct"]
+        keys = {a_["key"] for a_ in state["accts"]}
+        if sel not in keys:
+            sel = state["sel_acct"] = None
+        state["accounts"] = [a_ for a_ in state["acct_all"] if sel is None or a_.get("user") == sel]
+        for a_ in state["accounts"]:
+            a_["hay"] = f"{a_['name']} {a_['code']} {a_['info']}".lower()
+        state["acct_by_id"] = {a_["id"]: a_ for a_ in state["accounts"]}
+        state["acct_chosen"] &= set(state["acct_by_id"])
+        if scope_var.get() == "sel" and not state["acct_chosen"]:
+            scope_var.set("sel")
+        state.update(crows=[], by_key={}, cchosen=set(), clusters={}, listed=set())
+        update_scope_labels()
+        rebuild_account_list()
+        rebuild_cluster_list()
+        refresh_expiry_banner()
+
+    def choose_account(key):
+        if not is_cli() or state["busy"] or state["listing"] or state["signing"] or state["acct_loading"]:
+            status.set("Wait for the current run / listing / sign-in to finish before changing the account.")
+            render_accounts()
+            return
+        state["sel_acct"] = key
+        CRED["current"] = key or CRED.get("current")
+        apply_account_scope()
+        if key:
+            a_ = next((x for x in state["accts"] if x["key"] == key), None)
+            tn = (a_["tenants"][0][1] if a_ and a_["tenants"] else "")
+            acct_status.set(f"Account {key}: {count_of(len(state['accounts']), 'subscription')}" + (f" in tenant {tn}" if tn else "") + ".")
+            if a_:
+                check_accounts_async([a_])
+        else:
+            acct_status.set(f"All accounts: {count_of(len(state['accounts']), 'subscription')}.")
+        update_controls()
+        if not acct_expired():
+            maybe_auto_list()
+
+    def on_acct_combo(_event=None):
+        txt = acct_combo.get()
+        if txt == "All accounts":
+            choose_account(None)
+        elif txt in state["acct_map"]:
+            choose_account(state["acct_map"][txt])
+
+    def on_acct_type(event=None):
+        if event is not None and event.keysym in ("Return", "Up", "Down", "Escape", "Tab"):
+            return
+        typed = acct_combo.get().strip().lower()
+        vals = state.get("acct_values") or ["All accounts"]
+        acct_combo.configure(values=[v for v in vals if typed in v.lower()] or vals)
+
+    def recheck_selected():
+        key = selected_account_key()
+        a_ = next((x for x in state["accts"] if x["key"] == key), None)
+        if a_ is None:
+            check_status()
+        else:
+            check_accounts_async([a_])
+
+    def check_all_accounts():
+        check_accounts_async(list(state["accts"]))
+
+    # ---- sign-in with the details panel
+    def fmt_left(sec):
+        sec = max(0, int(sec))
+        return f"{sec // 60:02d}:{sec % 60:02d}"
+
+    def panel_reset(sess):
+        sp.pack(fill="x", pady=(6, 0))
+        dev = sess["device"] and not sess.get("console")
+        sp_url.configure(text="waiting for az to print the sign-in URL ..." if dev else (
+            "A console window opened for the sign-in - complete it there." if sess.get("console") else "A browser window opens for the sign-in - complete it there."))
+        sp_code.configure(text="........" if dev else ("(see the console window)" if sess.get("console") else "(no code needed)"))
+        sp_chip.configure(text="Waiting", bg=COLORS["info"])
+        sp_detail.set("")
+        sp_raw.set("")
+        sp_account.set("Account / tenant: " + (f"tenant {sess['tenant']}" if sess["tenant"] else "chosen when you sign in")
+                       + (f"   (replacing {sess['previous']})" if sess.get("previous") else ""))
+        sp_countdown.set("Starting sign-in ...")
+        set_state(sp_open_btn, False)
+        set_state(sp_copy_url_btn, False)
+        set_state(sp_copy_code_btn, False)
+
+    def tick():
+        state["tick"] = None
+        sess = state["signin"]
+        if not sess or sess.get("state") != "running":
+            return
+        if (sess["device"] and not sess.get("console") and not sess.get("url") and not sess.get("nourl") and time.time() - sess["t0"] > NO_URL_SECONDS):
+            sess["nourl"] = sess["autoswitch"] = True               # az printed no URL: stop it and switch to the commands the user runs in their own terminal
+            sess["cancel"].set()
+            man_open(reason=NO_URL_REASON, force=True)
+        if sess.get("expires"):
+            left = sess["expires"] - time.time()
+            sp_countdown.set(f"waiting for you to sign in... {fmt_left(left)}" if left > 0 else "The code has expired - cancel and start the sign-in again.")
+            if left <= 0:
+                sp_chip.configure(text="Expired", bg=COLORS["warn"])
+        else:
+            sp_countdown.set("waiting for you to sign in..." if not sess["device"] else "Starting sign-in ...")
+        state["tick"] = root.after(500, tick)
+
+    def on_signin_event(sess, ev):
+        if sess is not state["signin"]:
+            return
+        if ev["kind"] == "line":
+            sess["lines"] = (sess["lines"] + [ev["line"]])[-5:]
+            if not sess.get("code"):
+                sp_raw.set("\n".join(sess["lines"]))              # parsing failed (or not yet): the raw output stays readable
+        elif ev["kind"] == "code":
+            sess.update(url=ev["url"], code=ev["code"], expires=ev["expires_at"])
+            sp_url.configure(text=ev["url"])
+            sp_code.configure(text=ev["code"])
+            sp_raw.set("")
+            for b_ in (sp_open_btn, sp_copy_url_btn, sp_copy_code_btn):
+                set_state(b_, True)
+            sp_chip.configure(text="Waiting for sign-in", bg=COLORS["info"])
+            set_badge("Waiting for sign-in", "info")
+            say(f"Open {ev['url']} and enter the code {ev['code']} (details in step 2).", "info")
+            tick()
+
+    def open_signin_url(_e=None):
+        u = (state["signin"] or {}).get("url")
+        if u:
+            webbrowser.open(u)
+
+    def copy_text(txt):
+        if txt:
+            root.clipboard_clear()
+            root.clipboard_append(txt)
+
+    def cancel_signin():
+        sess = state["signin"]
+        if sess and sess.get("state") == "running":
+            sess["cancel"].set()
+            sp_chip.configure(text="Cancelling", bg=COLORS["warn"])
+            sp_countdown.set("Cancelling the sign-in ...")
+
+    def start_signin(different=False):
         if not is_cli() or state["checking"] or state["signing"] or state["busy"] or state["listing"]:
             return
         sync_login_opts()
+        tenant = tenant_var.get().strip() or None
+        if tenant and not TENANT_RE.match(tenant):
+            say("The tenant must be a tenant id (GUID) or a domain name such as contoso.onmicrosoft.com - or leave the box empty.", "warn")
+            return
+        LOGIN_OPTS["tenant"] = tenant
         acct = signin_account()
+        force = different or bool(acct_expired())
+        if LOGIN_OPTS["signin"] == "manual":                # the default: show the commands, the user runs one in their own terminal, then presses Verify
+            man_open(force=force, different=different)
+            return
+        sess = {"cancel": threading.Event(), "state": "running", "device": bool(device_var.get()), "console": LOGIN_OPTS["signin"] == "console",
+                "tenant": tenant, "url": None, "code": None,
+                "expires": None, "lines": [], "different": different, "previous": (state["auth"].get("who") if different else None), "t0": time.time()}
         state.update(signing=True, auth_for=acct)
         set_badge("Signing in...", "info")
         auth_msg.set("Running the sign-in ...")
@@ -8352,17 +11067,253 @@ def run_gui(default_minutes, skip_login=False, context=None):
 
         def work():
             try:
-                pre = login_status(acct)
-                if pre["state"] != "not_signed_in":
-                    msgs.put(("auth", pre, "already" if pre["state"] == "ok" else "check"))
-                    return
-                msgs.put(("say", "Login window opened - complete the sign-in in the console window / browser that just opened (a code may be shown "
-                                 "in the console). This window continues when you are done.", "info"))
-                ok = cli_sign_in(lambda l: msgs.put(("line", l)), acct)
-                msgs.put(("auth", login_status(acct), "signin_ok" if ok else "signin_fail"))
+                if not force:
+                    pre = login_status(acct)
+                    if pre["state"] != "not_signed_in":
+                        msgs.put(("auth", pre, "already" if pre["state"] == "ok" else "check"))
+                        return
+                msgs.put(("signin_begin", sess))
+                res = cli_sign_in_detailed(lambda l: msgs.put(("line", l)), lambda ev: msgs.put(("signin_ev", sess, ev)), sess["cancel"], tenant, sess["device"], sess["console"])
+                msgs.put(("signin_done", sess, res, login_status(acct)))
             except Exception as exc:
-                msgs.put(("auth", {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": "Press 'Sign in' to try again."}, "signin_fail"))
+                msgs.put(("signin_done", sess, {"status": "error", "error": str(exc), "rc": None, "lines": []},
+                          {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": "Press 'Sign in' to try again."}))
         threading.Thread(target=work, daemon=True).start()
+
+    def sign_in(_event=None):
+        start_signin(False)
+
+    def sign_in_different(_event=None):
+        start_signin(True)
+
+    def on_signin_begin(sess):
+        state["signin"] = sess
+        panel_reset(sess)
+        update_controls()
+        say("Signing in: " + ("a console window opened - complete the sign-in there; this window continues when it closes ..." if sess.get("console") else
+                              ("the device-code URL and code appear in 'Sign-in details' below ..." if sess["device"] else "complete the sign-in in the browser window ...")), "info")
+        tick()
+
+    def on_signin_done(sess, res, st):
+        if sess is not state["signin"]:
+            state["signing"] = False
+            update_controls()
+            return
+        status_ = res.get("status")
+        sess["state"] = status_
+        if state["tick"]:
+            root.after_cancel(state["tick"])
+            state["tick"] = None
+        sp_countdown.set("")
+        if sess.get("autoswitch"):                          # no URL: the manual commands were opened by tick(); nothing more to report
+            sp_chip.configure(text="No URL", bg=COLORS["warn"])
+            sp_detail.set("az printed no sign-in URL - use the commands in the panel above.")
+            state["signing"] = False
+            update_controls()
+            return
+        chip = {"ok": ("Signed in", "ok"), "cancelled": ("Cancelled", "warn"), "expired": ("Code expired", "warn")}.get(status_, ("Failed", "err"))
+        sp_chip.configure(text=chip[0], bg=COLORS[chip[1]])
+        if status_ == "ok" and st.get("state") == "ok":
+            who = st.get("who") or "?"
+            sess["finalize"] = who
+            sp_detail.set(f"Signed in as {who} - checking subscriptions ...")
+            state.update(accounts_loaded=False, listed=set(), crows=[], by_key={}, cchosen=set(), clusters={})
+            if sess["different"]:
+                state["sel_acct"] = who
+            set_account_status(who, "active")
+            CRED["current"] = who
+            state["signing"] = False
+            apply_auth(st, "signin_ok")
+            return
+        why = res.get("error") or (st.get("detail") if st.get("state") != "ok" else "") or "no details"
+        sp_detail.set({"cancelled": "Sign-in cancelled."}.get(status_, why))
+        state["signing"] = False
+        if st.get("state") == "ok":                         # a failed switch leaves the previous account signed in
+            apply_auth(st, "check")
+            say({"cancelled": "Sign-in cancelled - you are still signed in as " + str(st.get("who")) + "."}.get(status_, f"Sign-in failed: {why}"),
+                "warn" if status_ == "cancelled" else "err")
+        else:
+            apply_auth(dict(st, detail=why), "signin_fail")
+            if status_ == "cancelled":
+                say("Sign-in cancelled. Press 'Sign in' to start again.", "warn")
+        if status_ not in ("ok", "cancelled"):                # failed / expired / could not start / no URL: switch to the commands the user runs themselves
+            man_open(reason=NO_URL_REASON if not sess.get("url") else FAILED_REASON, force=True, quiet=True)
+        update_controls()
+
+    # ---- manual sign-in: show the commands, wait for the user, verify read-only (az account show / expiry check / az account list)
+    def man_tenant():
+        t = tenant_var.get().strip()
+        return t if t and TENANT_RE.match(t) else None
+
+    def man_account_tenant():
+        """The real tenant id of the selected account (else of the signed-in one), when known."""
+        a_ = next((x for x in state["accts"] if x["key"] == state["sel_acct"]), None) if state["sel_acct"] else None
+        if a_ and len(a_["tenants"]) == 1 and a_["tenants"][0][0] not in (None, "?"):
+            return a_["tenants"][0][0]
+        return state["auth"].get("tenant_id") if state["auth"].get("state") == "ok" else None
+
+    def man_refresh():
+        """Put the tenant into the commands (1b variant line when the Tenant box has a value; command 3 uses the real tenant id when known)."""
+        items = manual_commands(man_tenant(), man_account_tenant())
+        for item in items:
+            man_cmd_vars[item["key"]].set(item["cmd"])
+        if any(i["key"] == "device-tenant" for i in items):
+            if not man_rows["device-tenant"].winfo_ismapped():
+                man_rows["device-tenant"].pack(fill="x", pady=(4, 0), after=man_rows["device"])
+        else:
+            man_rows["device-tenant"].pack_forget()
+            if man_form.get() == "device-tenant":
+                man_form.set("device")
+
+    def man_cli_check():
+        """The 'Azure CLI installed?' line: PATH lookup now, `az --version` (first line) in the background; install hint as TEXT when az is missing."""
+        text, found = az_cli_line()
+        man_cli_var.set(text)
+        man_cli_lbl.configure(fg=COLORS["ok"] if found else COLORS["err"])
+        if found:
+            man_inst.pack_forget()
+
+            def work():
+                try:
+                    ver = az_version()
+                except Exception:
+                    ver = None
+                msgs.put(("man", "cliinfo", ver))
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            man_inst.pack(fill="x", pady=(2, 0), after=man_cli_lbl)
+
+    def man_show():
+        if not man["shown"]:
+            man["shown"] = True
+            man_panel.pack(fill="x", pady=(6, 0), after=auth_msg_lbl)
+
+    def man_chip_set(text, kind):
+        man_chip.configure(text=text, bg=COLORS.get(kind, COLORS["dim"]))
+
+    def man_open(reason=None, force=False, different=False, quiet=False):
+        """Show the manual sign-in panel and start waiting (checks every MANUAL_POLL_SECONDS whether the sign-in happened). Idempotent while waiting."""
+        if not is_cli():
+            return
+        if state["auth"]["state"] == "ok" and not force and not reason and not man["active"]:
+            say(f"Already signed in as {state['auth'].get('who') or '?'}. Use 'Sign in with a different account' to sign in with another account.", "ok")
+            return
+        man_show()
+        man_refresh()
+        man_cli_check()
+        man["different"] = man["different"] or different
+        if man["active"]:
+            if reason:
+                man_msg_var.set(reason)
+            return
+        man_msg_var.set(reason or "")
+        man_form.set("device" if device_var.get() else "browser")
+        man_result_var.set("")
+        man_result_lbl.configure(fg=COLORS["info"])
+        if man.get("after"):
+            try:
+                root.after_cancel(man["after"])
+            except Exception:
+                pass
+        man.update(active=True, t0=time.time(), probing=False, expect=acct_expired())
+        man_stop_btn.state(["!disabled"])
+        man_chip_set("Waiting for you", "info")
+        man_status_var.set("Waiting for you to sign in...")
+        man["after"] = root.after(int(MANUAL_POLL_SECONDS * 1000), man_tick)
+        if not quiet:
+            say("Run one of the numbered commands in step 2 in your own terminal (open the URL it prints, enter the code), then press 'I have signed in - Verify'. "
+                "This window also notices the sign-in by itself.", "info")
+
+    def man_tick():
+        man["after"] = None
+        if not man["active"]:
+            return
+        if time.time() - man["t0"] > MANUAL_POLL_CAP:
+            man_stop(f"Stopped waiting after {MANUAL_POLL_CAP // 60} minutes. Press 'I have signed in - Verify' when you have signed in.")
+            return
+        if not man["probing"] and not (state["busy"] or state["checking"] or state["signing"] or state["listing"]):
+            man["probing"] = True
+
+            def work():
+                try:
+                    res = verify_signin(None)
+                except Exception as exc:
+                    res = {"state": "not_signed_in", "who": None, "detail": str(exc), "hint": ""}
+                msgs.put(("auth", res, "manual_auto"))
+            threading.Thread(target=work, daemon=True).start()
+        man["after"] = root.after(int(MANUAL_POLL_SECONDS * 1000), man_tick)
+
+    def man_stop(message=None):
+        man["active"] = False
+        if man.get("after"):
+            try:
+                root.after_cancel(man["after"])
+            except Exception:
+                pass
+            man["after"] = None
+        man_stop_btn.state(["disabled"])
+        if message != "":
+            man_chip_set("Stopped", "dim")
+            man_status_var.set(message or "Stopped waiting. Press 'I have signed in - Verify' when you have signed in.")
+
+    def man_hide():
+        man_stop("")
+        if man["shown"]:
+            man["shown"] = False
+            man_panel.pack_forget()
+
+    def man_verify():
+        if state["checking"] or state["signing"] or state["busy"] or state["listing"]:
+            man_result_var.set("Please wait for the current action to finish, then press Verify again.")
+            return
+        man_result_var.set("Verifying (read-only): az account show, the expiry check and az account list ...")
+        man_result_lbl.configure(fg=COLORS["info"])
+        man_chip_set("Verifying", "info")
+        check_status(source="manual_verify")
+
+    def man_signed_in(res):
+        man_stop("")
+        n_ = res.get("n_subs")
+        man_chip_set("Signed in", "ok")
+        man_status_var.set("Signed in.")
+        man_msg_var.set("")
+        man_result_var.set(f"Signed in as {res.get('who') or '?'}" + (f" - {count_of(n_, 'subscription')}" if n_ is not None else "")
+                           + (f"   (tenant {res['tenant']})" if res.get("tenant") else ""))
+        man_result_lbl.configure(fg=COLORS["ok"])
+
+    def man_failed(text):
+        man_chip_set("Waiting for you" if man["active"] else "Not signed in", "info" if man["active"] else "err")
+        man_result_var.set(text)
+        man_result_lbl.configure(fg=COLORS["err"])
+
+    def man_copy(key):
+        cmd = man_cmd_vars[key].get()
+        root.clipboard_clear()
+        root.clipboard_append(cmd)
+        status.set("Copied: " + cmd)
+
+    def man_terminal():
+        """'Open a terminal for me': a visible PowerShell window with the chosen az login form (user-initiated, local-only; nothing else is ever started this way)."""
+        form = man_form.get()
+        ok, info = open_terminal_signin(form, man_tenant() if form == "device-tenant" else (man_tenant() or man_account_tenant()))
+        if ok:
+            if not man["active"]:
+                man_open(force=True, quiet=True)
+            man_result_var.set(f"A PowerShell window opened and runs: {info}   Complete the sign-in there, then press 'I have signed in - Verify'.")
+            man_result_lbl.configure(fg=COLORS["info"])
+        else:
+            man_result_var.set("Could not open a terminal: " + info)
+            man_result_lbl.configure(fg=COLORS["err"])
+
+    def on_signin_method(_event=None):
+        LOGIN_OPTS["signin"] = _SESSION["signin"] = SIGNIN_KEYS.get(signin_var.get(), "manual")
+        if LOGIN_OPTS["signin"] == "manual":
+            say("Sign-in method: you run the command yourself. The commands are shown in step 2.", "info")
+            if is_cli() and state["auth"]["state"] != "ok":
+                man_open()
+        else:
+            man_hide()
+            say(f"Sign-in method: {SIGNIN_METHOD_LABELS[LOGIN_OPTS['signin']]}. Press 'Sign in' to start it.", "info")
 
     # ---- step 3 loading (subscriptions are read once and cached for the session; 'Reload subscriptions' refreshes)
     def load_accounts_async(force=False):
@@ -8385,20 +11336,37 @@ def run_gui(default_minutes, skip_login=False, context=None):
     def on_accounts(accts, err):
         state["acct_loading"] = False
         state["accounts_loaded"] = True
+        state["acct_all"] = accts
+        state["accts"] = build_accounts(accts)
+        register_account_owners(accts)
+        if state["sel_acct"] not in {a_["key"] for a_ in state["accts"]}:
+            state["sel_acct"] = None
+        if state["sel_acct"]:
+            accts = [a_ for a_ in accts if a_.get("user") == state["sel_acct"]]
+        if is_cli() and state["accts"]:
+            check_accounts_async(list(state["accts"]))
+        sess_ = state["signin"]
+        if sess_ and sess_.get("finalize"):
+            who_ = sess_.pop("finalize")
+            n_ = len([a_ for a_ in state["acct_all"] if a_.get("user") == who_]) or len(state["acct_all"])
+            sp_detail.set(f"Signed in as {who_} - {count_of(n_, 'subscription')}")
         state["accounts"] = accts
         state["acct_by_id"] = {a["id"]: a for a in accts}
         state["acct_chosen"] &= set(state["acct_by_id"])
+        if not state["acct_chosen"] and _SESSION.get("subs"):
+            state["acct_chosen"] = set(_SESSION["subs"]) & set(state["acct_by_id"])          # the last selection of this session
         if ACCOUNT0 and not state["pre"]:
             state["pre"] = True
             if ACCOUNT0 in state["acct_by_id"]:
                 state["acct_chosen"] = {ACCOUNT0}
                 scope_var.set("sel")
         if scope_var.get() == "sel" and not state["acct_chosen"]:
-            scope_var.set("all")
+            scope_var.set("sel")
         update_scope_labels()
         update_controls()
         rebuild_account_list()
         rebuild_cluster_list()
+        render_accounts()
         state["acct_err"] = err
         if not accts:
             acct_status.set("No subscriptions found. Your Azure sign-in can see no subscription (or the list could not be read). Fix: press 'Sign in' and use an account that has a subscription, or ask for the Reader role on one, then press 'Reload subscriptions'." + (f" (details: {err})" if err else ""))
@@ -8408,96 +11376,82 @@ def run_gui(default_minutes, skip_login=False, context=None):
         usable = len([a for a in accts if a.get("usable", True)])
         acct_status.set(f"{count_of(len(accts), 'subscription')} loaded" + (f" ({usable} usable)" if usable != len(accts) else "") + ".")
         if is_cli() and state["auth"]["state"] == "ok":
-            say(f"{count_of(len(accts), 'subscription')} loaded. Step 3: keep 'All subscriptions ({usable})' or select some in the list; step 4 lists the clusters.", "ok")
-            maybe_auto_list()
+            say(f"{count_of(len(accts), 'subscription')} loaded. Step 3: select one or more subscriptions (or 'Select all (shown)'), then press 'Collect clusters from selected subscriptions' in step 4.", "ok")
 
     # ---- step 4 loading (clusters are listed per subscription in parallel; the list grows while it runs)
     def maybe_auto_list():
-        if (is_cli() and state["auth"]["state"] == "ok" and state["accounts_loaded"] and not state["listing"] and not state["busy"]
-                and not state["listed"] and effective_accounts()):
-            load_clusters()
+        """Clusters are NEVER listed automatically any more: only the 'Collect clusters from selected subscriptions' button does it."""
+        cluster_hint()
 
-    def load_clusters(_event=None):
+    def load_clusters(_event=None, refresh=False):
+        """The 'Collect clusters from selected subscriptions' button (and 'Refresh selected'): lists the clusters of the SELECTED subscriptions only,
+        skipping the ones already collected (per-subscription cache) unless refresh=True. The custom login's default list is the akslogin menu (instant)."""
         if state["busy"]:
-            status.set("Wait for the current run to finish (or press Stop) before reloading the cluster list.")
+            status.set("Wait for the current run to finish (or press Stop) before collecting clusters.")
             return
         if state["listing"]:
             return
         sync_login_opts()
-        if not is_cli():
-            if not state["src_user"] and shutil.which("az"):
-                src_var.set("all")                       # default: every cluster the signed-in user can access
-            if src_var.get() == "all" and not shutil.which("az"):
-                src_var.set("menu")
-                say("The Azure CLI (az) is not installed, so only the clusters from the akslogin menu can be listed. "
-                    "Install az and press 'Reload clusters' to see every cluster you can access.", "warn")
-            if src_var.get() == "all":
-                load_exe_all()
-                return
+        if not is_cli() and src_var.get() != "all":                      # the akslogin menu: instant, no cloud call
             CLI_TARGETS.clear()
             state["listing"] = True
             cl_status.set("Loading the cluster list from akslogin ...")
             update_controls()
             threading.Thread(target=lambda: msgs.put(("clusters", list_clusters())), daemon=True).start()
             return
-        if state["auth"]["state"] != "ok":
-            say("Sign in first (step 2): press 'Sign in', or 'Check status' if you already signed in.", "warn")
+        if is_cli() and state["auth"]["state"] != "ok":
+            say("Sign in first (step 2): run one of the commands shown there, then press 'I have signed in - Verify'.", "warn")
+            return
+        if not shutil.which("az"):
+            say("The Azure CLI (az) is not installed - install it first (" + AZ_INSTALL_URL + ").", "warn")
             return
         accts = effective_accounts()
         if not accts:
-            say("Choose at least one subscription in step 3 (or click 'All subscriptions') and press 'Reload clusters'.", "warn")
+            say("Select one or more subscriptions above, then press 'Collect clusters from the selected subscriptions'.", "warn")
+            cluster_hint()
             return
-        ids = {a["id"] for a in accts}
+        todo = accts if refresh else [a for a in accts if a["id"] not in state["listed"]]
+        if not todo:
+            say(f"The {count_of(len(accts), 'selected subscription')} {'is' if len(accts) == 1 else 'are'} already collected (cached). Press 'Refresh selected' to read again.", "info")
+            return
+        if len(todo) > BIG_SCOPE and not confirm_big_scope(len(todo)):
+            say("Cluster collection cancelled.", "info")
+            return
+        ids = {a["id"] for a in todo}
         state["crows"] = [r for r in state["crows"] if r.get("account") not in ids]       # these are listed again
         state["listed"] -= ids
         index_rows()
         cancel = threading.Event()
-        state.update(listing=True, list_cancel=cancel, list_done=0, list_total=len(accts))
-        list_bar.configure(maximum=max(1, len(accts)), value=0)
-        simple = [{"id": a["id"], "name": a["name"]} for a in accts]
-        extra = {}
-        say(f"Listing clusters in {count_of(len(accts), 'subscription')} ... the list below fills in as results arrive (Stop cancels).", "info")
+        state.update(listing=True, list_cancel=cancel, list_done=0, list_total=len(todo), list_t0=time.time(), src_fallback=False, list_stopped=False)
+        list_bar.configure(maximum=max(1, len(todo)), value=0)
+        simple = [{"id": a["id"], "name": a["name"]} for a in todo]
+        with_menu = not is_cli()
+        say(f"Listing clusters in {count_of(len(todo), 'subscription')} ... the list below fills in as results arrive (Stop cancels).", "info")
         update_controls()
 
         def work():
             try:
-                found, failed = scan_clusters(simple, lambda l: msgs.put(("line", l)), lambda d, t: msgs.put(("lprog", d, t)), cancel,
-                                              lambda batch: msgs.put(("cbatch", list(batch))), **extra)
-                msgs.put(("cdone", found, failed, cancel.is_set(), [a["id"] for a in simple]))
-            except Exception as exc:
-                msgs.put(("cerr", str(exc), [a["id"] for a in simple]))
-        threading.Thread(target=work, daemon=True).start()
-
-    def load_exe_all():
-        """Custom login + 'All clusters I can access': read the akslogin menu, check the az sign-in (read-only), list every cluster of
-        every subscription az can see (parallel / Resource Graph), then map the menu entries onto them (merge_menu)."""
-        cancel = threading.Event()
-        state.update(listing=True, list_cancel=cancel, list_done=0, list_total=0, listed=set(), crows=[], by_key={}, src_fallback=False)
-        list_bar.configure(maximum=1, value=0)
-        cl_status.set("Reading the akslogin menu and the Azure sign-in ...")
-        say("Listing every cluster you can access (all subscriptions, via az) ... Stop cancels.", "info")
-        update_controls()
-
-        def work():
-            try:
-                menu = list_clusters()
-                msgs.put(("menu", dict(menu)))
-                res = login_status()
-                if res["state"] != "ok":
-                    msgs.put(("srcfallback", res.get("detail") or "az is not signed in", dict(menu)))
-                    return
-                accts, err = load_accounts()
-                simple = [{"id": a["id"], "name": a["name"]} for a in accts if a.get("usable", True)]
-                if not simple:
-                    msgs.put(("srcfallback", "az can see no subscription" + (f" ({err})" if err else ""), dict(menu)))
-                    return
+                if with_menu:
+                    menu = list_clusters()
+                    msgs.put(("menu", dict(menu)))
+                    res = login_status()
+                    if res["state"] != "ok":
+                        msgs.put(("srcfallback", res.get("detail") or "az is not signed in", dict(menu)))
+                        return
                 msgs.put(("lstart", len(simple)))
                 found, failed = scan_clusters(simple, lambda l: msgs.put(("line", l)), lambda d, t: msgs.put(("lprog", d, t)), cancel,
                                               lambda batch: msgs.put(("cbatch", list(batch))))
                 msgs.put(("cdone", found, failed, cancel.is_set(), [a["id"] for a in simple]))
             except Exception as exc:
-                msgs.put(("cerr", str(exc), []))
+                msgs.put(("cerr", str(exc), [a["id"] for a in simple]))
         threading.Thread(target=work, daemon=True).start()
+
+    def confirm_big_scope(n):
+        from tkinter import messagebox
+        return bool(messagebox.askyesno(PRODUCT_NAME, f"This will search {n} subscriptions and can take several minutes. Continue?", parent=root))
+
+    def refresh_selected():
+        load_clusters(refresh=True)
 
     def show_menu_clusters(menu, note=None):
         """The list is the akslogin menu only (numbers = the menu numbers)."""
@@ -8525,7 +11479,11 @@ def run_gui(default_minutes, skip_login=False, context=None):
         state.update(crows=[], by_key={}, cchosen=set(), clusters={}, listed=set(), menu={}, src_fallback=False)
         manual_var.set("")
         rebuild_cluster_list()
-        load_clusters()
+        if src_var.get() == "menu":
+            load_clusters()                                  # the akslogin menu is instant; az needs the button
+        else:
+            cluster_hint()
+            update_controls()
 
     def on_clusters_done(found, failed, cancelled, ids):
         state["listing"] = False
@@ -8557,6 +11515,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
         n = len(rows)
         skipped = (" Failed: " + ", ".join((LAST_SCAN.get("failed") or [])[:6]) + " - see the log.") if failed else ""
         summary = scan_summary([r for r in rows if not r.get("exe_only")])
+        state["list_stopped"] = bool(cancelled)
         if cancelled:
             cl_status.set(f"Listing stopped - {count_of(n, 'cluster')} so far.")
             say(f"Listing stopped - {count_of(n, 'cluster')} found so far. Press 'Reload clusters' to list again.", "warn")
@@ -8599,6 +11558,8 @@ def run_gui(default_minutes, skip_login=False, context=None):
         """Read the login method and the chosen subscription (and region) into the options a run (or a cluster listing) uses."""
         LOGIN_OPTS["method"] = "cli" if method_combo.get() == LOGIN_LABELS["cli"] else "exe"
         LOGIN_OPTS["device_code"] = device_var.get()
+        LOGIN_OPTS["signin"] = _SESSION["signin"] = SIGNIN_KEYS.get(signin_var.get(), "manual")        # remembered for the session
+        LOGIN_OPTS["tenant"] = tenant_var.get().strip() or None
         LOGIN_OPTS["all_clusters"] = False        # the window has its own 'Cluster list' choice (list_clusters() then means the akslogin menu)
         picked = state["acct_chosen"] if scope_var.get() == "sel" else set()
         if state["pre"] or not ACCOUNT0:      # keep the command-line value until the list has been read
@@ -8648,6 +11609,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
         picked = selected_sections()
         if not [s for s in picked if s in selectable_ids()]:
             status.set("Nothing is selected under 'What to collect'.")
+            nb.select(tab_collect)
             say("Nothing is selected under 'What to collect'. Tick at least one section (or press 'Select all'), then press 'Login & Debug'.", "warn")
             return
         try:
@@ -8664,6 +11626,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
         reset_steps()
         reset_run(selected)
         status.set(f"Starting {len(selected)} cluster(s) ...")
+        nb.select(tab_run)                     # tab 3 (live steps, findings, log) opens when a run starts
 
         def work():
             try:
@@ -8711,7 +11674,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
         update_controls()
         status.set(ok_text)
 
-    RUN_TAG = {"running": "running", "ok": "ok", "failed": "failed", "stopped (partial)": "partial"}
+    RUN_TAG = {"running": "running", "ok": "ok", "failed": "failed", "credentials expired": "failed", "stopped (partial)": "partial"}
 
     def poll():
         try:
@@ -8724,6 +11687,31 @@ def run_gui(default_minutes, skip_login=False, context=None):
                     say(msg[1], msg[2])
                 elif kind == "auth":
                     apply_auth(msg[1], msg[2])
+                elif kind == "signin_begin":
+                    on_signin_begin(msg[1])
+                elif kind == "signin_ev":
+                    on_signin_event(msg[1], msg[2])
+                elif kind == "man":
+                    if msg[1] == "cliinfo" and msg[2]:
+                        man_cli_var.set("Azure CLI installed: " + msg[2])
+                elif kind == "signin_done":
+                    on_signin_done(msg[1], msg[2], msg[3])
+                elif kind == "acctstat":
+                    refresh_expiry_banner()
+                elif kind == "acctdone":
+                    state["checking_accts"] = False
+                    update_controls()
+                    refresh_expiry_banner()
+                elif kind == "expired":                  # an az call failed because the credentials expired (mid-use)
+                    refresh_expiry_banner()
+                    if not state["signing"]:
+                        who_ = acct_expired() or msg[1]
+                        say(f"Credentials for {who_} expired. Press Sign in to renew.", "err")
+                        if is_cli():
+                            set_badge("Credentials expired", "err")
+                            signin_btn.configure(text=f"{icon('key')} Sign in again", style="Alert.TButton")
+                            auth_msg.set(f"Credentials for {who_} expired. Press Sign in to renew.")
+                            update_controls()
                 elif kind == "accounts":
                     on_accounts(msg[1], msg[2])
                 elif kind == "menu":
@@ -8736,7 +11724,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
                     state["src_fallback"] = True
                     src_var.set("menu")
                     show_menu_clusters(msg[2], f"Azure CLI (az) is not usable ({msg[1]}), so only the clusters from the akslogin menu are shown. "
-                                               "Sign in with 'az login', then press 'Reload clusters' to list every cluster you can access.")
+                                               "Sign in with 'az login', choose the az option in step 1 and press 'Collect clusters from selected subscriptions'.")
                 elif kind == "lprog":
                     state["list_done"], state["list_total"] = msg[1], msg[2]
                     list_bar.configure(maximum=max(1, msg[2]), value=msg[1])
@@ -8751,11 +11739,14 @@ def run_gui(default_minutes, skip_login=False, context=None):
                 elif kind == "cdone":
                     on_clusters_done(msg[1], msg[2], msg[3], msg[4])
                     status.set("Cluster listing done." if not msg[3] else "Cluster listing stopped.")
+                    if acct_expired():
+                        refresh_expiry_banner()                  # the listing failed because the credentials expired: say that, not a generic failure
                 elif kind == "cerr":
                     state["listing"] = False
                     cl_status.set("Listing failed.")
                     say(f"Could not list the clusters: {msg[1]}", "err")
                     update_controls()
+                    refresh_expiry_banner()
                 elif kind == "step":
                     _, key, st, secs = msg
                     if steps.exists(key):
@@ -8770,7 +11761,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
                 elif kind == "cluster":
                     _, i, n, label, st, entry = msg
                     number = entry["number"]
-                    shown = {"ok": "OK", "failed": "FAILED", "running": "running ..."}.get(st, st)
+                    shown = {"ok": "OK", "failed": "FAILED", "running": "running ...", "credentials expired": "CREDENTIALS EXPIRED"}.get(st, st)
                     c = entry["counts"] if entry.get("counts") else Counter()
                     if run_tree.exists(number):
                         run_tree.item(number, values=(shown, c["CRIT"] if st != "running" else "", c["HIGH"] if st != "running" else ""),
@@ -8799,7 +11790,7 @@ def run_gui(default_minutes, skip_login=False, context=None):
                     progress_bar.configure(value=state["total"])
                     if state["html"]:
                         open_btn.state(["!disabled"])
-                    bad = [r["label"] for r in results["items"] if r["status"] == "failed"]
+                    bad = [r["label"] for r in results["items"] if r["status"] in ("failed", "credentials expired")]
                     finish(f"Done: {len(ok)} of {len(results['items'])} cluster(s) reported"
                            + (f" ({len(bad)} failed: {', '.join(bad)})" if bad else "")
                            + ". Click 'Open HTML report'." if state["html"] else "Finished, but no report could be written - see the log.")
@@ -8812,6 +11803,8 @@ def run_gui(default_minutes, skip_login=False, context=None):
                     finish(f"ERROR: {msg[1]}")
         except queue.Empty:
             pass
+        if state["listing"]:
+            cluster_hint()                                  # progress line with the elapsed time
         if state["busy"] and state["t0"]:
             s = int(time.time() - state["t0"])
             elapsed.set(f"elapsed {s // 60}:{s % 60:02d}")
@@ -8820,7 +11813,9 @@ def run_gui(default_minutes, skip_login=False, context=None):
     minutes_var.trace_add("write", lambda *_: update_banner())
     run_btn.configure(command=start)
     stop_btn.configure(command=stop)
-    refresh_btn.configure(command=load_clusters)
+    refresh_btn.configure(command=refresh_selected)
+    collect_btn.configure(command=load_clusters)
+    collect_stop_btn.configure(command=stop)
     open_btn.configure(command=open_report)
     folder_btn.configure(command=open_folder)
     select_all_btn.configure(command=select_all)
@@ -8842,6 +11837,25 @@ def run_gui(default_minutes, skip_login=False, context=None):
     manual_var.trace_add("write", lambda *_: update_selected_label())
     method_combo.bind("<<ComboboxSelected>>", on_method_change)
     device_var.trace_add("write", lambda *_: sync_login_opts())
+    tenant_var.trace_add("write", lambda *_: (sync_login_opts(), man_refresh() if man["shown"] else None))
+    signin_combo.bind("<<ComboboxSelected>>", on_signin_method)
+    for _k, _b in man_copy_btns.items():
+        _b.configure(command=lambda k=_k: man_copy(k))
+    man_term_btn.configure(command=man_terminal)
+    man_verify_btn.configure(command=man_verify)
+    man_stop_btn.configure(command=lambda: man_stop())
+    acct_combo.bind("<<ComboboxSelected>>", on_acct_combo)
+    acct_combo.bind("<KeyRelease>", on_acct_type)
+    acct_combo.bind("<Return>", on_acct_combo)
+    recheck_btn.configure(command=recheck_selected)
+    check_all_btn.configure(command=check_all_accounts)
+    switch_btn.configure(command=sign_in_different)
+    sp_cancel_btn.configure(command=cancel_signin)
+    sp_open_btn.configure(command=open_signin_url)
+    sp_url.bind("<Button-1>", open_signin_url)
+    sp_copy_url_btn.configure(command=lambda: copy_text((state["signin"] or {}).get("url")))
+    sp_copy_code_btn.configure(command=lambda: copy_text((state["signin"] or {}).get("code")))
+    CRED["hook"] = lambda user, text: msgs.put(("expired", user, text))
     reset_steps()
     apply_method_ui()
     update_controls()
@@ -8854,15 +11868,28 @@ def run_gui(default_minutes, skip_login=False, context=None):
                 method_combo=method_combo, device_var=device_var, on_method_change=on_method_change,
                 acct_tree=acct_tree, acct_filter=acct_filter, acct_count=acct_count, cl_count=cl_count, scope_var=scope_var,
                 acct_all_btn=acct_all_btn, acct_clear_btn=acct_clear_btn, acct_reload_btn=acct_reload_btn, refresh_btn=refresh_btn,
-                signin_btn=signin_btn, check_btn=check_btn, auth_badge=auth_badge, auth_msg=auth_msg, guide_msg=guide_msg,
+                signin_btn=signin_btn, check_btn=check_btn, switch_btn=switch_btn, tenant_var=tenant_var, tenant_entry=tenant_entry,
+                acct_combo=acct_combo, acct_chip=acct_chip, recheck_btn=recheck_btn, check_all_btn=check_all_btn, chips_row=chips_row,
+                who_var=who_var, sp=sp, sp_url=sp_url, sp_code=sp_code, sp_open_btn=sp_open_btn, sp_copy_url_btn=sp_copy_url_btn,
+                sp_copy_code_btn=sp_copy_code_btn, sp_cancel_btn=sp_cancel_btn, sp_chip=sp_chip, sp_countdown=sp_countdown,
+                sp_account=sp_account, sp_detail=sp_detail, sp_raw=sp_raw, device_chk=device_chk, choose_account=choose_account,
+                acct_expired=acct_expired, device_text=lambda: device_chk.cget("text"), auth_badge=auth_badge, auth_msg=auth_msg, guide_msg=guide_msg,
                 acct_status=acct_status, cl_status=cl_status, method_info=method_info, search_icon=SEARCH_ICON,
                 s3=s3, s4=s4, list_bar=list_bar, acct_search=acct_search, cl_search=cl_search, scope_all_rb=scope_all_rb,
                 scope_sel_rb=scope_sel_rb, src_var=src_var, src_all_rb=src_all_rb, src_menu_rb=src_menu_rb, on_source_change=on_source_change,
-                check_status=check_status, sign_in=sign_in, load_clusters=load_clusters,
+                check_status=check_status, sign_in=sign_in, load_clusters=load_clusters, refresh_selected=refresh_selected,
+                collect_btn=collect_btn, collect_stop_btn=collect_stop_btn, acct_sel_count=acct_sel_count, confirm_big_scope=confirm_big_scope,
                 banner=banner, draw_banner=draw_banner, banner_sub=banner_sub, page=page, page_canvas=page_canvas, footer=footer, style=style,
-                sec_vars=sec_vars, sec_checks=sec_checks, preset_btns=preset_btns, sec_count=sec_count, sec_note=sec_note, sections_card=sections_card,
+                sec_vars=sec_vars, sec_checks=sec_checks, preset_btns=preset_btns, sec_count=sec_count, sec_note=sec_note, sections_card=sections_card, notebook=nb, s1=s1, s2=s2, tab_clusters=tab_clusters, tab_collect=tab_collect, tab_run=tab_run, ro_note=ro_note,
+                top=top, run_bar=run_bar, sec_chip=sec_chip, body=body, steps_box=steps_box, run_box=run_box, find_box=find_box, logopt=logopt,
                 selected_sections=selected_sections, set_sections=set_sections, tasks_var=tasks_var, workers_var=workers_var, workers_spin=workers_spin,
-                ICON=ICON, auth_icon=auth_icon, az_chk=az_chk, minutes_var=minutes_var, stripe=stripe)
+                ICON=ICON, auth_icon=auth_icon, az_chk=az_chk, minutes_var=minutes_var, stripe=stripe,
+                signin_var=signin_var, signin_combo=signin_combo, man=man, man_panel=man_panel, man_instr_var=man_instr_var, man_cli_var=man_cli_var,
+                man_cli_lbl=man_cli_lbl, man_inst=man_inst, man_msg_var=man_msg_var, man_cmd_vars=man_cmd_vars, man_copy_btns=man_copy_btns,
+                man_entries=man_entries, man_rows=man_rows, man_chip=man_chip, man_status_var=man_status_var, man_stop_btn=man_stop_btn,
+                man_verify_btn=man_verify_btn, man_term_btn=man_term_btn, man_result_var=man_result_var, man_form=man_form, man_open=man_open,
+                man_tick=man_tick, man_verify=man_verify, man_stop=man_stop, man_terminal=man_terminal, man_copy=man_copy, auth_msg_lbl=auth_msg_lbl,
+                s2m=s2m, on_signin_method=on_signin_method, man_cli_check=man_cli_check, man_result_lbl=man_result_lbl, man_msg_lbl=man_msg_lbl)
     if is_cli():
         check_status()
     else:
@@ -8913,15 +11940,27 @@ def main():
     parser.add_argument("--akslogin", help="path to akslogin.exe")
     parser.add_argument("--no-gui", action="store_true", help="never open the GUI")
     parser.add_argument("--all-clusters", action="store_true",
-                        help="list / choose among EVERY cluster the signed-in user can access (az, all subscriptions, no cap) - works with --list and --cluster N|name|all. "
+                        help="list / choose among the clusters az can reach in the chosen scope (--subscription a,b,c | all; default: the current subscription only) - works with --list and --cluster N|name|all. "
                              "With the akslogin method the clusters that are in its menu still log in with akslogin; the others use az aks get-credentials")
     parser.add_argument("--login-method", choices=["exe", "cli"], default="exe",
                         help="how to log in: exe = the custom akslogin.exe (default); cli = the standard Azure CLI (az) - then --list / --cluster use the cluster list read from az")
-    parser.add_argument("--device-code", action="store_true",
-                        help="with --login-method cli: sign in without a browser pop-up (az login --use-device-code)")
+    parser.add_argument("--device-code", action=argparse.BooleanOptionalAction, default=True,
+                        help="sign in with a device code (az login --use-device-code): DEFAULT. The URL and code are printed in a box (and shown in the window). "
+                             "--no-device-code = the browser flow (az login)")
+    parser.add_argument("--signin-method", choices=["manual", "captured", "console"], default=default_signin_method(),
+                        help="how a sign-in is done: manual (default) = the exact commands (az login --use-device-code ...) are printed, you run one in your own terminal and "
+                             "press Enter, then the tool verifies read-only; captured = the tool runs az login and shows the URL / code; console = az login in its own console window. "
+                             "--device-code / --no-device-code apply to captured and console")
+    parser.add_argument("--tenant", help="Azure tenant id / domain for the sign-in (az login --tenant) and to restrict the subscription list to that tenant")
+    parser.add_argument("--list-accounts", action="store_true",
+                        help="list the accounts the Azure CLI knows (user / service principal / managed identity, tenant, subscriptions) with the state of their credentials "
+                             "(Active, Expiring soon, Expired, Not signed in); an expired one is reported and the device-code sign-in is started")
+    parser.add_argument("--sign-in-only", action="store_true",
+                        help="only sign in to Azure (see --signin-method; the manual commands are printed by default) and show the signed-in account, then exit")
     parser.add_argument("--az-cluster", help="AKS cluster name for the Azure checks (default: found from the nodes' resource group)")
     parser.add_argument("--resource-group", help="resource group of the AKS cluster (use with --az-cluster)")
-    parser.add_argument("--subscription", help="Azure subscription id to use. Default: chosen automatically after login")
+    parser.add_argument("--subscription", help="Azure subscription(s) to search for clusters: one id / name, a comma list (a,b,c) or 'all'. Default: only the current (default) "
+                                               "subscription - clusters are never searched in every subscription unless you ask (all)")
     parser.add_argument("--context", help="kubectl context to use (default: matched from the selected cluster)")
     parser.add_argument("--list-subscriptions", action="store_true", help="list the Azure subscriptions `az` can see and exit")
     parser.add_argument("--open", action="store_true", help="open the HTML report in your browser when done")
@@ -8940,6 +11979,16 @@ def main():
     parser.add_argument("--only-networking", action="store_true", help="collect only the network and traffic section (plus the cluster overview)")
     parser.add_argument("--no-networking", action="store_true", help="collect everything except the network and traffic section")
     parser.add_argument("--list-sections", action="store_true", help="print the section ids and titles and exit")
+    parser.add_argument("--pim-list", action="store_true",
+                        help="print your Privileged Identity Management roles: ACTIVE now and ELIGIBLE (Azure resource roles, Microsoft Entra roles, privileged access groups); read-only; needs `az login`")
+    parser.add_argument("--pim-activate-all", action="store_true",
+                        help="list them, then SELF-ACTIVATE every eligible role / group that is not active (needs --justification and --yes; without --yes it only prints what it would do). "
+                             "The only thing in this tool that is not a read - see the README 'Privileged roles (PIM) tab'")
+    parser.add_argument("--justification", metavar="TEXT", help="with --pim-activate-all: the justification sent with every activation request (required)")
+    parser.add_argument("--hours", type=float, default=None, metavar="N", help="with --pim-activate-all: hours to request (default and upper limit: each role's policy maximum)")
+    parser.add_argument("--ticket-number", help="with --pim-activate-all: optional ticket number")
+    parser.add_argument("--ticket-system", help="with --pim-activate-all: optional ticket system")
+    parser.add_argument("--yes", action="store_true", help="with --pim-activate-all: really submit the requests (without it nothing is submitted)")
     args = parser.parse_args()
 
     if args.list_sections:
@@ -8963,14 +12012,39 @@ def main():
         SUPPORT_LABEL = args.support_label
     if args.traffic_sample is not None:
         TRAFFIC_SAMPLE_SECONDS = max(0, args.traffic_sample)
-    AZ_OPTS.update(cluster=args.az_cluster, resource_group=args.resource_group, subscription=args.subscription, enabled=not args.no_azure)
+    SCAN_SCOPE["value"] = parse_subscription_scope(args.subscription)
+    multi_scope = SCAN_SCOPE["value"] == "all" or (isinstance(SCAN_SCOPE["value"], list) and len(SCAN_SCOPE["value"]) > 1)
+    AZ_OPTS.update(cluster=args.az_cluster, resource_group=args.resource_group, subscription=None if multi_scope else args.subscription, enabled=not args.no_azure)
     if args.akslogin:
         AKSLOGIN_EXE = args.akslogin
     try:
         sys.stdout.reconfigure(errors="replace")
     except Exception:
         pass
-    LOGIN_OPTS.update(method=args.login_method, device_code=args.device_code, all_clusters=args.all_clusters)
+    if args.tenant and not TENANT_RE.match(args.tenant):
+        parser.error("--tenant must be a tenant id (GUID) or a domain name")
+    LOGIN_OPTS.update(method=args.login_method, device_code=args.device_code, all_clusters=args.all_clusters, tenant=args.tenant, signin=args.signin_method)
+
+    if args.pim_list or args.pim_activate_all:
+        if args.pim_activate_all and not (args.justification or "").strip():
+            parser.error("--pim-activate-all needs --justification TEXT")
+        if args.hours is not None and not (0 < args.hours <= 24 * 30):
+            parser.error("--hours must be a number of hours greater than 0")
+        sys.exit(pim_cli(args))
+
+    if args.list_accounts:
+        sys.exit(list_accounts_cli(lambda l: print(l, flush=True)))
+
+    if args.sign_in_only:
+        say_ = lambda l: print(l, flush=True)
+        res = cli_sign_in_any(say_)
+        if res["status"] != "ok":
+            print("Sign-in " + {"cancelled": "was cancelled", "expired": "timed out"}.get(res["status"], "failed") + ": " + (res.get("error") or "no details"), file=sys.stderr)
+            sys.exit(1)
+        st = login_status()
+        n = len(list_az_subscriptions()) if st["state"] == "ok" else 0
+        print(f"Signed in as {st.get('who') or '?'}" + (f" (tenant {st['tenant']})" if st.get("tenant") else "") + f" - {n} subscription{'s' if n != 1 else ''}")
+        return
 
     if args.list_subscriptions:
         found = list_az_subscriptions()
@@ -9016,7 +12090,7 @@ def main():
             import pathlib
             import webbrowser
             webbrowser.open(pathlib.Path(target).as_uri())
-        if any(r["status"] == "failed" for r in results["items"]):
+        if any(r["status"] in ("failed", "credentials expired") for r in results["items"]):
             sys.exit(1)
         return
 
