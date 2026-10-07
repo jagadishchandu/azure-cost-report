@@ -1,0 +1,44 @@
+{
+  "_comment_file": "Copy to splunk_config.json and edit. Keys starting with _comment are ignored. Do NOT put your token or password here - type them in the app, or set the SPLUNK_TOKEN environment variable.",
+
+  "host": "splunk.yourcompany.com",
+  "_comment_host": "Splunk server name. Splunk Cloud: <stack>.splunkcloud.com (port 8089 may need to be allowed through the IP allowlist).",
+
+  "port": 8089,
+  "_comment_port": "Splunk MANAGEMENT port (REST API). Default 8089. Not 8000 (web) or 8088 (HEC).",
+
+  "scheme": "https",
+  "_comment_scheme": "https in normal use. http only for a local test server.",
+
+  "verify_ssl": true,
+  "_comment_verify_ssl": "Keep true. If you get a certificate error, set ca_bundle instead of turning this off.",
+
+  "ca_bundle": "",
+  "_comment_ca_bundle": "Optional path to your company CA bundle (.pem), e.g. C:\\certs\\company-ca.pem. Used instead of verify_ssl when set.",
+
+  "default_indexes": [],
+  "_comment_default_indexes": "Indexes pre-selected in the app, e.g. [\"k8s\"]. Empty = search every index your role can access.",
+
+  "cluster_field": "cluster_name",
+  "namespace_field": "namespace",
+  "pod_field": "pod",
+  "_comment_fields": "Field names that hold the cluster, namespace and pod in YOUR Splunk events. Splunk Connect for Kubernetes: cluster_name / namespace / pod. OpenTelemetry collector: k8s.cluster.name / k8s.namespace.name / k8s.pod.name. Check one event in Splunk to see which you have.",
+
+  "use_tstats": true,
+  "_comment_use_tstats": "true = fast listing of clusters/namespaces/pods when those fields are indexed fields. The app automatically falls back to a normal search if tstats finds nothing.",
+
+  "discovery_lookback_hours": 24,
+  "_comment_discovery_lookback_hours": "Default look-back when listing clusters and namespaces. Can be changed in the app.",
+
+  "max_events": 50000,
+  "_comment_max_events": "Default maximum number of log events to fetch in one go.",
+
+  "hard_max_events": 500000,
+  "_comment_hard_max_events": "Upper limit the app will allow for 'maximum events', to protect Splunk and your browser.",
+
+  "search_timeout_seconds": 600,
+  "_comment_search_timeout_seconds": "Give up waiting for a Splunk search after this many seconds.",
+
+  "parallel_pages": 4,
+  "_comment_parallel_pages": "How many result pages (50,000 events each) are downloaded from Splunk at the same time. 4 is a good default; use 1 if your Splunk admin asks you to go easy on the REST API."
+}
